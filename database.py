@@ -436,15 +436,17 @@ def init_db() -> None:
             closed_at TEXT,
             closed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
             rating INTEGER CHECK(rating BETWEEN 1 AND 5),
-            rated_at TEXT
+            rated_at TEXT,
+            first_assigned_at TEXT,
+            reassignment_pending INTEGER NOT NULL DEFAULT 0,
+            analytics_legacy INTEGER NOT NULL DEFAULT 0
         )
     """)
     _ensure_column(c, "operator_dialogs", "reassignment_pending", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(c, "operator_dialogs", "first_assigned_at", "TEXT")
-    c.execute(
-        "UPDATE operator_dialogs SET first_assigned_at=assigned_at "
-        "WHERE first_assigned_at IS NULL AND assigned_at IS NOT NULL"
-    )
+    # Existing databases cannot reconstruct the first assignment timestamp.
+    # Keep that fact explicit: exact wait/duration analytics excludes these rows.
+    _ensure_column(c, "operator_dialogs", "analytics_legacy", "INTEGER NOT NULL DEFAULT 1")
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
         ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
@@ -453,6 +455,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS ix_operator_dialog_queue
         ON operator_dialogs(status, queue_seq, created_at)
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_dialogs_created ON operator_dialogs(created_at)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -530,6 +533,10 @@ def init_db() -> None:
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_reports_status ON operator_client_reports(status,created_at,id)")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_operator_reports_status_decided "
+        "ON operator_client_reports(status,decided_at)"
+    )
 
     # Обезличенная продуктовая телеметрия. В metadata_json разрешены только
     # технические типы/классы ошибок; тексты сообщений и ПДн сюда не пишутся.
@@ -557,6 +564,18 @@ def init_db() -> None:
     c.execute(
         "CREATE INDEX IF NOT EXISTS ix_analytics_events_dialog "
         "ON analytics_events(dialog_id,event_type,occurred_at)"
+    )
+    # Preserve the current owner of pre-analytics dialogs as a durable baseline.
+    # The synthetic event records participation only; it deliberately does not
+    # invent an exact first-assignment time.
+    c.execute(
+        """INSERT OR IGNORE INTO analytics_events
+           (event_type,occurred_at,dialog_id,operator_id,metadata_json,dedupe_key)
+           SELECT 'operator_assigned',COALESCE(d.assigned_at,d.created_at),d.id,d.operator_id,
+                  '{"source":"legacy_baseline"}',
+                  'operator:' || d.id || ':assigned:legacy'
+           FROM operator_dialogs d
+           WHERE d.analytics_legacy=1 AND d.operator_id IS NOT NULL"""
     )
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_chat_blocks (

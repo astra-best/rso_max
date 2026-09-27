@@ -525,7 +525,7 @@ def test_main_menu_and_router_expose_ai_entry(monkeypatch):
     bot.send_main_menu(42)
     payloads = [row[0]["payload"] for row in sender.call_args.args[2]]
     assert "ai_start" in payloads
-    assert bot._CALLBACK_STATIC["ai_from_faq"] is bot._start_ai_from_faq
+    assert "faq_terminal_ai" in bot._CALLBACK_PREFIXES
     assert bot._MESSAGE_HANDLERS[bot.S.AI_QUESTION] is bot._on_ai_question
 
 

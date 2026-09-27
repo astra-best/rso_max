@@ -100,8 +100,9 @@ def test_aggregates_boundaries_median_repeats_sources_and_all_sections(analytics
     )
     conn.execute(
         """INSERT INTO operator_client_reports(dialog_id,operator_id,client_chat_id,
-           reason,snapshot_json,status,created_at) VALUES(1,7,99,'spam','[]','confirmed',
-           '2026-09-01T00:03:00+00:00')"""
+           reason,snapshot_json,status,created_at,decided_at)
+           VALUES(1,7,99,'spam','[]','confirmed',
+           '2026-09-01T00:03:00+00:00','2026-09-01T00:04:00+00:00')"""
     )
     conn.commit()
     conn.close()
@@ -126,7 +127,7 @@ def test_aggregates_boundaries_median_repeats_sources_and_all_sections(analytics
     assert report["operator"]["avg_wait_seconds"] == 10.0
     assert report["operator"]["median_duration_seconds"] == 120.0
     assert report["operator"]["confirmed_complaints"] == 1
-    assert report["operator"]["legacy_operator_dialogs"] == 1
+    assert report["operator"]["legacy_operator_dialogs"] == 0
     assert report["ai"]["questions"] == 1
     assert report["ai"]["successful_answers"] == 1
     assert report["ai"]["errors"] == 1
@@ -169,6 +170,71 @@ def test_operator_participation_counts_initial_and_reassigned_without_duplicates
     assert report["operator"]["legacy_operator_dialogs"] == 0
 
 
+def test_legacy_owner_survives_reassignment_without_fabricated_timing(analytics_db):
+    conn = db.get_conn()
+    conn.executemany(
+        "INSERT INTO users(id,username,password,name,role) VALUES(?,?,?,?, 'operator')",
+        [(21, "legacy", "x", "Старый"), (22, "new", "x", "Новый")],
+    )
+    conn.execute(
+        """INSERT INTO operator_dialogs
+           (id,chat_id,operator_id,status,created_at,assigned_at,last_activity_at,
+            analytics_legacy)
+           VALUES(8,88,21,'active','2026-09-01T00:00:00+00:00',
+                  '2026-09-01T00:01:00+00:00','2026-09-01T00:02:00+00:00',1)"""
+    )
+    conn.commit()
+    conn.close()
+    db.init_db()
+    conn = db.get_conn()
+    assert conn.execute(
+        "SELECT first_assigned_at FROM operator_dialogs WHERE id=8"
+    ).fetchone()[0] is None
+    conn.execute(
+        "UPDATE operator_dialogs SET operator_id=22,assigned_at=? WHERE id=8",
+        ("2026-09-01T00:03:00+00:00",),
+    )
+    conn.commit()
+    conn.close()
+    assert analytics.record_event(
+        "operator_assigned", dialog_id=8, operator_id=22,
+        dedupe_key="operator:8:assigned:2",
+        occurred_at=datetime(2026, 9, 1, 0, 3, tzinfo=timezone.utc),
+    )
+    assert not analytics.record_event(
+        "operator_assigned", dialog_id=8, operator_id=22,
+        dedupe_key="operator:8:assigned:2",
+        occurred_at=datetime(2026, 9, 1, 0, 3, tzinfo=timezone.utc),
+    )
+    report = analytics.build_dashboard(analytics.parse_period("2026-09-01", "2026-09-01"))
+    assert {(row["operator_id"], row["value"]) for row in report["operator"]["by_operator"]} == {
+        (21, 1), (22, 1),
+    }
+    assert report["operator"]["legacy_operator_dialogs"] == 1
+    assert report["operator"]["avg_wait_seconds"] is None
+
+
+def test_operator_time_queries_use_range_indexes(analytics_db):
+    conn = db.get_conn()
+    dialog_plan = " ".join(
+        row["detail"] for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM operator_dialogs "
+            "WHERE created_at>=? AND created_at<?",
+            ("2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00"),
+        )
+    )
+    complaint_plan = " ".join(
+        row["detail"] for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM operator_client_reports "
+            "WHERE status='confirmed' AND decided_at>=? AND decided_at<?",
+            ("2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00"),
+        )
+    )
+    conn.close()
+    assert "ix_operator_dialogs_created" in dialog_plan
+    assert "ix_operator_reports_status_decided" in complaint_plan
+
+
 def _login(client, username: str, password: str) -> None:
     response = client.post("/login", data={"username": username, "password": password})
     assert response.status_code == 302
@@ -201,4 +267,3 @@ def test_dashboard_admin_only_filters_empty_state_and_escaping(analytics_db):
     body = client.get("/analytics?from=2026-09-01&to=2026-09-02").get_data(as_text=True)
     assert "<script>alert(1)</script>" not in body
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
-

@@ -439,8 +439,9 @@ def request_dialog(
         cur = conn.execute(
             """INSERT INTO operator_dialogs
                (chat_id,operator_id,status,queue_seq,authenticated,client_fio,client_ls,
-                client_address,faq_context,ai_context_json,created_at,assigned_at,last_activity_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                client_address,faq_context,ai_context_json,created_at,assigned_at,last_activity_at,
+                analytics_legacy)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
             (
                 chat_id, operator_id, status, queue_seq, int(authenticated),
                 profile.get("fio") if authenticated else None,

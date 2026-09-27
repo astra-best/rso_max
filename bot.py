@@ -377,15 +377,6 @@ def _appeal_dependencies() -> appeals.AppealDependencies:
 
 def _start_appeal(chat_id: int) -> None:
     """Compatibility wrapper for starting the extracted appeal flow."""
-    state = _get_state(chat_id)
-    terminal = state.get("faq_terminal") or {}
-    if terminal:
-        analytics.record_event(
-            "faq_transition_appeal", script_id=terminal.get("script_id"),
-            node_id=terminal.get("node_id"),
-            dedupe_key=f"faq:{terminal.get('run_id')}:transition:appeal",
-        )
-        state.pop("faq_terminal", None)
     appeals.start_appeal(chat_id, _appeal_dependencies())
 
 
@@ -548,18 +539,6 @@ def _start_ai(chat_id: int, faq_context: str | None = None) -> None:
     ai_assistant.start(chat_id, _ai_dependencies(), faq_context=faq_context)
 
 
-def _start_ai_from_faq(chat_id: int, state: dict) -> None:
-    terminal = state.get("faq_terminal") or {}
-    analytics.record_event(
-        "faq_transition_ai", script_id=terminal.get("script_id"),
-        node_id=terminal.get("node_id"),
-        dedupe_key=f"faq:{terminal.get('run_id')}:transition:ai" if terminal.get("run_id") else None,
-    )
-    state.pop("faq_terminal", None)
-    context = state.pop("ai_faq_context", None)
-    _start_ai(chat_id, context)
-
-
 def _on_ai_question(chat_id: int, state: dict, text: str) -> None:
     del state
     ai_assistant.ask(chat_id, text, _ai_dependencies())
@@ -581,15 +560,7 @@ def _operator_profile(chat_id: int) -> dict | None:
 
 def _start_operator_chat(chat_id: int) -> None:
     state = _get_state(chat_id)
-    terminal = state.get("faq_terminal") or {}
-    if terminal:
-        analytics.record_event(
-            "faq_transition_operator", script_id=terminal.get("script_id"),
-            node_id=terminal.get("node_id"),
-            dedupe_key=f"faq:{terminal.get('run_id')}:transition:operator",
-        )
-        state.pop("faq_terminal", None)
-    elif state.get("state") == S.AI_QUESTION:
+    if state.get("state") == S.AI_QUESTION:
         analytics.record_event("ai_transition_operator")
     if operator_chat.is_client_blocked(chat_id):
         _clear_flow(state)
@@ -1083,6 +1054,74 @@ def _cb_operator_rate(chat_id: int, st: dict, arg: str) -> None:
     _rate_operator(chat_id, int(dialog), int(rating))
 
 
+def _terminal_context_or_reject(chat_id: int, st: dict, arg: str) -> dict | None:
+    terminal = faq.validate_terminal_action(st, arg, menu_state=S.MENU)
+    if terminal is None:
+        send_message(chat_id, "Эта кнопка FAQ устарела.")
+    return terminal
+
+
+def _complete_terminal_transition(st: dict, terminal: dict, target: str) -> None:
+    st.pop("faq_terminal", None)
+    analytics.record_event(
+        f"faq_transition_{target}", script_id=terminal["script_id"],
+        node_id=terminal["node_id"],
+        dedupe_key=f"faq:{terminal['run_id']}:transition:{target}",
+    )
+
+
+def _cb_faq_terminal_ai(chat_id: int, st: dict, arg: str) -> None:
+    terminal = _terminal_context_or_reject(chat_id, st, arg)
+    if terminal is None:
+        return
+    _start_ai(chat_id, st.get("ai_faq_context"))
+    if st.get("state") == S.AI_QUESTION:
+        st.pop("ai_faq_context", None)
+        _complete_terminal_transition(st, terminal, "ai")
+
+
+def _cb_faq_terminal_appeal(chat_id: int, st: dict, arg: str) -> None:
+    terminal = _terminal_context_or_reject(chat_id, st, arg)
+    if terminal is None:
+        return
+    _start_appeal(chat_id)
+    if st.get("state") == S.APPEAL_CATEGORY:
+        st.pop("ai_faq_context", None)
+        _complete_terminal_transition(st, terminal, "appeal")
+
+
+def _cb_faq_terminal_operator(chat_id: int, st: dict, arg: str) -> None:
+    terminal = _terminal_context_or_reject(chat_id, st, arg)
+    if terminal is None:
+        return
+    context = st.get("ai_faq_context")
+    _start_operator_chat(chat_id)
+    if st.get("state") in {S.OPERATOR_CHAT, S.AWAIT_LS, S.AWAIT_LS_1C}:
+        _complete_terminal_transition(st, terminal, "operator")
+    else:
+        # Failed availability/blocked checks clear the flow; retain the bound
+        # terminal so a later retry is still valid and no transition is logged.
+        st["state"] = S.MENU
+        st["faq_terminal"] = terminal
+        if context:
+            st["ai_faq_context"] = context
+        _touch(st)
+
+
+def _cb_faq_terminal_menu(chat_id: int, st: dict, arg: str) -> None:
+    terminal = _terminal_context_or_reject(chat_id, st, arg)
+    if terminal is None:
+        return
+    _clear_flow(st)
+    _touch(st)
+    send_main_menu(chat_id)
+    analytics.record_event(
+        "faq_exit", script_id=terminal["script_id"], node_id=terminal["node_id"],
+        metadata={"reason": "main_menu"},
+        dedupe_key=f"faq:{terminal['run_id']}:exit:main_menu",
+    )
+
+
 # Префикс payload → (обработчик, приводить ли аргумент к int)
 _CALLBACK_PREFIXES: dict[str, callable] = {
     "confirm":     _cb_confirm_appeal,
@@ -1099,6 +1138,10 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "appt_time":   lambda chat_id, st, arg: _ask_theme(chat_id, arg),
     "appt_cancel": lambda chat_id, st, arg: _cancel_own_appointment(chat_id, int(arg)),
     "operator_rate": _cb_operator_rate,
+    "faq_terminal_ai": _cb_faq_terminal_ai,
+    "faq_terminal_appeal": _cb_faq_terminal_appeal,
+    "faq_terminal_operator": _cb_faq_terminal_operator,
+    "faq_terminal_menu": _cb_faq_terminal_menu,
 }
 
 
@@ -1106,6 +1149,23 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
 
 def _cb_kvitanciya(chat_id: int, st: dict) -> None:
     receipts.start(chat_id, st, _receipt_flow_dependencies())
+
+
+def _reject_unbound_terminal_action(chat_id: int, st: dict) -> bool:
+    if st.get("faq_terminal"):
+        send_message(chat_id, "Эта кнопка FAQ устарела.")
+        return True
+    return False
+
+
+def _cb_appeal_start(chat_id: int, st: dict) -> None:
+    if not _reject_unbound_terminal_action(chat_id, st):
+        _start_appeal(chat_id)
+
+
+def _cb_operator_start(chat_id: int, st: dict) -> None:
+    if not _reject_unbound_terminal_action(chat_id, st):
+        _start_operator_chat(chat_id)
 
 
 def _cb_skip_theme(chat_id: int, st: dict) -> None:
@@ -1117,16 +1177,8 @@ def _cb_appt_confirm(chat_id: int, st: dict) -> None:
 
 
 def _cb_main_menu(chat_id: int, st: dict) -> None:
-    script = st.get("script") or {}
-    terminal = st.get("faq_terminal") or {}
-    source = script or terminal
-    if source:
-        analytics.record_event(
-            "faq_exit", script_id=source.get("id") or source.get("script_id"),
-            node_id=source.get("current") or source.get("node_id"),
-            metadata={"reason": "main_menu"},
-            dedupe_key=f"faq:{source.get('run_id')}:exit:main_menu" if source.get("run_id") else None,
-        )
+    if _reject_unbound_terminal_action(chat_id, st):
+        return
     _clear_flow(st)
     _touch(st)
     send_main_menu(chat_id)
@@ -1165,16 +1217,16 @@ def _cb_appeal_draft_edit(chat_id: int, st: dict) -> None:
 
 _CALLBACK_STATIC: dict[str, callable] = {
     "auth_1c":          lambda chat_id, st: _start_1c_auth(chat_id),
-    "appeal_start":      lambda chat_id, st: _start_appeal(chat_id),
+    "appeal_start":      _cb_appeal_start,
     "my_appeals":        lambda chat_id, st: _show_my_appeals(chat_id),
     "pokazaniya":        lambda chat_id, st: _start_pokazaniya(chat_id),
     "scripts_list":      lambda chat_id, st: _show_scripts_list(chat_id),
     "ai_start":          lambda chat_id, st: _start_ai(chat_id),
-    "ai_from_faq":       _start_ai_from_faq,
+    "ai_from_faq":       lambda chat_id, st: send_message(chat_id, "Эта кнопка FAQ устарела."),
     "ai_more":           lambda chat_id, st: _start_ai(chat_id),
     "ai_new":            _cb_ai_new,
     "ai_appeal":         _cb_ai_appeal,
-    "operator_start":    lambda chat_id, st: _start_operator_chat(chat_id),
+    "operator_start":    _cb_operator_start,
     "operator_cancel":   _cancel_operator_wait,
     "appeal_draft_submit": _cb_appeal_draft_submit,
     "appeal_draft_edit": _cb_appeal_draft_edit,
@@ -1203,10 +1255,38 @@ _CALLBACK_PREFIX_MODULES = {
     "script": "faq", "script_node": "faq", "faq_scripts_page": "faq",
     "faq_node_page": "faq", "meter": "readings",
     "faq_go": "faq",
+    "faq_terminal_ai": "ai", "faq_terminal_appeal": "appeal",
     "appt_branch": "appointment", "appt_date": "appointment",
     "appt_time": "appointment", "appt_cancel": "appointment",
 }
-_CALLBACK_PREFIX_EXEMPT = {"operator_rate"}
+_CALLBACK_PREFIX_EXEMPT = {
+    "operator_rate", "faq_terminal_operator", "faq_terminal_menu",
+}
+
+
+def _active_faq_source(st: dict) -> dict | None:
+    script = st.get("script")
+    if (
+        st.get("state") == S.SCRIPT_NODE and isinstance(script, dict)
+        and isinstance(script.get("id"), int) and isinstance(script.get("current"), int)
+        and isinstance(script.get("run_id"), str)
+    ):
+        return {
+            "script_id": script["id"], "node_id": script["current"],
+            "run_id": script["run_id"],
+        }
+    return None
+
+
+def _record_faq_exit_after(st: dict, source: dict | None, payload: str) -> None:
+    if source is None or st.get("state") == S.SCRIPT_NODE:
+        return
+    reason = "main_menu" if payload in {"main_menu", "cancel"} else "new_flow"
+    analytics.record_event(
+        "faq_exit", script_id=source["script_id"], node_id=source["node_id"],
+        metadata={"reason": reason},
+        dedupe_key=f"faq:{source['run_id']}:exit:{reason}",
+    )
 
 
 def _reject_disabled(chat_id: int, state: dict) -> None:
@@ -1226,15 +1306,7 @@ def handle_callback(update: dict) -> None:
     st = _get_state(chat_id)
     _touch(st)
     log.debug("callback chat_id=%s payload=%s", chat_id, payload)
-    active_script = st.get("script") or {}
-    if active_script and payload not in {"main_menu", "cancel"} and not payload.startswith(
-        ("faq_go:", "faq_node_page:")
-    ):
-        analytics.record_event(
-            "faq_exit", script_id=active_script.get("id"),
-            node_id=active_script.get("current"), metadata={"reason": "new_flow"},
-            dedupe_key=f"faq:{active_script.get('run_id')}:exit:new_flow",
-        )
+    active_script = _active_faq_source(st)
 
     # Payload с аргументом: "префикс:значение"
     if ":" in payload:
@@ -1246,6 +1318,7 @@ def handle_callback(update: dict) -> None:
                 module is None or not operator_chat.module_enabled(module)
             ):
                 _reject_disabled(chat_id, st)
+                _record_faq_exit_after(st, active_script, payload)
                 return
             try:
                 handler(chat_id, st, arg)
@@ -1253,6 +1326,8 @@ def handle_callback(update: dict) -> None:
                 log.warning("callback %s: некорректный аргумент '%s': %s",
                             prefix, arg, exc)
                 send_main_menu(chat_id)
+            else:
+                _record_faq_exit_after(st, active_script, payload)
             return
 
     # Статичный payload без аргумента
@@ -1263,8 +1338,10 @@ def handle_callback(update: dict) -> None:
             module is None or not operator_chat.module_enabled(module)
         ):
             _reject_disabled(chat_id, st)
+            _record_faq_exit_after(st, active_script, payload)
             return
         handler(chat_id, st)
+        _record_faq_exit_after(st, active_script, payload)
         return
 
     log.warning("Неизвестный payload: %s  chat_id=%s", payload, chat_id)

@@ -132,7 +132,7 @@ def test_open_script_uses_smallest_root_and_logs_ambiguous_tree():
         "Если вы не получили ответ на ваш вопрос, "
         "вы можете обратиться к ИИ-помощнику."
     )
-    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"].startswith("faq_terminal_ai:")
     assert state["state"] == "menu"
     assert "script" not in state
 
@@ -157,7 +157,7 @@ def test_terminal_node_returns_to_main_menu_and_clears_script():
         "Если вы не получили ответ на ваш вопрос, "
         "вы можете обратиться к ИИ-помощнику."
     )
-    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"].startswith("faq_terminal_ai:")
     assert state["state"] == "menu"
     assert "script" not in state
 
@@ -175,7 +175,7 @@ def test_terminal_node_does_not_invite_disabled_ai():
     faq.show_script_node(42, deps)
     text, rows = deps.send_buttons.call_args.args[1:]
     assert "ИИ-помощнику" not in text
-    assert all(button["payload"] != "ai_from_faq" for row in rows for button in row)
+    assert all(not button["payload"].startswith("faq_terminal_ai:") for row in rows for button in row)
 
 
 def test_terminal_node_hides_disabled_appeal_transition():
@@ -394,7 +394,7 @@ def test_terminal_faq_preserves_traversed_path_for_ai():
     assert state["ai_faq_context"] == (
         "Оплата → Выберите тему → Неверная сумма → Проверьте квитанцию"
     )
-    assert deps.send_buttons.call_args.args[2][0][0]["payload"] == "ai_from_faq"
+    assert deps.send_buttons.call_args.args[2][0][0]["payload"].startswith("faq_terminal_ai:")
 
 
 def test_navigate_without_active_script_returns_to_menu():
@@ -483,3 +483,115 @@ def test_main_menu_with_all_modules_disabled_is_plain_text(monkeypatch):
     assert bot.send_main_menu(12, "Нет доступных разделов") is True
     text_sender.assert_called_once_with(12, "Нет доступных разделов")
     buttons_sender.assert_not_called()
+
+
+def _bot_callback(payload: str) -> dict:
+    return {
+        "message": {"recipient": {"chat_id": 42}},
+        "callback": {"callback_id": "cb", "payload": payload},
+    }
+
+
+def _terminal_state() -> tuple[dict, str]:
+    run_id = "a" * 24
+    token = "b" * 8
+    state = {
+        "state": bot.S.MENU,
+        "ai_faq_context": "Сценарий",
+        "faq_terminal": {
+            "script_id": 7, "node_id": 9, "run_id": run_id, "token": token,
+        },
+    }
+    return state, f"7:9:{run_id}:{token}"
+
+
+def test_terminal_ai_requires_current_bound_context_and_deduplicates(monkeypatch):
+    state, argument = _terminal_state()
+    events = Mock()
+    starter = Mock(side_effect=lambda _chat, _context: state.update(state=bot.S.AI_QUESTION))
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(bot, "_start_ai", starter)
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "send_message", Mock())
+
+    bot.handle_callback(_bot_callback(f"faq_terminal_ai:{argument}"))
+    bot.handle_callback(_bot_callback(f"faq_terminal_ai:{argument}"))
+
+    starter.assert_called_once_with(42, "Сценарий")
+    events.assert_called_once_with(
+        "faq_transition_ai", script_id=7, node_id=9,
+        dedupe_key=f"faq:{'a' * 24}:transition:ai",
+    )
+
+
+def test_stale_and_crafted_terminal_ai_never_start_or_log(monkeypatch):
+    state, argument = _terminal_state()
+    state["faq_terminal"]["token"] = "c" * 8
+    starter = Mock()
+    appeal_starter = Mock()
+    operator_starter = Mock()
+    events = Mock()
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(bot, "_start_ai", starter)
+    monkeypatch.setattr(bot, "_start_appeal", appeal_starter)
+    monkeypatch.setattr(bot, "_start_operator_chat", operator_starter)
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "send_message", Mock())
+
+    bot.handle_callback(_bot_callback(f"faq_terminal_ai:{argument}"))
+    bot.handle_callback(_bot_callback("ai_from_faq"))
+    bot.handle_callback(_bot_callback("appeal_start"))
+    bot.handle_callback(_bot_callback("operator_start"))
+
+    starter.assert_not_called()
+    appeal_starter.assert_not_called()
+    operator_starter.assert_not_called()
+    events.assert_not_called()
+
+
+def test_terminal_ai_failure_keeps_context_and_does_not_log(monkeypatch):
+    state, argument = _terminal_state()
+    events = Mock()
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(bot, "_start_ai", Mock())
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+
+    bot.handle_callback(_bot_callback(f"faq_terminal_ai:{argument}"))
+
+    assert state["faq_terminal"]["script_id"] == 7
+    events.assert_not_called()
+
+
+def test_faq_exit_is_recorded_only_after_successful_real_transition(monkeypatch):
+    state = {
+        "state": bot.S.SCRIPT_NODE,
+        "script": {"id": 3, "current": 4, "run_id": "d" * 24},
+    }
+    events = Mock()
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "send_main_menu", Mock())
+    monkeypatch.setattr(bot, "_rate_operator", Mock())
+
+    bot.handle_callback(_bot_callback("unknown:crafted"))
+    bot.handle_callback(_bot_callback("operator_rate:1-5"))
+    bot.handle_callback(_bot_callback("script:not-an-int"))
+    events.assert_not_called()
+
+    bot.handle_callback(_bot_callback("main_menu"))
+    events.assert_called_once_with(
+        "faq_exit", script_id=3, node_id=4, metadata={"reason": "main_menu"},
+        dedupe_key=f"faq:{'d' * 24}:exit:main_menu",
+    )

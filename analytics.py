@@ -149,8 +149,8 @@ def _duration_stats(
                      ROW_NUMBER() OVER (ORDER BY (julianday({end_column})-julianday({start_column}))*86400) rn,
                      COUNT(*) OVER () cnt
               FROM {table}
-              WHERE julianday({period_column})>=julianday(?)
-                AND julianday({period_column})<julianday(?)
+              WHERE {period_column}>=?
+                AND {period_column}<?
                 AND {start_column} IS NOT NULL AND {end_column} IS NOT NULL
                 AND julianday({end_column})>=julianday({start_column}) AND {extra_where}
             )
@@ -183,8 +183,8 @@ def build_dashboard(period: dict[str, Any]) -> dict[str, Any]:
                   AND p.category=a.category
                   AND ((a.chat_id IS NOT NULL AND p.chat_id=a.chat_id)
                     OR (a.chat_id IS NULL AND a.ls IS NOT NULL AND p.ls=a.ls))
-                  AND julianday(p.created_at)>=julianday(a.created_at)-30
-                  AND julianday(p.created_at)<=julianday(a.created_at))""",
+                  AND p.created_at>=substr(datetime(a.created_at,'-30 days'),1,16)
+                  AND p.created_at<=a.created_at)""",
             appeal_params,
         ).fetchone()["n"]
         appeals = {
@@ -218,16 +218,18 @@ def build_dashboard(period: dict[str, Any]) -> dict[str, Any]:
 
         dialog_count = conn.execute(
             """SELECT COUNT(*) n FROM operator_dialogs
-               WHERE julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?)""",
+               WHERE created_at>=? AND created_at<?""",
             (us, ue),
         ).fetchone()["n"]
         wait_avg, _ = _duration_stats(
             conn, table="operator_dialogs", start_column="created_at",
             end_column="first_assigned_at", period_column="created_at", start=us, end=ue,
+            extra_where="analytics_legacy=0",
         )
         duration_avg, duration_median = _duration_stats(
             conn, table="operator_dialogs", start_column="first_assigned_at",
             end_column="closed_at", period_column="created_at", start=us, end=ue,
+            extra_where="analytics_legacy=0",
         )
         operator = {
             "dialogs": int(dialog_count), "avg_wait_seconds": wait_avg,
@@ -236,33 +238,27 @@ def build_dashboard(period: dict[str, Any]) -> dict[str, Any]:
                   SELECT DISTINCT e.dialog_id,e.operator_id
                   FROM analytics_events e JOIN operator_dialogs d ON d.id=e.dialog_id
                   WHERE e.event_type='operator_assigned' AND e.operator_id IS NOT NULL
-                    AND julianday(d.created_at)>=julianday(?) AND julianday(d.created_at)<julianday(?)
-                  UNION ALL
-                  SELECT d.id,d.operator_id FROM operator_dialogs d
-                  WHERE d.operator_id IS NOT NULL
-                    AND julianday(d.created_at)>=julianday(?) AND julianday(d.created_at)<julianday(?)
-                    AND NOT EXISTS (SELECT 1 FROM analytics_events e
-                      WHERE e.dialog_id=d.id AND e.event_type='operator_assigned')
+                    AND d.created_at>=? AND d.created_at<?
                 )
                 SELECT p.operator_id,COALESCE(u.name,'Удалённый оператор') label,
                        COUNT(DISTINCT p.dialog_id) value
                 FROM participation p LEFT JOIN users u ON u.id=p.operator_id
-                GROUP BY p.operator_id,u.name ORDER BY value DESC,label""", (us, ue, us, ue)),
+                GROUP BY p.operator_id,u.name ORDER BY value DESC,label""", (us, ue)),
             "legacy_operator_dialogs": conn.execute("""SELECT COUNT(*) n
-                FROM operator_dialogs d WHERE d.operator_id IS NOT NULL
-                  AND julianday(d.created_at)>=julianday(?) AND julianday(d.created_at)<julianday(?)
-                  AND NOT EXISTS (SELECT 1 FROM analytics_events e
-                    WHERE e.dialog_id=d.id AND e.event_type='operator_assigned')""", (us, ue)).fetchone()["n"],
+                FROM operator_dialogs d WHERE d.analytics_legacy=1
+                  AND d.created_at>=? AND d.created_at<?""", (us, ue)).fetchone()["n"],
             "reassignments": conn.execute(f"SELECT COUNT(*) n FROM analytics_events WHERE {event_where} AND event_type='operator_reassigned'", event_params).fetchone()["n"],
             "lost_connections": conn.execute(f"SELECT COUNT(*) n FROM analytics_events WHERE {event_where} AND event_type='operator_connection_lost'", event_params).fetchone()["n"],
             "ratings": _groups(conn, """SELECT rating label,COUNT(*) value FROM operator_dialogs
-                WHERE julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?) AND rating IS NOT NULL
+                WHERE created_at>=? AND created_at<? AND rating IS NOT NULL
                 GROUP BY rating ORDER BY rating""", (us, ue)),
             "average_rating": conn.execute("""SELECT ROUND(AVG(rating),2) value FROM operator_dialogs
-                WHERE julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?) AND rating IS NOT NULL""", (us, ue)).fetchone()["value"],
+                WHERE created_at>=? AND created_at<? AND rating IS NOT NULL""", (us, ue)).fetchone()["value"],
             "confirmed_complaints": conn.execute("""SELECT COUNT(*) n FROM operator_client_reports
-                WHERE status='confirmed' AND julianday(COALESCE(decided_at,created_at))>=julianday(?)
-                AND julianday(COALESCE(decided_at,created_at))<julianday(?)""", (us, ue)).fetchone()["n"],
+                WHERE status='confirmed' AND decided_at>=? AND decided_at<?""", (us, ue)).fetchone()["n"],
+            "legacy_confirmed_complaints": conn.execute("""SELECT COUNT(*) n
+                FROM operator_client_reports WHERE status='confirmed' AND decided_at IS NULL
+                  AND created_at>=? AND created_at<?""", (us, ue)).fetchone()["n"],
         }
 
         ai_counts = {row["event_type"]: int(row["n"]) for row in conn.execute(
@@ -282,4 +278,3 @@ def build_dashboard(period: dict[str, Any]) -> dict[str, Any]:
         return {"appeals": appeals, "faq": faq, "operator": operator, "ai": ai}
     finally:
         conn.close()
-

@@ -19,10 +19,44 @@ State = dict[str, Any]
 Button = dict[str, Any]
 PAGE_ROWS = 29
 _TOKEN_PATTERN = re.compile(r"[0-9a-f]{8}\Z", re.ASCII)
+_RUN_PATTERN = re.compile(r"[0-9a-f]{24}\Z", re.ASCII)
 
 
 def _valid_render_token(value: Any) -> bool:
     return isinstance(value, str) and _TOKEN_PATTERN.fullmatch(value) is not None
+
+
+def validate_terminal_action(
+    state: State,
+    argument: str,
+    *,
+    menu_state: str,
+) -> dict[str, Any] | None:
+    """Return the active terminal context only for its bound callback.
+
+    Terminal buttons are capabilities tied to one render.  Checking every
+    identifier prevents old or hand-crafted callbacks from creating telemetry
+    (or starting another flow) without an active FAQ terminal.
+    """
+    parts = argument.split(":")
+    if len(parts) != 4 or state.get("state") != menu_state:
+        return None
+    script_raw, node_raw, run_id, token = parts
+    if not script_raw.isdigit() or not node_raw.isdigit():
+        return None
+    if _RUN_PATTERN.fullmatch(run_id) is None or not _valid_render_token(token):
+        return None
+    terminal = state.get("faq_terminal")
+    if not isinstance(terminal, dict):
+        return None
+    expected = (
+        str(terminal.get("script_id")), str(terminal.get("node_id")),
+        str(terminal.get("run_id", "")), str(terminal.get("token", "")),
+    )
+    actual = (script_raw, node_raw, run_id, token)
+    if any(not secrets.compare_digest(left, right) for left, right in zip(expected, actual)):
+        return None
+    return dict(terminal)
 
 
 @dataclass(frozen=True)
@@ -230,6 +264,7 @@ def show_script_node(chat_id: int, deps: FaqDependencies, page: int = 0) -> None
         state["ai_faq_context"] = " → ".join(str(item) for item in path if item)
         state["faq_terminal"] = {
             "run_id": run_id, "script_id": script.get("id"), "node_id": current_id,
+            "token": script.get("render_token"),
         }
         state["state"] = deps.menu_state
         state.pop("script", None)
@@ -241,10 +276,10 @@ def show_script_node(chat_id: int, deps: FaqDependencies, page: int = 0) -> None
         )
         rows = (
             link_rows
-            + ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
-            + ([[deps.make_callback("📝 Оформить обращение", "appeal_start")]] if deps.appeal_available() else [])
-            + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
-            + [[deps.make_callback("🏠 Главное меню", "main_menu")]]
+            + ([[deps.make_callback("🤖 Спросить у ИИ-помощника", f"faq_terminal_ai:{script.get('id')}:{current_id}:{run_id}:{script.get('render_token')}")]] if deps.ai_available() else [])
+            + ([[deps.make_callback("📝 Оформить обращение", f"faq_terminal_appeal:{script.get('id')}:{current_id}:{run_id}:{script.get('render_token')}")]] if deps.appeal_available() else [])
+            + ([[deps.make_callback("🎧 Связаться с оператором", f"faq_terminal_operator:{script.get('id')}:{current_id}:{run_id}:{script.get('render_token')}")]] if deps.operator_available() else [])
+            + [[deps.make_callback("🏠 Главное меню", f"faq_terminal_menu:{script.get('id')}:{current_id}:{run_id}:{script.get('render_token')}")]]
         )
         _send_page(
             chat_id, f"📌 {text}{invitation}", rows, 0,
