@@ -1279,7 +1279,13 @@ def _active_faq_source(st: dict) -> dict | None:
 
 
 def _record_faq_exit_after(st: dict, source: dict | None, payload: str) -> None:
-    if source is None or st.get("state") == S.SCRIPT_NODE:
+    if source is None:
+        return
+    current = _active_faq_source(st)
+    if current and (
+        current["script_id"] == source["script_id"]
+        and current["run_id"] == source["run_id"]
+    ):
         return
     reason = "main_menu" if payload in {"main_menu", "cancel"} else "new_flow"
     analytics.record_event(

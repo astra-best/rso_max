@@ -13,6 +13,7 @@ import httpx
 import pytest
 from PIL import Image
 
+import analytics
 import bot
 import database as db
 import web
@@ -105,6 +106,46 @@ def test_least_loaded_fifo_capacity_and_cancel(operator_db, monkeypatch):
     operator_chat.close_dialog(d1["id"], first)
     assigned = operator_chat.assign_waiting()
     assert assigned == [{"dialog_id": d4["id"], "chat_id": 4, "operator_id": first}]
+
+
+def test_legacy_never_assigned_waiting_dialog_gets_exact_timing(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=60)
+    operator_id = _operator("legacy-waiting-op")
+    created = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    assigned_at = created + timedelta(minutes=2)
+    conn = db.get_conn()
+    cursor = conn.execute(
+        """INSERT INTO operator_dialogs
+           (chat_id,status,queue_seq,authenticated,ai_context_json,created_at,
+            last_activity_at,analytics_legacy,reassignment_pending)
+           VALUES(701,'waiting',1,0,'[]',?,?,1,0)""",
+        (created.isoformat(timespec="seconds"), created.isoformat(timespec="seconds")),
+    )
+    dialog_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    operator_chat.start_shift(operator_id, now=assigned_at)
+
+    assert operator_chat.assign_waiting(now=assigned_at) == [{
+        "dialog_id": dialog_id, "chat_id": 701, "operator_id": operator_id,
+    }]
+    operator_chat.close_dialog(
+        dialog_id, operator_id, now=assigned_at + timedelta(minutes=10),
+    )
+
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT analytics_legacy,first_assigned_at FROM operator_dialogs WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    conn.close()
+    assert row["analytics_legacy"] == 0
+    assert row["first_assigned_at"] == assigned_at.isoformat(timespec="seconds")
+    report = analytics.build_dashboard(
+        analytics.parse_period("2026-09-01", "2026-09-01")
+    )
+    assert report["operator"]["avg_wait_seconds"] == 120.0
+    assert report["operator"]["avg_duration_seconds"] == 600.0
 
 
 def test_stale_operator_requeues_warns_and_times_out(operator_db):

@@ -531,12 +531,23 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             if not waiting or not operator_id:
                 break
             was_reassignment = bool(waiting["reassignment_pending"])
+            is_first_known_assignment = bool(
+                waiting["analytics_legacy"]
+                and waiting["operator_id"] is None
+                and waiting["assigned_at"] is None
+                and waiting["first_assigned_at"] is None
+                and not was_reassignment
+            )
             cur = conn.execute(
                 """UPDATE operator_dialogs SET status='active',operator_id=?,assigned_at=?,
                    first_assigned_at=COALESCE(first_assigned_at,?),
-                   last_activity_at=?,warned_at=NULL,reassignment_pending=0
+                   last_activity_at=?,warned_at=NULL,reassignment_pending=0,
+                   analytics_legacy=CASE WHEN ? THEN 0 ELSE analytics_legacy END
                    WHERE id=? AND status='waiting'""",
-                (operator_id, _iso(now), _iso(now), _iso(now), waiting["id"]),
+                (
+                    operator_id, _iso(now), _iso(now), _iso(now),
+                    int(is_first_known_assignment), waiting["id"],
+                ),
             )
             if not cur.rowcount:
                 continue

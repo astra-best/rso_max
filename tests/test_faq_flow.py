@@ -595,3 +595,62 @@ def test_faq_exit_is_recorded_only_after_successful_real_transition(monkeypatch)
         "faq_exit", script_id=3, node_id=4, metadata={"reason": "main_menu"},
         dedupe_key=f"faq:{'d' * 24}:exit:main_menu",
     )
+
+
+def test_opening_new_faq_run_exits_previous_run_only_after_success(monkeypatch):
+    old_run = "e" * 24
+    state = {
+        "state": bot.S.SCRIPT_NODE,
+        "script": {"id": 1, "current": 11, "run_id": old_run},
+    }
+    events = Mock()
+    tree = {
+        "title": "Новый FAQ",
+        "nodes": [
+            {"id": 20, "title": "Начало", "is_terminal": False},
+            {"id": 21, "title": "Ответ", "is_terminal": True},
+        ],
+        "edges": [{"from_node_id": 20, "to_node_id": 21, "label": "Далее"}],
+    }
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(bot.client_api, "get_script_tree", lambda _script_id: (tree, None))
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "send_buttons", Mock())
+
+    bot.handle_callback(_bot_callback("script:2"))
+
+    assert state["script"]["id"] == 2
+    assert state["script"]["run_id"] != old_run
+    assert [call.args[0] for call in events.call_args_list] == [
+        "faq_script_start", "faq_node_view", "faq_exit",
+    ]
+    assert events.call_args_list[-1].kwargs == {
+        "script_id": 1, "node_id": 11, "metadata": {"reason": "new_flow"},
+        "dedupe_key": f"faq:{old_run}:exit:new_flow",
+    }
+
+
+def test_failed_new_faq_run_does_not_exit_current_run(monkeypatch):
+    state = {
+        "state": bot.S.SCRIPT_NODE,
+        "script": {"id": 1, "current": 11, "run_id": "f" * 24},
+    }
+    events = Mock()
+    monkeypatch.setattr(bot, "_ack_callback", Mock())
+    monkeypatch.setattr(bot, "_reconcile_operator_terminal", lambda _chat: False)
+    monkeypatch.setattr(bot, "_get_state", lambda _chat: state)
+    monkeypatch.setattr(
+        bot.client_api, "get_script_tree", lambda _script_id: (None, "unavailable"),
+    )
+    monkeypatch.setattr(bot.analytics, "record_event", events)
+    monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "send_message", Mock())
+    monkeypatch.setattr(bot, "send_main_menu", Mock())
+
+    bot.handle_callback(_bot_callback("script:2"))
+
+    assert state["script"]["run_id"] == "f" * 24
+    events.assert_not_called()
