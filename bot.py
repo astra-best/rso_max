@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 
+import analytics
 import client_api
 import database as db
 from config import (
@@ -376,11 +377,20 @@ def _appeal_dependencies() -> appeals.AppealDependencies:
 
 def _start_appeal(chat_id: int) -> None:
     """Compatibility wrapper for starting the extracted appeal flow."""
+    state = _get_state(chat_id)
+    terminal = state.get("faq_terminal") or {}
+    if terminal:
+        analytics.record_event(
+            "faq_transition_appeal", script_id=terminal.get("script_id"),
+            node_id=terminal.get("node_id"),
+            dedupe_key=f"faq:{terminal.get('run_id')}:transition:appeal",
+        )
+        state.pop("faq_terminal", None)
     appeals.start_appeal(chat_id, _appeal_dependencies())
 
 
 def _start_appeal_draft(chat_id: int, body: str) -> None:
-    appeals.start_appeal(chat_id, _appeal_dependencies(), draft_body=body)
+    appeals.start_appeal(chat_id, _appeal_dependencies(), draft_body=body, source="ai")
 
 
 def _appeal_set_category(chat_id: int, category: str) -> None:
@@ -430,6 +440,8 @@ def _faq_dependencies() -> faq.FaqDependencies:
         menu_state=S.MENU,
         operator_available=operator_chat.has_active_operators,
         ai_available=lambda: operator_chat.module_enabled("ai"),
+        appeal_available=lambda: operator_chat.module_enabled("appeal"),
+        record_event=analytics.record_event,
     )
 
 
@@ -528,6 +540,7 @@ def _ai_dependencies() -> ai_assistant.AIDependencies:
         question_state=S.AI_QUESTION,
         operator_available=operator_chat.has_active_operators,
         appeal_available=lambda: operator_chat.module_enabled("appeal"),
+        record_event=analytics.record_event,
     )
 
 
@@ -536,6 +549,13 @@ def _start_ai(chat_id: int, faq_context: str | None = None) -> None:
 
 
 def _start_ai_from_faq(chat_id: int, state: dict) -> None:
+    terminal = state.get("faq_terminal") or {}
+    analytics.record_event(
+        "faq_transition_ai", script_id=terminal.get("script_id"),
+        node_id=terminal.get("node_id"),
+        dedupe_key=f"faq:{terminal.get('run_id')}:transition:ai" if terminal.get("run_id") else None,
+    )
+    state.pop("faq_terminal", None)
     context = state.pop("ai_faq_context", None)
     _start_ai(chat_id, context)
 
@@ -560,8 +580,18 @@ def _operator_profile(chat_id: int) -> dict | None:
 
 
 def _start_operator_chat(chat_id: int) -> None:
+    state = _get_state(chat_id)
+    terminal = state.get("faq_terminal") or {}
+    if terminal:
+        analytics.record_event(
+            "faq_transition_operator", script_id=terminal.get("script_id"),
+            node_id=terminal.get("node_id"),
+            dedupe_key=f"faq:{terminal.get('run_id')}:transition:operator",
+        )
+        state.pop("faq_terminal", None)
+    elif state.get("state") == S.AI_QUESTION:
+        analytics.record_event("ai_transition_operator")
     if operator_chat.is_client_blocked(chat_id):
-        state = _get_state(chat_id)
         _clear_flow(state)
         send_main_menu(chat_id, "Связь с оператором временно недоступна.")
         return
@@ -580,7 +610,6 @@ def _start_operator_chat(chat_id: int) -> None:
     if settings["require_auth"] and not profile:
         _request_ls(chat_id, "operator")
         return
-    state = _get_state(chat_id)
     ai_session = db.get_ai_session(chat_id, create_if_missing=False)
     dialog = operator_chat.request_dialog(
         chat_id, profile=profile, faq_context=state.get("ai_faq_context") or ai_session.get("faq_context"),
@@ -1088,6 +1117,16 @@ def _cb_appt_confirm(chat_id: int, st: dict) -> None:
 
 
 def _cb_main_menu(chat_id: int, st: dict) -> None:
+    script = st.get("script") or {}
+    terminal = st.get("faq_terminal") or {}
+    source = script or terminal
+    if source:
+        analytics.record_event(
+            "faq_exit", script_id=source.get("id") or source.get("script_id"),
+            node_id=source.get("current") or source.get("node_id"),
+            metadata={"reason": "main_menu"},
+            dedupe_key=f"faq:{source.get('run_id')}:exit:main_menu" if source.get("run_id") else None,
+        )
     _clear_flow(st)
     _touch(st)
     send_main_menu(chat_id)
@@ -1109,7 +1148,8 @@ def _cb_ai_new(chat_id: int, st: dict) -> None:
 
 
 def _cb_ai_appeal(chat_id: int, st: dict) -> None:
-    del st
+    if st.get("state") == S.AI_QUESTION:
+        analytics.record_event("ai_transition_appeal")
     ai_assistant.create_appeal_draft(chat_id, _ai_dependencies())
 
 
@@ -1186,6 +1226,15 @@ def handle_callback(update: dict) -> None:
     st = _get_state(chat_id)
     _touch(st)
     log.debug("callback chat_id=%s payload=%s", chat_id, payload)
+    active_script = st.get("script") or {}
+    if active_script and payload not in {"main_menu", "cancel"} and not payload.startswith(
+        ("faq_go:", "faq_node_page:")
+    ):
+        analytics.record_event(
+            "faq_exit", script_id=active_script.get("id"),
+            node_id=active_script.get("current"), metadata={"reason": "new_flow"},
+            dedupe_key=f"faq:{active_script.get('run_id')}:exit:new_flow",
+        )
 
     # Payload с аргументом: "префикс:значение"
     if ":" in payload:

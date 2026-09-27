@@ -312,6 +312,7 @@ class AIDependencies:
     question_state: str
     operator_available: Callable[[], bool] = lambda: False
     appeal_available: Callable[[], bool] = lambda: True
+    record_event: Callable[..., Any] = lambda *_args, **_kwargs: None
 
 
 def _fallback_buttons(deps: AIDependencies) -> list[list[Button]]:
@@ -386,11 +387,13 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
             _fallback_buttons(deps),
         )
         return
+    deps.record_event("ai_question")
     if not deps.reserve_question(
         chat_id,
         int(settings["daily_limit"]),
         session_date=operation_date,
     ):
+        deps.record_event("ai_limit_hit")
         state = deps.get_state(chat_id)
         state["ai_last_exchange"] = {"question": question, "answer": ""}
         deps.touch(state)
@@ -422,6 +425,9 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
         if not answer:
             raise AIServiceError("empty sanitized response")
     except AIServiceError:
+        deps.record_event(
+            "ai_provider_error", metadata={"error_class": "provider_or_response"},
+        )
         deps.release_question(chat_id, session_date=operation_date)
         state = deps.get_state(chat_id)
         state["ai_last_exchange"] = {"question": question, "answer": ""}
@@ -438,7 +444,9 @@ def ask(chat_id: int, text: str, deps: AIDependencies) -> None:
     state["state"] = deps.question_state
     state["ai_last_exchange"] = {"question": question, "answer": answer}
     deps.touch(state)
-    deps.send_buttons(chat_id, f"🤖 {answer}", _answer_buttons(deps))
+    delivered = deps.send_buttons(chat_id, f"🤖 {answer}", _answer_buttons(deps))
+    if delivered:
+        deps.record_event("ai_answer_delivered")
 
 
 def new_dialog(chat_id: int, deps: AIDependencies) -> None:

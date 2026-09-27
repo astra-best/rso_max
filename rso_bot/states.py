@@ -51,6 +51,7 @@ FLOW_KEYS = (
     "after_1c_auth",
     "ai_last_exchange",
     "ai_faq_context",
+    "faq_terminal",
 )
 
 METER_INPUT_KEYS = ("new_value1", "new_value2")

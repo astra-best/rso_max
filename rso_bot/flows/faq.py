@@ -44,6 +44,8 @@ class FaqDependencies:
     menu_state: str
     operator_available: Callable[[], bool] = lambda: False
     ai_available: Callable[[], bool] = lambda: True
+    appeal_available: Callable[[], bool] = lambda: True
+    record_event: Callable[..., Any] = lambda *_args, **_kwargs: None
 
 
 def _safe_callback(deps: FaqDependencies, label: Any, payload: str) -> Button | None:
@@ -172,6 +174,7 @@ def open_script(chat_id: int, script_id: int, deps: FaqDependencies) -> None:
     state["state"] = deps.script_node_state
     state["script"] = {
         "id": script_id,
+        "run_id": secrets.token_hex(12),
         "render_token": secrets.token_hex(4),
         "nodes": nodes,
         "edges_by_from": edges_by_from,
@@ -180,6 +183,15 @@ def open_script(chat_id: int, script_id: int, deps: FaqDependencies) -> None:
         "path": [tree.get("title", "FAQ"), nodes[root_id]["title"]],
     }
     deps.touch(state)
+    run_id = state["script"]["run_id"]
+    deps.record_event(
+        "faq_script_start", script_id=script_id,
+        dedupe_key=f"faq:{run_id}:start",
+    )
+    deps.record_event(
+        "faq_node_view", script_id=script_id, node_id=root_id,
+        dedupe_key=f"faq:{run_id}:node:{root_id}:0",
+    )
     show_script_node(chat_id, deps)
 
 
@@ -209,8 +221,16 @@ def show_script_node(chat_id: int, deps: FaqDependencies, page: int = 0) -> None
             deps.logger.warning("FAQ node id=%s contains an invalid legacy link", current_id)
 
     if node.get("is_terminal") or not edges:
+        run_id = script.get("run_id")
+        deps.record_event(
+            "faq_final", script_id=script.get("id"), node_id=current_id,
+            dedupe_key=f"faq:{run_id}:final:{current_id}" if run_id else None,
+        )
         path = list(script.get("path", []))
         state["ai_faq_context"] = " → ".join(str(item) for item in path if item)
+        state["faq_terminal"] = {
+            "run_id": run_id, "script_id": script.get("id"), "node_id": current_id,
+        }
         state["state"] = deps.menu_state
         state.pop("script", None)
         deps.touch(state)
@@ -222,6 +242,7 @@ def show_script_node(chat_id: int, deps: FaqDependencies, page: int = 0) -> None
         rows = (
             link_rows
             + ([[deps.make_callback("🤖 Спросить у ИИ-помощника", "ai_from_faq")]] if deps.ai_available() else [])
+            + ([[deps.make_callback("📝 Оформить обращение", "appeal_start")]] if deps.appeal_available() else [])
             + ([[deps.make_callback("🎧 Связаться с оператором", "operator_start")]] if deps.operator_available() else [])
             + [[deps.make_callback("🏠 Главное меню", "main_menu")]]
         )
@@ -294,8 +315,13 @@ def navigate_script_node(
     if target:
         script.setdefault("path", []).append(target.get("title", ""))
     script["current"] = node_id
+    script["view_seq"] = int(script.get("view_seq", 0)) + 1
     script["render_token"] = secrets.token_hex(4)
     deps.touch(state)
+    deps.record_event(
+        "faq_node_view", script_id=script.get("id"), node_id=node_id,
+        dedupe_key=f"faq:{script.get('run_id')}:node:{node_id}:{script['view_seq']}",
+    )
     show_script_node(chat_id, deps)
 
 

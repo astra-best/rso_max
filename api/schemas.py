@@ -57,6 +57,9 @@ class AppealCreate(BaseModel):
     body:      str        = Field(..., min_length=1, description="Текст обращения")
     chat_id:   int | None = Field(None, description="ID чата для обратного ответа")
     file_path: str | None = Field(None, description="Путь к вложению (если есть)")
+    source: Literal["bot", "operator", "ai"] | None = Field(
+        None, description="Сценарий, из которого создано обращение",
+    )
 
     @field_validator("body")
     @classmethod

@@ -51,6 +51,7 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import analytics
 import client_api
 import database as db
 from config import (
@@ -450,6 +451,33 @@ def index():
         statuses=STATUSES,
         status_colors=STATUS_COLORS,
         user=session["user"],
+    )
+
+
+def _human_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {secs} с"
+    return f"{secs} с"
+
+
+@app.get("/analytics")
+@admin_required
+def analytics_dashboard():
+    try:
+        period = analytics.parse_period(request.args.get("from"), request.args.get("to"))
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    report = analytics.build_dashboard(period)
+    return render_template(
+        "analytics.html", report=report, period=period,
+        human_duration=_human_duration, user=session["user"],
     )
 
 

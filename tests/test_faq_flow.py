@@ -178,6 +178,21 @@ def test_terminal_node_does_not_invite_disabled_ai():
     assert all(button["payload"] != "ai_from_faq" for row in rows for button in row)
 
 
+def test_terminal_node_hides_disabled_appeal_transition():
+    deps, state = _dependencies()
+    object.__setattr__(deps, "appeal_available", lambda: False)
+    state.update({
+        "state": "script_node",
+        "script": {
+            "nodes": {5: {"id": 5, "title": "Готовый ответ", "is_terminal": True}},
+            "edges_by_from": {}, "current": 5,
+        },
+    })
+    faq.show_script_node(42, deps)
+    rows = deps.send_buttons.call_args.args[2]
+    assert all(button["payload"] != "appeal_start" for row in rows for button in row)
+
+
 def test_faq_node_renders_structured_site_link_without_markdown():
     deps, state = _dependencies()
     state["script"] = {
@@ -218,6 +233,26 @@ def test_navigate_can_move_to_child_and_back_to_parent():
     faq.navigate_script_node(42, 1, deps)
     assert state["script"]["current"] == 1
     assert deps.send_buttons.call_args.args[1] == "📌 Родитель"
+
+
+def test_faq_telemetry_tracks_start_views_and_final_without_content():
+    tree = {
+        "title": "Секретный текст",
+        "nodes": [
+            {"id": 1, "title": "Начало", "is_terminal": False},
+            {"id": 2, "title": "Ответ с ПДн", "is_terminal": True},
+        ],
+        "edges": [{"from_node_id": 1, "to_node_id": 2, "label": "Далее"}],
+    }
+    deps, state = _dependencies(tree=(tree, None))
+    recorder = Mock()
+    object.__setattr__(deps, "record_event", recorder)
+    faq.open_script(42, 9, deps)
+    faq.navigate_script_node(42, 2, deps)
+    event_names = [call.args[0] for call in recorder.call_args_list]
+    assert event_names == ["faq_script_start", "faq_node_view", "faq_node_view", "faq_final"]
+    assert all("Секрет" not in repr(call) and "ПДн" not in repr(call) for call in recorder.call_args_list)
+    assert state["faq_terminal"]["script_id"] == 9
 
 
 def test_node_edges_paginate_without_invalid_max_keyboard():

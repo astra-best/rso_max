@@ -116,6 +116,64 @@ def test_stale_operator_requeues_warns_and_times_out(operator_db):
     events = operator_chat.process_timeouts(now=base + timedelta(minutes=6))
     assert [item["chat_id"] for item in events["requeued"]] == [5]
     assert operator_chat.get_open_dialog_for_chat(5)["status"] == "waiting"
+    conn = db.get_conn()
+    tracked = conn.execute(
+        "SELECT event_type,dialog_id FROM analytics_events"
+    ).fetchall()
+    conn.close()
+    assert [(row["event_type"], row["dialog_id"]) for row in tracked] == [
+        ("operator_assigned", events["requeued"][0]["id"]),
+        ("operator_connection_lost", events["requeued"][0]["id"]),
+    ]
+
+
+def test_reassignment_telemetry_and_first_assignment_are_durable(operator_db):
+    _settings(heartbeat_timeout_min=5, max_active_dialogs=2)
+    first, second = _operator("lost-owner"), _operator("new-owner")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(first, now=base)
+    dialog = operator_chat.request_dialog(
+        55, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.start_shift(second, now=base + timedelta(minutes=6))
+    result = operator_chat.process_timeouts(now=base + timedelta(minutes=6))
+    assert result["assigned"][0]["operator_id"] == second
+    saved = operator_chat.get_open_dialog_for_chat(55)
+    assert saved["first_assigned_at"] == dialog["assigned_at"]
+    conn = db.get_conn()
+    event_types = [
+        row["event_type"] for row in conn.execute(
+            "SELECT event_type FROM analytics_events WHERE dialog_id=? ORDER BY id",
+            (dialog["id"],),
+        )
+    ]
+    conn.close()
+    assert event_types == [
+        "operator_assigned", "operator_connection_lost",
+        "operator_assigned", "operator_reassigned",
+    ]
+
+
+def test_single_assignment_event_is_deduplicated(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("one-owner")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    first = operator_chat.request_dialog(
+        56, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    second = operator_chat.request_dialog(
+        56, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    assert first["id"] == second["id"]
+    conn = db.get_conn()
+    count = conn.execute(
+        """SELECT COUNT(*) n FROM analytics_events
+           WHERE dialog_id=? AND event_type='operator_assigned'""",
+        (first["id"],),
+    ).fetchone()["n"]
+    conn.close()
+    assert count == 1
 
 
 def test_messages_object_auth_close_and_unique_rating(operator_db):

@@ -76,6 +76,41 @@ def test_sanitizer_removes_known_and_obvious_personal_data():
         assert secret not in cleaned
 
 
+def test_ai_telemetry_counts_delivery_only_after_successful_send():
+    recorder = Mock()
+    deps, _, _ = _deps(record_event=recorder, send_buttons=Mock(return_value=False))
+    ai_assistant.ask(42, "Почему нет отопления?", deps)
+    assert [call.args[0] for call in recorder.call_args_list] == ["ai_question"]
+
+    recorder.reset_mock()
+    object.__setattr__(deps, "send_buttons", Mock(return_value=True))
+    ai_assistant.ask(42, "Когда включат отопление?", deps)
+    assert [call.args[0] for call in recorder.call_args_list] == [
+        "ai_question", "ai_answer_delivered",
+    ]
+
+
+def test_ai_telemetry_tracks_limit_and_provider_error_without_question_text():
+    recorder = Mock()
+    limited, _, _ = _deps(record_event=recorder, reserve_question=Mock(return_value=False))
+    ai_assistant.ask(42, "Почему нет воды?", limited)
+    assert [call.args[0] for call in recorder.call_args_list] == ["ai_question", "ai_limit_hit"]
+    assert "Почему" not in repr(recorder.call_args_list)
+
+    recorder.reset_mock()
+    failed, _, _ = _deps(
+        record_event=recorder,
+        complete=Mock(side_effect=ai_assistant.AIServiceError("secret provider detail")),
+    )
+    ai_assistant.ask(42, "Почему нет воды?", failed)
+    assert [call.args[0] for call in recorder.call_args_list] == [
+        "ai_question", "ai_provider_error",
+    ]
+    assert recorder.call_args_list[-1].kwargs["metadata"] == {
+        "error_class": "provider_or_response",
+    }
+
+
 @pytest.mark.parametrize(
     ("source", "secret"),
     [

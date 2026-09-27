@@ -301,6 +301,7 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "appeals", "reopen_reason", "TEXT")
+    _ensure_column(c, "appeals", "source", "TEXT")
 
     # 4.2 Ответы операторов
     c.execute("""
@@ -439,6 +440,11 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "operator_dialogs", "reassignment_pending", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(c, "operator_dialogs", "first_assigned_at", "TEXT")
+    c.execute(
+        "UPDATE operator_dialogs SET first_assigned_at=assigned_at "
+        "WHERE first_assigned_at IS NULL AND assigned_at IS NOT NULL"
+    )
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
         ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
@@ -524,6 +530,34 @@ def init_db() -> None:
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_reports_status ON operator_client_reports(status,created_at,id)")
+
+    # Обезличенная продуктовая телеметрия. В metadata_json разрешены только
+    # технические типы/классы ошибок; тексты сообщений и ПДн сюда не пишутся.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            script_id INTEGER,
+            node_id INTEGER,
+            dialog_id INTEGER,
+            operator_id INTEGER,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            dedupe_key TEXT UNIQUE
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_time_type "
+        "ON analytics_events(occurred_at,event_type)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_script "
+        "ON analytics_events(script_id,node_id,occurred_at)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_dialog "
+        "ON analytics_events(dialog_id,event_type,occurred_at)"
+    )
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_chat_blocks (
             chat_id INTEGER PRIMARY KEY,
@@ -709,6 +743,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_appeals_created_at
         ON appeals(created_at)
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_appeals_chat_category_created ON appeals(chat_id,category,created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_appeals_ls_category_created ON appeals(ls,category,created_at)")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_appeal_responses_appeal
         ON appeal_responses(appeal_id)
@@ -794,6 +830,7 @@ def create_appeal(
     chat_id: int | None = None,
     file_path: str | None = None,
     priority: str = "normal",
+    source: str | None = None,
 ) -> str:
     """
     Создаёт обращение, возвращает ticket_no.
@@ -806,10 +843,13 @@ def create_appeal(
     c.execute(
         """
         INSERT INTO appeals
-            (ticket_no, ls, channel, category, priority, body, chat_id, file_path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ticket_no, ls, channel, category, priority, body, chat_id, file_path, created_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (ticket_no, ls, channel, category, priority, body, chat_id, file_path, msk_now()),
+        (
+            ticket_no, ls, channel, category, priority, body, chat_id,
+            file_path, msk_now(), source if source in {"bot", "operator", "ai"} else None,
+        ),
     )
     conn.commit()
     conn.close()

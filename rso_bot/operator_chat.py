@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+import analytics
 import database as db
 
 ACTIVE_STATUSES = ("waiting", "active")
@@ -450,6 +451,17 @@ def request_dialog(
                 _iso(now), _iso(now) if operator_id else None, _iso(now),
             ),
         )
+        if operator_id:
+            conn.execute(
+                "UPDATE operator_dialogs SET first_assigned_at=? WHERE id=?",
+                (_iso(now), cur.lastrowid),
+            )
+            analytics.record_event_in_transaction(
+                conn, "operator_assigned", dialog_id=cur.lastrowid,
+                operator_id=operator_id,
+                dedupe_key=f"operator:{cur.lastrowid}:assigned:1",
+                occurred_at=now,
+            )
         dialog_id = cur.lastrowid
         if status == "active":
             conn.execute(
@@ -520,9 +532,10 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             was_reassignment = bool(waiting["reassignment_pending"])
             cur = conn.execute(
                 """UPDATE operator_dialogs SET status='active',operator_id=?,assigned_at=?,
+                   first_assigned_at=COALESCE(first_assigned_at,?),
                    last_activity_at=?,warned_at=NULL,reassignment_pending=0
                    WHERE id=? AND status='waiting'""",
-                (operator_id, _iso(now), _iso(now), waiting["id"]),
+                (operator_id, _iso(now), _iso(now), _iso(now), waiting["id"]),
             )
             if not cur.rowcount:
                 continue
@@ -552,6 +565,19 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
                 now=now,
             )
             assigned.append({"dialog_id": waiting["id"], "chat_id": waiting["chat_id"], "operator_id": operator_id})
+            analytics.record_event_in_transaction(
+                conn, "operator_assigned", dialog_id=waiting["id"],
+                operator_id=operator_id,
+                dedupe_key=f"operator:{waiting['id']}:assigned:{assignment_no}",
+                occurred_at=now,
+            )
+            if was_reassignment:
+                analytics.record_event_in_transaction(
+                    conn, "operator_reassigned", dialog_id=waiting["id"],
+                    operator_id=operator_id,
+                    dedupe_key=f"operator:{waiting['id']}:reassigned:{assignment_no}",
+                    occurred_at=now,
+                )
     return assigned
 
 
@@ -1142,6 +1168,11 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
                 (queue_seq, _iso(now), row["id"]),
             )
             result["requeued"].append(dict(row))
+            analytics.record_event_in_transaction(
+                conn, "operator_connection_lost", dialog_id=row["id"],
+                dedupe_key=f"operator:{row['id']}:lost:{row['assigned_at']}",
+                occurred_at=now,
+            )
         warn_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"] - settings["warning_before_min"])))
         close_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"])))
         warns = conn.execute(

@@ -128,6 +128,7 @@ def create_appeal(
     body: str,
     chat_id: int,
     file_path: str | None = None,
+    source: str | None = "bot",
 ) -> tuple[dict | None, str | None]:
     """POST /api/v1/appeals → {"ticket_no": "RSO-..."}"""
     return _post("/api/v1/appeals", {
@@ -137,6 +138,7 @@ def create_appeal(
         "body": body,
         "chat_id": chat_id,
         "file_path": file_path,
+        "source": source,
     })
 
 
