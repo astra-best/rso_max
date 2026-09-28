@@ -44,6 +44,7 @@
 {% block content %}
 <div class="page-header">
     <h1>Обращения</h1>
+    <a class="btn btn-primary" href="{{ url_for('appeals_export', status=current_filters.status, category=current_filters.category, priority=current_filters.priority, date_from=current_filters.date_from, date_to=current_filters.date_to) }}">Выгрузить в Excel</a>
 </div>
 
 {% with messages = get_flashed_messages(with_categories=true) %}

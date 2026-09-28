@@ -920,8 +920,14 @@ def list_appeals(
         query += " AND created_at >= ?"
         params.append(date_from)
     if date_to:
-        query += " AND created_at <= ?"
-        params.append(date_to)
+        try:
+            next_day = (datetime.fromisoformat(date_to).date() + timedelta(days=1)).isoformat()
+        except ValueError:
+            query += " AND created_at <= ?"
+            params.append(date_to)
+        else:
+            query += " AND created_at < ?"
+            params.append(next_day)
     if ls:
         query += " AND ls = ?"
         params.append(ls)
@@ -2769,6 +2775,8 @@ def get_appointments(
     branch_id: int | None = None,
     date: str | None = None,
     status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> list[sqlite3.Row]:
     """Список записей для операторского портала (REQ-СОТ-05-01)."""
     query = """
@@ -2787,6 +2795,12 @@ def get_appointments(
     if status:
         query += " AND a.status=?"
         params.append(status)
+    if date_from:
+        query += " AND a.slot_date>=?"
+        params.append(date_from)
+    if date_to:
+        query += " AND a.slot_date<=?"
+        params.append(date_to)
     query += " ORDER BY a.slot_date, a.slot_time"
 
     conn = get_conn()

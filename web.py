@@ -36,6 +36,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 from flask import (
     Flask,
@@ -54,6 +55,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import analytics
 import client_api
 import database as db
+import excel_exports
 from config import (
     API,
     APP_ENV,
@@ -364,6 +366,27 @@ def _enrich_appeals(rows) -> list[dict]:
     return result
 
 
+def _appeal_filters() -> dict[str, str | None]:
+    return {
+        "status": request.args.get("status") or None,
+        "category": request.args.get("category") or None,
+        "priority": request.args.get("priority") or None,
+        "date_from": request.args.get("date_from") or None,
+        "date_to": request.args.get("date_to") or None,
+    }
+
+
+def _xlsx_response(output, prefix: str):
+    filename = f"{prefix}_{datetime.now(ZoneInfo('Europe/Moscow')).strftime('%Y-%m-%d')}.xlsx"
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
+
+
 # ── Авторизация ───────────────────────────────────────────────────────────────
 
 @app.route("/login", methods=["GET", "POST"])
@@ -523,19 +546,8 @@ def ai_settings_page():
 @app.route("/appeals")
 @login_required
 def appeals_list():
-    status_filter   = request.args.get("status")   or None
-    category_filter = request.args.get("category") or None
-    priority_filter = request.args.get("priority") or None
-    date_from       = request.args.get("date_from") or None
-    date_to         = request.args.get("date_to")   or None
-
-    rows = db.list_appeals(
-        status=status_filter,
-        category=category_filter,
-        priority=priority_filter,
-        date_from=date_from,
-        date_to=date_to,
-    )
+    filters = _appeal_filters()
+    rows = db.list_appeals(**filters)
     appeals = _enrich_appeals(rows)
     counts  = db.get_counts()
 
@@ -547,15 +559,38 @@ def appeals_list():
         status_colors=STATUS_COLORS,
         categories=CATEGORIES,
         channels=CHANNELS,
-        current_filters={
-            "status":   status_filter,
-            "category": category_filter,
-            "priority": priority_filter,
-            "date_from": date_from,
-            "date_to":   date_to,
-        },
+        current_filters=filters,
         user=session["user"],
     )
+
+
+@app.get("/appeals/export.xlsx")
+@login_required
+def appeals_export():
+    rows = _enrich_appeals(db.list_appeals(**_appeal_filters()))
+    columns = (
+        ("Номер обращения", 22), ("Лицевой счёт", 18), ("Категория", 24),
+        ("Приоритет", 14), ("Текст обращения", 55), ("Статус", 22),
+        ("Канал", 16), ("Источник", 16), ("Дата подачи", 20), ("Дата закрытия", 20),
+    )
+    output = excel_exports.build_workbook(
+        "Обращения", columns,
+        (
+            (
+                excel_exports.safe_text(row.get("ticket_no")),
+                excel_exports.safe_text(row.get("ls")),
+                excel_exports.safe_text(row.get("category_label")),
+                "Высокий" if row.get("priority") == "high" else "Обычный",
+                excel_exports.safe_text(row.get("body")),
+                excel_exports.safe_text(row.get("status_label")),
+                excel_exports.safe_text(row.get("channel_label")),
+                excel_exports.safe_text(row.get("source") or "unknown/legacy"),
+                excel_exports.parse_datetime(row.get("created_at")),
+                excel_exports.parse_datetime(row.get("closed_at")),
+            ) for row in rows
+        ), table_name="AppealsExport",
+    )
+    return _xlsx_response(output, "appeals")
 
 
 # ── Карточка обращения ────────────────────────────────────────────────────────
@@ -1311,10 +1346,67 @@ def operator_chat_settings_page():
 @app.get("/operator-chat/history")
 @admin_required
 def operator_chat_history_page():
+    filters = _operator_history_filters()
     return render_template(
         "operator_chat_history.html", user=session["user"],
-        dialogs=operator_chat.list_history(),
+        dialogs=operator_chat.list_history(**filters),
+        current_filters=dict(request.args),
+        operators=[row for row in db.get_all_users() if row["role"] == "operator"],
     )
+
+
+def _operator_history_filters() -> dict:
+    status = request.args.get("status") or None
+    if status and status not in {"closed", "timed_out", "cancelled"}:
+        abort(400, description="Некорректный статус")
+    operator_raw = request.args.get("operator_id") or None
+    try:
+        operator_id = int(operator_raw) if operator_raw else None
+    except ValueError:
+        abort(400, description="Некорректный оператор")
+    date_from = request.args.get("date_from") or None
+    date_to_raw = request.args.get("date_to") or None
+    date_to = None
+    if date_to_raw:
+        try:
+            date_to = (datetime.fromisoformat(date_to_raw).date() + timedelta(days=1)).isoformat()
+        except ValueError:
+            abort(400, description="Некорректная дата")
+    return {
+        "status": status, "operator_id": operator_id,
+        "date_from": date_from, "date_to": date_to,
+    }
+
+
+@app.get("/operator-chat/history/export.xlsx")
+@admin_required
+def operator_chat_history_export():
+    rows = operator_chat.list_history(limit=None, **_operator_history_filters())
+    columns = (
+        ("Номер диалога", 16), ("Клиент", 30), ("Лицевой счёт", 18),
+        ("Адрес", 38), ("Оператор", 28), ("Статус", 18),
+        ("Создан", 20), ("Первое назначение", 20), ("Закрыт", 20),
+        ("Оценка", 12), ("Контекст FAQ", 55),
+    )
+    output = excel_exports.build_workbook(
+        "История диалогов", columns,
+        (
+            (
+                excel_exports.safe_text(row.get("id")),
+                excel_exports.safe_text(row.get("client_fio") or "Неавторизованный/удалён"),
+                excel_exports.safe_text(row.get("client_ls")),
+                excel_exports.safe_text(row.get("client_address")),
+                excel_exports.safe_text(row.get("operator_name")),
+                excel_exports.safe_text(row.get("status")),
+                excel_exports.parse_datetime(row.get("created_at"), utc_to_moscow=True),
+                excel_exports.parse_datetime(row.get("first_assigned_at"), utc_to_moscow=True),
+                excel_exports.parse_datetime(row.get("closed_at"), utc_to_moscow=True),
+                row.get("rating"),
+                excel_exports.safe_text(row.get("faq_context")),
+            ) for row in rows
+        ), table_name="OperatorDialogsExport",
+    )
+    return _xlsx_response(output, "operator_dialogs")
 
 
 @app.get("/operator-chat/api/history")
@@ -1469,17 +1561,28 @@ def _enrich_appointments(rows) -> list[dict]:
     return result
 
 
+def _appointment_filters() -> dict:
+    branch_id_raw = request.args.get("branch_id") or None
+    try:
+        branch_id = int(branch_id_raw) if branch_id_raw else None
+    except ValueError:
+        abort(400, description="Некорректный филиал")
+    return {
+        "branch_id": branch_id,
+        "date": request.args.get("date") or None,
+        "status": request.args.get("status") or None,
+        "date_from": request.args.get("date_from") or None,
+        "date_to": request.args.get("date_to") or None,
+    }
+
+
 # ── Записи на приём (REQ-СОТ-05) ─────────────────────────────────────────────
 
 @app.route("/appointments")
 @login_required
 def appointments_list():
-    branch_id_raw = request.args.get("branch_id") or None
-    date_filter   = request.args.get("date") or None
-    status_filter = request.args.get("status") or None
-    branch_id     = int(branch_id_raw) if branch_id_raw else None
-
-    rows = db.get_appointments(branch_id=branch_id, date=date_filter, status=status_filter)
+    filters = _appointment_filters()
+    rows = db.get_appointments(**filters)
     appointments = _enrich_appointments(rows)
     branches = db.get_branches()
 
@@ -1489,12 +1592,45 @@ def appointments_list():
         branches=branches,
         statuses=APPOINTMENT_STATUSES,
         current_filters={
-            "branch_id": branch_id_raw,
-            "date":      date_filter,
-            "status":    status_filter,
+            "branch_id": str(filters["branch_id"]) if filters["branch_id"] is not None else None,
+            "date":      filters["date"],
+            "status":    filters["status"],
         },
         user=session["user"],
     )
+
+
+@app.get("/appointments/export.xlsx")
+@login_required
+def appointments_export():
+    rows = _enrich_appointments(db.get_appointments(**_appointment_filters()))
+    columns = (
+        ("Номер записи", 16), ("Дата приёма", 16), ("Время приёма", 14),
+        ("Филиал", 30), ("Адрес филиала", 38), ("Лицевой счёт", 18),
+        ("Тема", 45), ("Статус", 18), ("Канал", 14), ("Создана", 20),
+        ("Отменена", 20), ("Причина отмены", 40), ("Кем отменена", 18),
+    )
+    output = excel_exports.build_workbook(
+        "Записи на приём", columns,
+        (
+            (
+                excel_exports.safe_text(row.get("id")),
+                excel_exports.parse_date(row.get("slot_date")),
+                excel_exports.parse_time(row.get("slot_time")),
+                excel_exports.safe_text(row.get("branch_name")),
+                excel_exports.safe_text(row.get("branch_address")),
+                excel_exports.safe_text(row.get("ls")),
+                excel_exports.safe_text(row.get("theme")),
+                excel_exports.safe_text(row.get("status_label")),
+                excel_exports.safe_text(row.get("channel")),
+                excel_exports.parse_datetime(row.get("created_at")),
+                excel_exports.parse_datetime(row.get("cancelled_at")),
+                excel_exports.safe_text(row.get("cancel_reason")),
+                excel_exports.safe_text(row.get("cancelled_by")),
+            ) for row in rows
+        ), table_name="AppointmentsExport",
+    )
+    return _xlsx_response(output, "appointments")
 
 
 @app.route("/appointments/<int:appointment_id>/cancel", methods=["POST"])

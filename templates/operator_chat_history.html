@@ -1,8 +1,13 @@
 {% extends "base.html" %}
 {% block title %}История операторских диалогов{% endblock %}
 {% block content %}
-<h1>История операторских диалогов</h1>
+<div class="page-header"><h1>История операторских диалогов</h1><a class="btn btn-primary" href="{{ url_for('operator_chat_history_export', status=current_filters.status, operator_id=current_filters.operator_id, date_from=current_filters.date_from, date_to=current_filters.date_to) }}">Выгрузить в Excel</a></div>
+<form class="card mb-3" method="get" action="{{ url_for('operator_chat_history_page') }}"><div class="card-body" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+<div class="form-group"><label for="history-status">Статус</label><select class="form-control" id="history-status" name="status"><option value="">Все</option><option value="closed" {% if current_filters.status == 'closed' %}selected{% endif %}>Закрыт</option><option value="timed_out" {% if current_filters.status == 'timed_out' %}selected{% endif %}>По тайм-ауту</option><option value="cancelled" {% if current_filters.status == 'cancelled' %}selected{% endif %}>Отменён</option></select></div>
+<div class="form-group"><label for="history-operator">Оператор</label><select class="form-control" id="history-operator" name="operator_id"><option value="">Все</option>{% for operator in operators %}<option value="{{ operator.id }}" {% if current_filters.operator_id == operator.id|string %}selected{% endif %}>{{ operator.name }}</option>{% endfor %}</select></div>
+<div class="form-group"><label for="history-from">С даты</label><input class="form-control" id="history-from" name="date_from" type="date" value="{{ current_filters.date_from or '' }}"></div><div class="form-group"><label for="history-to">По дату</label><input class="form-control" id="history-to" name="date_to" type="date" value="{{ current_filters.date_to or '' }}"></div><button class="btn btn-primary" type="submit">Применить</button><a class="btn btn-secondary" href="{{ url_for('operator_chat_history_page') }}">Сбросить</a>
+</div></form>
 <div class="card"><div class="card-body p-0"><table class="table"><thead><tr><th>№</th><th>Клиент</th><th>Оператор</th><th>Статус</th><th>Закрыт</th><th>Оценка</th></tr></thead><tbody>
-{% for d in dialogs %}<tr><td><a href="{{ url_for('operator_chat_history_detail', dialog_id=d.id) }}">{{ d.id }}</a></td><td>{{ d.client_fio or 'Неавторизованный/удалён' }}</td><td>{{ d.operator_name or '—' }}</td><td>{{ d.status }}</td><td>{{ d.closed_at or '—' }}</td><td>{{ d.rating or '—' }}</td></tr>{% endfor %}
+{% for d in dialogs %}<tr><td><a href="{{ url_for('operator_chat_history_detail', dialog_id=d.id) }}">{{ d.id }}</a></td><td>{{ d.client_fio or 'Неавторизованный/удалён' }}</td><td>{{ d.operator_name or '—' }}</td><td>{{ d.status }}</td><td>{{ d.closed_at or '—' }}</td><td>{{ d.rating or '—' }}</td></tr>{% else %}<tr><td colspan="6" class="text-muted text-center">Диалогов не найдено</td></tr>{% endfor %}
 </tbody></table></div></div>
 {% endblock %}

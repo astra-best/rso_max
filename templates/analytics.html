@@ -2,7 +2,7 @@
 {% block title %}Аналитика{% endblock %}
 {% block head %}
 <style>
-  .analytics-filter,.analytics-tabs,.kpi-grid{display:flex;gap:12px;flex-wrap:wrap}.analytics-filter{align-items:end;margin-bottom:18px}.analytics-filter .form-group{min-width:180px;margin:0}
+  .analytics-filter,.analytics-tabs,.kpi-grid,.analytics-exports{display:flex;gap:12px;flex-wrap:wrap}.analytics-filter{align-items:end;margin-bottom:18px}.analytics-filter .form-group{min-width:180px;margin:0}
   .analytics-tabs{margin-bottom:20px}.analytics-tabs a{color:var(--muted);border:1px solid var(--border);padding:7px 12px;border-radius:18px;text-decoration:none}.analytics-tabs a:hover{color:var(--accent);border-color:var(--accent)}
   .analytics-section{scroll-margin-top:20px;margin-bottom:34px}.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:18px}.kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px}.kpi-value{font-size:25px;font-weight:700;color:var(--accent);margin-top:8px}.kpi-label{font-size:10px;color:var(--muted);text-transform:uppercase}
   .analytics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.metric-table{width:100%;border-collapse:collapse}.metric-table td,.metric-table th{padding:8px;border-bottom:1px solid var(--border);text-align:left;font-size:11px}.metric-table th{color:var(--muted)}
@@ -25,6 +25,11 @@
  <button class="btn btn-primary" type="submit">Применить</button>
 </form>
 <div class="notice">Исторические показатели частичны: новая телеметрия собирается только после установки этой версии. Старые обращения отображаются с источником «unknown/legacy».</div>
+<div class="card mb-3"><div class="card-header">Быстрые выгрузки за выбранный период</div><div class="card-body analytics-exports">
+  <a class="btn btn-primary" href="{{ url_for('appeals_export', date_from=period.from, date_to=period.to) }}">Обращения — Excel</a>
+  <a class="btn btn-primary" href="{{ url_for('appointments_export', date_from=period.from, date_to=period.to) }}">Записи на приём — Excel</a>
+  <a class="btn btn-primary" href="{{ url_for('operator_chat_history_export', date_from=period.from, date_to=period.to) }}">История диалогов — Excel</a>
+</div></div>
 <nav class="analytics-tabs" aria-label="Разделы аналитики"><a href="#appeals">Обращения</a><a href="#faq">FAQ</a><a href="#operators">Операторы</a><a href="#ai">ИИ</a></nav>
 
 <section id="appeals" class="analytics-section"><h2 class="mb-3">Обращения</h2><div class="kpi-grid">

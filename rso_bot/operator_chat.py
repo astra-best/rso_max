@@ -899,16 +899,36 @@ def rating_report() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def list_history(limit: int = 200) -> list[dict[str, Any]]:
-    limit = max(1, min(int(limit), 500))
-    with _connection() as conn:
-        rows = conn.execute(
-            """SELECT d.*,u.name operator_name FROM operator_dialogs d
+def list_history(
+    limit: int | None = 200,
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict[str, Any]]:
+    query = """SELECT d.*,u.name operator_name FROM operator_dialogs d
                LEFT JOIN users u ON u.id=d.operator_id
-               WHERE d.status IN ('closed','timed_out','cancelled')
-               ORDER BY COALESCE(d.closed_at,d.created_at) DESC,d.id DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
+               WHERE d.status IN ('closed','timed_out','cancelled')"""
+    params: list[Any] = []
+    if status in {"closed", "timed_out", "cancelled"}:
+        query += " AND d.status=?"
+        params.append(status)
+    if operator_id is not None:
+        query += " AND d.operator_id=?"
+        params.append(operator_id)
+    if date_from:
+        query += " AND COALESCE(d.closed_at,d.created_at)>=?"
+        params.append(date_from)
+    if date_to:
+        query += " AND COALESCE(d.closed_at,d.created_at)<?"
+        params.append(date_to)
+    query += " ORDER BY COALESCE(d.closed_at,d.created_at) DESC,d.id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+    with _connection() as conn:
+        rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
 
