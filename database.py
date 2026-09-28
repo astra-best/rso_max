@@ -929,7 +929,7 @@ def _appeals_query(
     if date_to:
         try:
             next_day = (datetime.fromisoformat(date_to).date() + timedelta(days=1)).isoformat()
-        except ValueError:
+        except (ValueError, OverflowError):
             query += " AND created_at <= ?"
             params.append(date_to)
         else:

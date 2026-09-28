@@ -369,12 +369,26 @@ def _enrich_appeals(rows) -> list[dict]:
 
 
 def _appeal_filters() -> dict[str, str | None]:
+    def date_arg(name: str, *, needs_next_day: bool = False) -> str | None:
+        raw = request.args.get(name) or None
+        if raw is None:
+            return None
+        if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
+            abort(400, description="Некорректная дата")
+        try:
+            parsed = date.fromisoformat(raw)
+        except ValueError:
+            abort(400, description="Некорректная дата")
+        if needs_next_day and parsed == date.max:
+            abort(400, description="Некорректная дата")
+        return raw
+
     return {
         "status": request.args.get("status") or None,
         "category": request.args.get("category") or None,
         "priority": request.args.get("priority") or None,
-        "date_from": request.args.get("date_from") or None,
-        "date_to": request.args.get("date_to") or None,
+        "date_from": date_arg("date_from"),
+        "date_to": date_arg("date_to", needs_next_day=True),
     }
 
 
@@ -1381,7 +1395,10 @@ def _operator_history_filters() -> dict:
         except ValueError:
             abort(400, description="Некорректная дата")
         if next_day:
-            parsed += timedelta(days=1)
+            try:
+                parsed += timedelta(days=1)
+            except OverflowError:
+                abort(400, description="Некорректная дата")
         moscow_midnight = datetime.combine(parsed, datetime.min.time(), ZoneInfo("Europe/Moscow"))
         return moscow_midnight.astimezone(timezone.utc).isoformat()
 

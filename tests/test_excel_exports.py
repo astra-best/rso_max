@@ -194,12 +194,23 @@ def test_dialog_history_dates_use_moscow_calendar_boundaries(export_db):
 
 @pytest.mark.parametrize(
     "query",
-    ["date_from=2026-9-02", "date_from=not-a-date", "date_to=2026-02-30"],
+    [
+        "date_from=2026-9-02",
+        "date_from=not-a-date",
+        "date_to=2026-02-30",
+        "date_to=9999-12-31",
+    ],
 )
 def test_dialog_history_rejects_invalid_dates(export_db, query):
     client = web.app.test_client()
     _login(client, "admin-export")
     assert client.get(f"/operator-chat/history/export.xlsx?{query}").status_code == 400
+
+
+def test_appeals_export_rejects_unrepresentable_end_date(export_db):
+    client = web.app.test_client()
+    _login(client, "operator-export")
+    assert client.get("/appeals/export.xlsx?date_to=9999-12-31").status_code == 400
 
 
 def test_analytics_has_three_period_scoped_exports(export_db):
