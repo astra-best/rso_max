@@ -105,6 +105,17 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _iter_query(query: str, params: list, batch_size: int = 500):
+    """Stream query results while keeping the connection scoped to iteration."""
+    conn = get_conn()
+    try:
+        cursor = conn.execute(query, params)
+        while batch := cursor.fetchmany(batch_size):
+            yield from batch
+    finally:
+        conn.close()
+
+
 # ── Инициализация и миграции ──────────────────────────────────────────────────
 
 def _migrate_appeals_legacy(c: sqlite3.Cursor) -> None:
@@ -893,18 +904,14 @@ def get_appeal_by_id(appeal_id: int) -> sqlite3.Row | None:
     return row
 
 
-def list_appeals(
+def _appeals_query(
     status: str | None = None,
     category: str | None = None,
     priority: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     ls: str | None = None,
-) -> list[sqlite3.Row]:
-    """
-    Список обращений с фильтрами для операторского портала.
-    Все параметры опциональны.
-    """
+) -> tuple[str, list]:
     query = "SELECT * FROM appeals WHERE 1=1"
     params: list = []
     if status:
@@ -932,11 +939,37 @@ def list_appeals(
         query += " AND ls = ?"
         params.append(ls)
     query += " ORDER BY created_at DESC"
+    return query, params
+
+
+def list_appeals(
+    status: str | None = None,
+    category: str | None = None,
+    priority: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    ls: str | None = None,
+) -> list[sqlite3.Row]:
+    """Список обращений с фильтрами для операторского портала."""
+    query, params = _appeals_query(status, category, priority, date_from, date_to, ls)
 
     conn = get_conn()
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
+
+
+def iter_appeals(
+    status: str | None = None,
+    category: str | None = None,
+    priority: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    ls: str | None = None,
+):
+    """Stream every matching appeal without loading the result set into memory."""
+    query, params = _appeals_query(status, category, priority, date_from, date_to, ls)
+    yield from _iter_query(query, params)
 
 
 def update_appeal_status(
@@ -2771,14 +2804,13 @@ def mark_appointment(appointment_id: int, status: str) -> None:
     conn.close()
 
 
-def get_appointments(
+def _appointments_query(
     branch_id: int | None = None,
     date: str | None = None,
     status: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
-) -> list[sqlite3.Row]:
-    """Список записей для операторского портала (REQ-СОТ-05-01)."""
+) -> tuple[str, list]:
     query = """
         SELECT a.*, b.name AS branch_name, b.address AS branch_address
         FROM appointments a
@@ -2802,11 +2834,35 @@ def get_appointments(
         query += " AND a.slot_date<=?"
         params.append(date_to)
     query += " ORDER BY a.slot_date, a.slot_time"
+    return query, params
+
+
+def get_appointments(
+    branch_id: int | None = None,
+    date: str | None = None,
+    status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[sqlite3.Row]:
+    """Список записей для операторского портала (REQ-СОТ-05-01)."""
+    query, params = _appointments_query(branch_id, date, status, date_from, date_to)
 
     conn = get_conn()
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
+
+
+def iter_appointments(
+    branch_id: int | None = None,
+    date: str | None = None,
+    status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """Stream every matching appointment without loading all rows into memory."""
+    query, params = _appointments_query(branch_id, date, status, date_from, date_to)
+    yield from _iter_query(query, params)
 
 
 def get_appointment(appointment_id: int) -> sqlite3.Row | None:

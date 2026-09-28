@@ -899,14 +899,14 @@ def rating_report() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def list_history(
+def _history_query(
     limit: int | None = 200,
     *,
     status: str | None = None,
     operator_id: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[str, list[Any]]:
     query = """SELECT d.*,u.name operator_name FROM operator_dialogs d
                LEFT JOIN users u ON u.id=d.operator_id
                WHERE d.status IN ('closed','timed_out','cancelled')"""
@@ -927,9 +927,44 @@ def list_history(
     if limit is not None:
         query += " LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
+    return query, params
+
+
+def list_history(
+    limit: int | None = 200,
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict[str, Any]]:
+    query, params = _history_query(
+        limit, status=status, operator_id=operator_id,
+        date_from=date_from, date_to=date_to,
+    )
     with _connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def iter_history(
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    batch_size: int = 500,
+):
+    """Stream all matching closed dialogs without the UI history limit."""
+    query, params = _history_query(
+        None, status=status, operator_id=operator_id,
+        date_from=date_from, date_to=date_to,
+    )
+    with _connection() as conn:
+        cursor = conn.execute(query, params)
+        while batch := cursor.fetchmany(batch_size):
+            for row in batch:
+                yield dict(row)
 
 
 def get_history_dialog(dialog_id: int) -> dict[str, Any] | None:
