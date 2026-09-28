@@ -39,6 +39,7 @@ def _workbook(response):
     assert response.status_code == 200
     assert response.mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     assert response.headers["Content-Disposition"].endswith(".xlsx")
+    assert response.headers["Cache-Control"] == "private, no-store"
     return load_workbook(BytesIO(response.data))
 
 
@@ -46,8 +47,11 @@ def _assert_layout(sheet, *, rows: bool = True):
     assert sheet.freeze_panes == "A2"
     assert sheet.auto_filter.ref.startswith("A1:")
     assert sheet.sheet_view.showGridLines is False
+    assert len(sheet.tables) == 0
     if rows:
-        assert len(sheet.tables) == 1
+        assert sheet["A2"].fill.fgColor.rgb.endswith("D9EAF7") is False
+        if sheet.max_row > 2:
+            assert sheet["A3"].fill.fgColor.rgb.endswith("D9EAF7")
 
 
 def test_appeals_export_filters_types_formula_safety_and_list_link(export_db):
@@ -56,7 +60,7 @@ def test_appeals_export_filters_types_formula_safety_and_list_link(export_db):
         """INSERT INTO appeals(ticket_no,ls,channel,category,priority,status,body,
            created_at,closed_at,source) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         [
-            ("RSO-1", "+100", "max", "авария", "high", "closed", "=HYPERLINK(\"x\")", "2026-09-02 10:15", "2026-09-02 11:30", "bot"),
+            ("RSO-1", "+100", "max", "авария", "high", "closed", " \t=HYPERLINK(\"x\")\x00", "2026-09-02 10:15", "2026-09-02 11:30", "bot"),
             ("RSO-2", "200", "max", "прочее", "normal", "new", "обычный", "2026-09-03 10:15", None, "ai"),
         ],
     )
@@ -75,7 +79,8 @@ def test_appeals_export_filters_types_formula_safety_and_list_link(export_db):
     assert sheet.max_row == 2
     assert sheet["A2"].value == "RSO-1"
     assert sheet["B2"].value == "'+100"
-    assert sheet["E2"].value.startswith("'=")
+    assert sheet["E2"].value.startswith("' \t=")
+    assert "\x00" not in sheet["E2"].value
     assert isinstance(sheet["I2"].value, datetime)
     assert sheet["I2"].number_format == "dd.mm.yyyy hh:mm"
 
@@ -159,6 +164,42 @@ def test_dialog_history_export_is_admin_only_filtered_and_unbounded(export_db):
     assert sheet["D2"].value == "'+Адрес"
     assert sheet["K2"].value == "'=FAQ"
     assert sheet["G2"].value.hour == 10  # UTC timestamp is exported in Moscow time.
+
+
+def test_dialog_history_dates_use_moscow_calendar_boundaries(export_db):
+    conn = db.get_conn()
+    operator_id = conn.execute("SELECT id FROM users WHERE username='operator-export'").fetchone()[0]
+    rows = [
+        (20_001, operator_id, "2026-09-01T20:59:59+00:00"),
+        (20_002, operator_id, "2026-09-01T21:00:00+00:00"),
+        (20_003, operator_id, "2026-09-02T20:59:59+00:00"),
+        (20_004, operator_id, "2026-09-02T21:00:00+00:00"),
+    ]
+    conn.executemany(
+        """INSERT INTO operator_dialogs(chat_id,operator_id,status,created_at,
+           last_activity_at,closed_at) VALUES(?,?,'closed',?,?,?)""",
+        [(chat_id, operator_id, timestamp, timestamp, timestamp) for chat_id, operator_id, timestamp in rows],
+    )
+    conn.commit()
+    conn.close()
+    client = web.app.test_client()
+    _login(client, "admin-export")
+    response = client.get(
+        "/operator-chat/history/export.xlsx?date_from=2026-09-02&date_to=2026-09-02"
+    )
+    sheet = _workbook(response).active
+    assert sheet.max_row == 3
+    assert {sheet["A2"].value, sheet["A3"].value} == {"2", "3"}
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["date_from=2026-9-02", "date_from=not-a-date", "date_to=2026-02-30"],
+)
+def test_dialog_history_rejects_invalid_dates(export_db, query):
+    client = web.app.test_client()
+    _login(client, "admin-export")
+    assert client.get(f"/operator-chat/history/export.xlsx?{query}").status_code == 400
 
 
 def test_analytics_has_three_period_scoped_exports(export_db):

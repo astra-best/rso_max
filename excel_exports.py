@@ -4,24 +4,36 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time
-from io import BytesIO
+from tempfile import SpooledTemporaryFile
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 
 MOSCOW = ZoneInfo("Europe/Moscow")
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
 def safe_text(value: Any) -> str:
-    """Return text that Excel cannot interpret as a formula."""
+    """Return valid XML text that Excel cannot interpret as a formula."""
     if value is None:
         return ""
-    text = str(value)
-    return "'" + text if text.startswith(_FORMULA_PREFIXES) else text
+    text = "".join(character for character in str(value) if _is_valid_xml_character(character))
+    formula_candidate = text.lstrip(" \t\r\n")
+    return "'" + text if formula_candidate.startswith(_FORMULA_PREFIXES) else text
+
+
+def _is_valid_xml_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        codepoint in (0x09, 0x0A, 0x0D)
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
 
 
 def parse_datetime(value: Any, *, utc_to_moscow: bool = False) -> datetime | None:
@@ -58,51 +70,53 @@ def build_workbook(
     rows: Iterable[Sequence[Any]],
     *,
     table_name: str,
-) -> BytesIO:
-    """Create a one-sheet workbook with a frozen, filtered header."""
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = sheet_name
-    sheet.append([header for header, _ in columns])
-    row_count = 0
-    for values in rows:
-        sheet.append(list(values))
-        row_count += 1
+) -> SpooledTemporaryFile:
+    """Stream a one-sheet workbook into a bounded-memory temporary file."""
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet(sheet_name)
+    sheet.freeze_panes = "A2"
+    sheet.sheet_view.showGridLines = False
+    sheet.row_dimensions[1].height = 32
+    for index, (_, width) in enumerate(columns, 1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
-    for cell in sheet[1]:
+    header_cells = []
+    for header, _ in columns:
+        cell = WriteOnlyCell(sheet, value=header)
         cell.fill = header_fill
         cell.font = Font(color="FFFFFF", bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:{sheet.cell(1, len(columns)).coordinate}"
-    sheet.sheet_view.showGridLines = False
-    sheet.row_dimensions[1].height = 32
+        header_cells.append(cell)
+    sheet.append(header_cells)
 
-    for index, (_, width) in enumerate(columns, 1):
-        sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
-    for row in sheet.iter_rows(min_row=2):
-        for cell in row:
+    body_fill = PatternFill("solid", fgColor="D9EAF7")
+    row_count = 0
+    for values in rows:
+        row_count += 1
+        cells = []
+        for value in values:
+            cell = WriteOnlyCell(sheet, value=value)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if isinstance(cell.value, datetime):
+            if row_count % 2 == 0:
+                cell.fill = body_fill
+            if isinstance(value, datetime):
                 cell.number_format = "dd.mm.yyyy hh:mm"
-            elif isinstance(cell.value, date):
+            elif isinstance(value, date):
                 cell.number_format = "dd.mm.yyyy"
-            elif isinstance(cell.value, time):
+            elif isinstance(value, time):
                 cell.number_format = "hh:mm"
+            cells.append(cell)
+        sheet.append(cells)
 
-    if row_count:
-        table = Table(
-            displayName=table_name,
-            ref=f"A1:{sheet.cell(row_count + 1, len(columns)).coordinate}",
-        )
-        table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
-            showRowStripes=True, showColumnStripes=False,
-        )
-        sheet.add_table(table)
+    last_column = get_column_letter(len(columns))
+    sheet.auto_filter.ref = f"A1:{last_column}{row_count + 1}"
 
-    output = BytesIO()
+    # Real Excel Tables need random worksheet access and are not reliable in
+    # openpyxl's write-only mode. Auto-filter plus styled/striped rows retain the
+    # useful table presentation without keeping the complete export in memory.
+    del table_name
+    output = SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b")
     workbook.save(output)
     output.seek(0)
     return output

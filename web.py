@@ -33,7 +33,7 @@ import shutil
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -353,17 +353,19 @@ def _csrf_token() -> str:
     return token
 
 
-def _enrich_appeals(rows) -> list[dict]:
+def _iter_enriched_appeals(rows):
     """Дополняет список обращений читаемыми метками."""
-    result = []
     for r in rows:
         d = dict(r)
         d["status_label"]   = STATUSES.get(d.get("status", ""), d.get("status", ""))
         d["status_color"]   = STATUS_COLORS.get(d.get("status", ""), "muted")
         d["category_label"] = CATEGORIES.get(d.get("category", ""), d.get("category", ""))
         d["channel_label"]  = CHANNELS.get(d.get("channel", ""), d.get("channel", ""))
-        result.append(d)
-    return result
+        yield d
+
+
+def _enrich_appeals(rows) -> list[dict]:
+    return list(_iter_enriched_appeals(rows))
 
 
 def _appeal_filters() -> dict[str, str | None]:
@@ -378,13 +380,15 @@ def _appeal_filters() -> dict[str, str | None]:
 
 def _xlsx_response(output, prefix: str):
     filename = f"{prefix}_{datetime.now(ZoneInfo('Europe/Moscow')).strftime('%Y-%m-%d')}.xlsx"
-    return send_file(
+    response = send_file(
         output,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name=filename,
         max_age=0,
     )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 # ── Авторизация ───────────────────────────────────────────────────────────────
@@ -567,7 +571,7 @@ def appeals_list():
 @app.get("/appeals/export.xlsx")
 @login_required
 def appeals_export():
-    rows = _enrich_appeals(db.list_appeals(**_appeal_filters()))
+    rows = _iter_enriched_appeals(db.iter_appeals(**_appeal_filters()))
     columns = (
         ("Номер обращения", 22), ("Лицевой счёт", 18), ("Категория", 24),
         ("Приоритет", 14), ("Текст обращения", 55), ("Статус", 22),
@@ -1364,24 +1368,34 @@ def _operator_history_filters() -> dict:
         operator_id = int(operator_raw) if operator_raw else None
     except ValueError:
         abort(400, description="Некорректный оператор")
-    date_from = request.args.get("date_from") or None
+    date_from_raw = request.args.get("date_from") or None
     date_to_raw = request.args.get("date_to") or None
-    date_to = None
-    if date_to_raw:
+
+    def utc_boundary(raw: str | None, *, next_day: bool = False) -> str | None:
+        if raw is None:
+            return None
+        if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
+            abort(400, description="Некорректная дата")
         try:
-            date_to = (datetime.fromisoformat(date_to_raw).date() + timedelta(days=1)).isoformat()
+            parsed = date.fromisoformat(raw)
         except ValueError:
             abort(400, description="Некорректная дата")
+        if next_day:
+            parsed += timedelta(days=1)
+        moscow_midnight = datetime.combine(parsed, datetime.min.time(), ZoneInfo("Europe/Moscow"))
+        return moscow_midnight.astimezone(timezone.utc).isoformat()
+
     return {
         "status": status, "operator_id": operator_id,
-        "date_from": date_from, "date_to": date_to,
+        "date_from": utc_boundary(date_from_raw),
+        "date_to": utc_boundary(date_to_raw, next_day=True),
     }
 
 
 @app.get("/operator-chat/history/export.xlsx")
 @admin_required
 def operator_chat_history_export():
-    rows = operator_chat.list_history(limit=None, **_operator_history_filters())
+    rows = operator_chat.iter_history(**_operator_history_filters())
     columns = (
         ("Номер диалога", 16), ("Клиент", 30), ("Лицевой счёт", 18),
         ("Адрес", 38), ("Оператор", 28), ("Статус", 18),
@@ -1551,14 +1565,16 @@ WEEKDAYS = {
 }
 
 
-def _enrich_appointments(rows) -> list[dict]:
-    result = []
+def _iter_enriched_appointments(rows):
     for r in rows:
         d = dict(r)
         d["status_label"] = APPOINTMENT_STATUSES.get(d.get("status", ""), d.get("status", ""))
         d["status_color"] = APPOINTMENT_STATUS_COLORS.get(d.get("status", ""), "muted")
-        result.append(d)
-    return result
+        yield d
+
+
+def _enrich_appointments(rows) -> list[dict]:
+    return list(_iter_enriched_appointments(rows))
 
 
 def _appointment_filters() -> dict:
@@ -1603,7 +1619,7 @@ def appointments_list():
 @app.get("/appointments/export.xlsx")
 @login_required
 def appointments_export():
-    rows = _enrich_appointments(db.get_appointments(**_appointment_filters()))
+    rows = _iter_enriched_appointments(db.iter_appointments(**_appointment_filters()))
     columns = (
         ("Номер записи", 16), ("Дата приёма", 16), ("Время приёма", 14),
         ("Филиал", 30), ("Адрес филиала", 38), ("Лицевой счёт", 18),
