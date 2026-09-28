@@ -116,7 +116,8 @@ def build_workbook(
     # openpyxl's write-only mode. Auto-filter plus styled/striped rows retain the
     # useful table presentation without keeping the complete export in memory.
     del table_name
-    output = SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b")
+    # The response owns this handle and closes it after the download finishes.
+    output = SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b")  # noqa: SIM115
     workbook.save(output)
     output.seek(0)
     return output
