@@ -213,6 +213,16 @@ def test_appeals_export_rejects_unrepresentable_end_date(export_db):
     assert client.get("/appeals/export.xlsx?date_to=9999-12-31").status_code == 400
 
 
+def test_exports_reject_out_of_range_database_ids(export_db):
+    huge_id = "999999999999999999999999999999"
+    client = web.app.test_client()
+    _login(client, "operator-export")
+    assert client.get(f"/appointments/export.xlsx?branch_id={huge_id}").status_code == 400
+    client.get("/logout")
+    _login(client, "admin-export")
+    assert client.get(f"/operator-chat/history/export.xlsx?operator_id={huge_id}").status_code == 400
+
+
 def test_analytics_has_three_period_scoped_exports(export_db):
     client = web.app.test_client()
     _login(client, "admin-export")

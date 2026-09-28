@@ -1382,6 +1382,8 @@ def _operator_history_filters() -> dict:
         operator_id = int(operator_raw) if operator_raw else None
     except ValueError:
         abort(400, description="Некорректный оператор")
+    if operator_id is not None and not 1 <= operator_id <= 2**63 - 1:
+        abort(400, description="Некорректный оператор")
     date_from_raw = request.args.get("date_from") or None
     date_to_raw = request.args.get("date_to") or None
 
@@ -1599,6 +1601,8 @@ def _appointment_filters() -> dict:
     try:
         branch_id = int(branch_id_raw) if branch_id_raw else None
     except ValueError:
+        abort(400, description="Некорректный филиал")
+    if branch_id is not None and not 1 <= branch_id <= 2**63 - 1:
         abort(400, description="Некорректный филиал")
     return {
         "branch_id": branch_id,
