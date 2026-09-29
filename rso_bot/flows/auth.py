@@ -47,6 +47,7 @@ class AccountDependencies:
     get_ls: Callable[[str], Any]
     integration_enabled: bool
     logger: logging.Logger
+    list_account_bindings: Callable[[int], list[Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,9 @@ class AuthFlowDependencies:
     continuations: dict[str, Continuation]
     integration_enabled: bool
     logger: logging.Logger
+    list_account_bindings: Callable[[int], list[Any]] | None = None
+    send_buttons: Callable[[int, str, list[list[dict[str, Any]]]], Any] | None = None
+    make_callback: Callable[[str, str], dict[str, Any]] | None = None
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -88,8 +92,39 @@ def _row_value(row: Any, key: str, default: Any = None) -> Any:
 
 
 def get_saved_ls(chat_id: int, deps: AccountDependencies) -> str | None:
-    """Return a session or persisted account that is valid for current mode."""
+    """Return the flow-selected/sole durable account; memory is never authority."""
     state = deps.get_state(chat_id)
+    if deps.list_account_bindings is not None:
+        try:
+            rows = deps.list_account_bindings(chat_id)
+        except Exception:  # noqa: BLE001 - DB adapter boundary must fail closed
+            deps.logger.error("Не удалось получить привязки лицевых счетов")
+            return None
+        accounts = [str(_row_value(row, "ls")) for row in rows if _row_value(row, "ls")]
+        selected = state.get("flow_ls")
+        if selected:
+            if selected in accounts:
+                state["ls"] = str(selected)
+                return str(selected)
+            # A revoked active selection is materially different from a new
+            # flow without a selection.  The entry point consumes this marker
+            # and cancels the old action instead of falling through to the
+            # sole remaining account.
+            state.pop("flow_ls", None)
+            state.pop("ls", None)
+            state.pop("authorized_1c", None)
+            state["revoked_selected_ls"] = True
+            return None
+        if len(accounts) == 1:
+            state["ls"] = accounts[0]  # compatibility cache, not an auth source
+            state["flow_ls"] = accounts[0]
+            state["authorized_1c"] = True
+            return accounts[0]
+        state.pop("ls", None)
+        state.pop("authorized_1c", None)
+        return None
+
+    # Compatibility fallback for isolated embedders/tests without the new DAO.
     if state.get("ls") and (not deps.integration_enabled or state.get("authorized_1c")):
         return str(state["ls"])
 
@@ -205,6 +240,32 @@ def reset_ls_brute(chat_id: int, deps: BruteForceDependencies) -> None:
 
 def request_ls(chat_id: int, after: str, deps: AuthFlowDependencies) -> None:
     """Request an account and remember which flow should continue afterward."""
+    if deps.list_account_bindings is not None:
+        try:
+            accounts = deps.list_account_bindings(chat_id)
+        except Exception:  # noqa: BLE001 - startup/adapter compatibility boundary
+            deps.logger.error("Не удалось получить привязки лицевых счетов")
+            accounts = []
+        if len(accounts) == 1:
+            ls = str(_row_value(accounts[0], "ls"))
+            state = deps.get_state(chat_id)
+            state["flow_ls"] = ls
+            state["ls"] = ls
+            action = deps.continuations.get(after)
+            if action:
+                action(chat_id, ls)
+                return
+        if len(accounts) > 1 and deps.send_buttons and deps.make_callback:
+            state = deps.get_state(chat_id)
+            state["state"] = S.ACCOUNT_SELECT
+            state["after_account_select"] = after
+            deps.touch(state)
+            rows = [
+                [deps.make_callback(str(_row_value(item, "ls")), f"account_select:{_row_value(item, 'ls')}")]
+                for item in accounts
+            ]
+            deps.send_buttons(chat_id, "Выберите лицевой счёт:", rows)
+            return
     if deps.integration_enabled:
         deps.start_1c_auth(chat_id, after)
         return

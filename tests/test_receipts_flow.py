@@ -374,6 +374,7 @@ def test_bot_delivery_wrapper_keeps_send_pdf_patch_point() -> None:
         patch.object(bot, "send_message") as send_message,
         patch.object(bot, "_send_pdf") as send_pdf,
         patch.object(bot, "send_main_menu") as send_main_menu,
+        patch.object(bot, "_ensure_bound_flow_account", return_value="100001"),
     ):
         bot._deliver_kvitanciya(7, "100001")
 
@@ -395,8 +396,9 @@ def test_bot_callback_wrapper_clears_flow_and_keeps_hooks() -> None:
     request_ls.assert_called_once_with(7, "kvitanciya")
 
 
-def test_after_ls_receipt_continuation_keeps_legacy_wrapper() -> None:
-    assert bot._AFTER_LS_ACTIONS["kvitanciya"] is bot._deliver_kvitanciya
+def test_after_ls_receipt_continuation_keeps_guarded_legacy_wrapper() -> None:
+    assert bot._RAW_AFTER_LS_ACTIONS["kvitanciya"] is bot._deliver_kvitanciya
+    assert callable(bot._AFTER_LS_ACTIONS["kvitanciya"])
 
 
 def test_default_receipt_open_preserves_runtime_adapter() -> None:

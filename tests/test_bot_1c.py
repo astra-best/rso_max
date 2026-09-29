@@ -21,7 +21,7 @@ class Bot1CFlowTests(unittest.TestCase):
     def test_main_menu_offers_auth_only_for_unbound_integration_user(self) -> None:
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True, create=True),
-            patch.object(bot, "_get_saved_ls", return_value=None),
+            patch.object(bot, "_is_authenticated", return_value=False),
             patch.object(bot, "send_buttons") as send,
         ):
             bot.send_main_menu(42)
@@ -32,7 +32,8 @@ class Bot1CFlowTests(unittest.TestCase):
     def test_main_menu_hides_auth_for_bound_user_and_keeps_emoji_actions(self) -> None:
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True, create=True),
-            patch.object(bot, "_get_saved_ls", return_value="100001"),
+            patch.object(bot, "_is_authenticated", return_value=True),
+            patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
             patch.object(bot, "send_buttons") as send,
         ):
             bot.send_main_menu(42)
@@ -49,6 +50,8 @@ class Bot1CFlowTests(unittest.TestCase):
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
             patch.object(bot, "_get_saved_ls", return_value=None),
+            patch.object(bot, "_is_authenticated", return_value=True),
+            patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
             patch.object(bot, "_validate_ls", side_effect=[False, True]),
             patch.object(bot, "_save_ls") as save,
             patch.object(bot, "send_message"),
@@ -193,6 +196,7 @@ class Bot1CFlowTests(unittest.TestCase):
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
             patch.object(bot.db, "add_pokazaniya"),
+            patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
             patch.object(bot, "send_message") as send,
             patch.object(bot, "_show_meter_select"),
             self.assertLogs("rso.bot", level="INFO") as logs,

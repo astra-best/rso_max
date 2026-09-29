@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Аналитика{% endblock %}
+{% block head %}
+<style>
+  .analytics-filter,.analytics-tabs,.kpi-grid,.analytics-exports{display:flex;gap:12px;flex-wrap:wrap}.analytics-filter{align-items:end;margin-bottom:18px}.analytics-filter .form-group{min-width:180px;margin:0}
+  .analytics-tabs{margin-bottom:20px}.analytics-tabs a{color:var(--muted);border:1px solid var(--border);padding:7px 12px;border-radius:18px;text-decoration:none}.analytics-tabs a:hover{color:var(--accent);border-color:var(--accent)}
+  .analytics-section{scroll-margin-top:20px;margin-bottom:34px}.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:18px}.kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px}.kpi-value{font-size:25px;font-weight:700;color:var(--accent);margin-top:8px}.kpi-label{font-size:10px;color:var(--muted);text-transform:uppercase}
+  .analytics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.metric-table{width:100%;border-collapse:collapse}.metric-table td,.metric-table th{padding:8px;border-bottom:1px solid var(--border);text-align:left;font-size:11px}.metric-table th{color:var(--muted)}
+  .bar{height:7px;border-radius:5px;background:var(--surface2);min-width:80px}.bar>span{display:block;height:100%;border-radius:5px;background:linear-gradient(90deg,var(--accent2),var(--accent));max-width:100%}.empty{padding:24px;text-align:center;color:var(--muted);font-size:11px}.notice{padding:12px 14px;border:1px solid rgba(255,183,0,.35);background:rgba(255,183,0,.06);color:var(--warning);border-radius:9px;margin-bottom:18px;font-size:11px}
+  @media(max-width:700px){.main{padding:18px}.analytics-filter>*{width:100%}.analytics-filter .form-group{min-width:100%}.analytics-grid{grid-template-columns:1fr}}
+</style>
+{% endblock %}
+{% macro distribution(title, rows) %}
+<div class="card"><div class="card-header">{{ title }}</div><div class="card-body p-0">
+{% if rows %}{% set maximum = rows|map(attribute='value')|max %}<table class="metric-table"><thead><tr><th>Значение</th><th>Количество</th><th></th></tr></thead><tbody>
+{% for row in rows %}<tr><td>{{ row.label or ('ID ' ~ (row.script_id or row.node_id or '—')) }}</td><td>{{ row.value }}</td><td><div class="bar"><span style="width:{{ (row.value * 100 / maximum) if maximum else 0 }}%"></span></div></td></tr>{% endfor %}
+</tbody></table>{% else %}<div class="empty">За выбранный период данных нет</div>{% endif %}</div></div>
+{% endmacro %}
+{% macro kpi(label,value) %}<div class="kpi"><div class="kpi-label">{{ label }}</div><div class="kpi-value">{{ value }}</div></div>{% endmacro %}
+{% block content %}
+<div class="page-header"><div><h1>Аналитика</h1><p class="text-muted small mt-1">Часовой пояс периода: Москва</p></div></div>
+<form class="analytics-filter" method="get" action="{{ url_for('analytics_dashboard') }}">
+ <div class="form-group"><label for="from">С даты</label><input class="form-control" id="from" name="from" type="date" required value="{{ period.from }}"></div>
+ <div class="form-group"><label for="to">По дату включительно</label><input class="form-control" id="to" name="to" type="date" required value="{{ period.to }}"></div>
+ <button class="btn btn-primary" type="submit">Применить</button>
+</form>
+<div class="notice">Исторические показатели частичны: новая телеметрия собирается только после установки этой версии. Старые обращения отображаются с источником «unknown/legacy».</div>
+<div class="card mb-3"><div class="card-header">Быстрые выгрузки за выбранный период</div><div class="card-body analytics-exports">
+  <a class="btn btn-primary" href="{{ url_for('appeals_export', date_from=period.from, date_to=period.to) }}">Обращения — Excel</a>
+  <a class="btn btn-primary" href="{{ url_for('appointments_export', date_from=period.from, date_to=period.to) }}">Записи на приём — Excel</a>
+  <a class="btn btn-primary" href="{{ url_for('operator_chat_history_export', date_from=period.from, date_to=period.to) }}">История диалогов — Excel</a>
+</div></div>
+<nav class="analytics-tabs" aria-label="Разделы аналитики"><a href="#appeals">Обращения</a><a href="#faq">FAQ</a><a href="#operators">Операторы</a><a href="#ai">ИИ</a></nav>
+
+<section id="appeals" class="analytics-section"><h2 class="mb-3">Обращения</h2><div class="kpi-grid">
+{{ kpi('Всего',report.appeals.total) }}{{ kpi('Повторные',report.appeals.repeats) }}{{ kpi('Среднее время решения',human_duration(report.appeals.avg_resolution_seconds)) }}{{ kpi('Медиана решения',human_duration(report.appeals.median_resolution_seconds)) }}</div>
+<p class="small text-muted mb-3">Повторное обращение: та же категория и тот же MAX-чат (а при его отсутствии — лицевой счёт), если предыдущее обращение создано в скользящем окне 30 дней.</p>
+<div class="analytics-grid">{{ distribution('Категории',report.appeals.categories) }}{{ distribution('Источники',report.appeals.sources) }}{{ distribution('Статусы',report.appeals.statuses) }}</div></section>
+
+<section id="faq" class="analytics-section"><h2 class="mb-3">FAQ</h2><div class="analytics-grid">{{ distribution('Запуски скриптов',report.faq.script_starts) }}{{ distribution('Посещаемость узлов',report.faq.node_views) }}{{ distribution('Точки выхода',report.faq.exits) }}{{ distribution('Финальные ответы',report.faq.finals) }}{{ distribution('Переходы из FAQ',report.faq.transitions) }}</div>
+<p class="small text-muted">Выход фиксируется при явном переходе в главное меню или другой сценарий. Закрытие MAX без действия технически не наблюдается.</p></section>
+
+<section id="operators" class="analytics-section"><h2 class="mb-3">Операторские диалоги</h2><div class="kpi-grid">
+{{ kpi('Диалогов',report.operator.dialogs) }}{{ kpi('Среднее ожидание',human_duration(report.operator.avg_wait_seconds)) }}{{ kpi('Средняя длительность',human_duration(report.operator.avg_duration_seconds)) }}{{ kpi('Медиана длительности',human_duration(report.operator.median_duration_seconds)) }}{{ kpi('Переназначения',report.operator.reassignments) }}{{ kpi('Потеря связи',report.operator.lost_connections) }}{{ kpi('Средняя оценка',report.operator.average_rating or '—') }}{{ kpi('Подтверждённые жалобы',report.operator.confirmed_complaints) }}</div>
+<p class="small text-muted mb-3">Ожидание считается от постановки в очередь до первого назначения оператора; длительность — от первого назначения до закрытия. В разрезе по операторам диалог учитывается один раз у каждого назначенного оператора. {% if report.operator.legacy_operator_dialogs %}У {{ report.operator.legacy_operator_dialogs }} старых диалогов неизвестно точное время первого назначения: они исключены из показателей времени, а сохранённый на момент обновления оператор отмечен как участник.{% endif %} {% if report.operator.legacy_confirmed_complaints %}Ещё {{ report.operator.legacy_confirmed_complaints }} старых подтверждённых жалоб без времени решения не включены в показатель периода.{% endif %}</p><div class="analytics-grid">{{ distribution('Участие операторов в диалогах',report.operator.by_operator) }}{{ distribution('Оценки',report.operator.ratings) }}</div></section>
+
+<section id="ai" class="analytics-section"><h2 class="mb-3">ИИ-помощник</h2><div class="kpi-grid">
+{{ kpi('Вопросов',report.ai.questions) }}{{ kpi('Доставлено ответов',report.ai.successful_answers) }}{{ kpi('Переходы к оператору',report.ai.operator_transitions) }}{{ kpi('Переходы в обращение',report.ai.appeal_transitions) }}{{ kpi('Достигнут лимит',report.ai.limit_hits) }}{{ kpi('Ошибки YandexGPT',report.ai.errors) }}</div><div class="analytics-grid">{{ distribution('Классы ошибок',report.ai.error_classes) }}</div></section>
+{% endblock %}

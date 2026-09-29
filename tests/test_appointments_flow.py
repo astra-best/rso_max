@@ -130,6 +130,7 @@ def test_branch_selection_and_unavailable_branch_path():
     assert state == {
         "state": "appointment_branch",
         "ls": "100001",
+        "flow_ls": "100001",
     }
     deps.send_buttons.assert_called_once_with(
         42,
@@ -380,6 +381,10 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_dependencies(monkeypatch):
     monkeypatch.setattr(bot.appointments, "start_appointment_flow", start)
     monkeypatch.setattr(bot.appointments, "select_date", select_date)
     monkeypatch.setattr(bot.appointments, "on_theme", on_theme)
+    monkeypatch.setattr(
+        bot, "_ensure_bound_flow_account",
+        lambda _chat, _after, selected=None: selected or "100001",
+    )
 
     bot._start_appointment_flow(42, "100001")
     state = {"state": bot.S.APPOINTMENT_DATE, "appt_branch_id": 2}

@@ -105,6 +105,17 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _iter_query(query: str, params: list, batch_size: int = 500):
+    """Stream query results while keeping the connection scoped to iteration."""
+    conn = get_conn()
+    try:
+        cursor = conn.execute(query, params)
+        while batch := cursor.fetchmany(batch_size):
+            yield from batch
+    finally:
+        conn.close()
+
+
 # ── Инициализация и миграции ──────────────────────────────────────────────────
 
 def _migrate_appeals_legacy(c: sqlite3.Cursor) -> None:
@@ -220,6 +231,26 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "bot_users", "authorized_1c", "INTEGER NOT NULL DEFAULT 0")
+    # ``bot_users.ls`` is retained as a backwards-compatible last-used value.
+    # Authorization is determined exclusively from this normalized relation.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_user_accounts (
+            chat_id INTEGER NOT NULL REFERENCES bot_users(chat_id) ON DELETE CASCADE,
+            ls TEXT NOT NULL REFERENCES licschet(number) ON UPDATE CASCADE ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, ls)
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_bot_user_accounts_ls "
+        "ON bot_user_accounts(ls, chat_id)"
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) "
+        "SELECT u.chat_id,u.ls,COALESCE(u.last_seen,?) FROM bot_users u "
+        "JOIN licschet l ON l.number=u.ls WHERE u.ls IS NOT NULL AND u.ls<>''",
+        (msk_now(),),
+    )
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS pokazaniya (
@@ -301,6 +332,7 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "appeals", "reopen_reason", "TEXT")
+    _ensure_column(c, "appeals", "source", "TEXT")
 
     # 4.2 Ответы операторов
     c.execute("""
@@ -435,10 +467,17 @@ def init_db() -> None:
             closed_at TEXT,
             closed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
             rating INTEGER CHECK(rating BETWEEN 1 AND 5),
-            rated_at TEXT
+            rated_at TEXT,
+            first_assigned_at TEXT,
+            reassignment_pending INTEGER NOT NULL DEFAULT 0,
+            analytics_legacy INTEGER NOT NULL DEFAULT 0
         )
     """)
     _ensure_column(c, "operator_dialogs", "reassignment_pending", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(c, "operator_dialogs", "first_assigned_at", "TEXT")
+    # Existing databases cannot reconstruct the first assignment timestamp.
+    # Keep that fact explicit: exact wait/duration analytics excludes these rows.
+    _ensure_column(c, "operator_dialogs", "analytics_legacy", "INTEGER NOT NULL DEFAULT 1")
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_dialog_open_chat
         ON operator_dialogs(chat_id) WHERE status IN ('waiting','active')
@@ -447,6 +486,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS ix_operator_dialog_queue
         ON operator_dialogs(status, queue_seq, created_at)
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_operator_dialogs_created ON operator_dialogs(created_at)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -524,6 +564,50 @@ def init_db() -> None:
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS ix_operator_reports_status ON operator_client_reports(status,created_at,id)")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_operator_reports_status_decided "
+        "ON operator_client_reports(status,decided_at)"
+    )
+
+    # Обезличенная продуктовая телеметрия. В metadata_json разрешены только
+    # технические типы/классы ошибок; тексты сообщений и ПДн сюда не пишутся.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            script_id INTEGER,
+            node_id INTEGER,
+            dialog_id INTEGER,
+            operator_id INTEGER,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            dedupe_key TEXT UNIQUE
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_time_type "
+        "ON analytics_events(occurred_at,event_type)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_script "
+        "ON analytics_events(script_id,node_id,occurred_at)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_analytics_events_dialog "
+        "ON analytics_events(dialog_id,event_type,occurred_at)"
+    )
+    # Preserve the current owner of pre-analytics dialogs as a durable baseline.
+    # The synthetic event records participation only; it deliberately does not
+    # invent an exact first-assignment time.
+    c.execute(
+        """INSERT OR IGNORE INTO analytics_events
+           (event_type,occurred_at,dialog_id,operator_id,metadata_json,dedupe_key)
+           SELECT 'operator_assigned',COALESCE(d.assigned_at,d.created_at),d.id,d.operator_id,
+                  '{"source":"legacy_baseline"}',
+                  'operator:' || d.id || ':assigned:legacy'
+           FROM operator_dialogs d
+           WHERE d.analytics_legacy=1 AND d.operator_id IS NOT NULL"""
+    )
     c.execute("""
         CREATE TABLE IF NOT EXISTS operator_chat_blocks (
             chat_id INTEGER PRIMARY KEY,
@@ -536,19 +620,33 @@ def init_db() -> None:
     """)
 
     # Центральные feature flags главного меню. Данные модулей не удаляются.
+    module_columns = {
+        row[1] for row in c.execute("PRAGMA table_info(module_settings)").fetchall()
+    }
     c.execute("""
         CREATE TABLE IF NOT EXISTS module_settings (
             module_key TEXT PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 1
+            enabled INTEGER NOT NULL DEFAULT 1,
+            allow_unauthenticated INTEGER NOT NULL DEFAULT 0
         )
     """)
-    for module_key in (
-        "auth", "appeal", "appeal_status", "readings", "faq", "ai",
-        "receipt", "appointment",
-    ):
+    added_public_flag = bool(module_columns) and "allow_unauthenticated" not in module_columns
+    _ensure_column(c, "module_settings", "allow_unauthenticated", "INTEGER NOT NULL DEFAULT 0")
+    module_defaults = {
+        "auth": True, "appeal": False, "appeal_status": False,
+        "readings": False, "faq": True, "ai": False, "receipt": False,
+        "appointment": False, "operator": True, "accounts": False,
+    }
+    for module_key, allow_unauthenticated in module_defaults.items():
         c.execute(
-            "INSERT OR IGNORE INTO module_settings (module_key, enabled) VALUES (?, 1)",
-            (module_key,),
+            "INSERT OR IGNORE INTO module_settings "
+            "(module_key, enabled, allow_unauthenticated) VALUES (?, 1, ?)",
+            (module_key, int(allow_unauthenticated)),
+        )
+    if added_public_flag:
+        c.executemany(
+            "UPDATE module_settings SET allow_unauthenticated=? WHERE module_key=?",
+            [(int(value), key) for key, value in module_defaults.items()],
         )
     # TODO Этап 10 (табличный редактор скриптов): при сохранении рёбер
     # добавить валидацию на отсутствие циклов в графе (DFS/топологическая сортировка).
@@ -709,6 +807,8 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_appeals_created_at
         ON appeals(created_at)
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_appeals_chat_category_created ON appeals(chat_id,category,created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_appeals_ls_category_created ON appeals(ls,category,created_at)")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_appeal_responses_appeal
         ON appeal_responses(appeal_id)
@@ -794,6 +894,7 @@ def create_appeal(
     chat_id: int | None = None,
     file_path: str | None = None,
     priority: str = "normal",
+    source: str | None = None,
 ) -> str:
     """
     Создаёт обращение, возвращает ticket_no.
@@ -806,10 +907,13 @@ def create_appeal(
     c.execute(
         """
         INSERT INTO appeals
-            (ticket_no, ls, channel, category, priority, body, chat_id, file_path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ticket_no, ls, channel, category, priority, body, chat_id, file_path, created_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (ticket_no, ls, channel, category, priority, body, chat_id, file_path, msk_now()),
+        (
+            ticket_no, ls, channel, category, priority, body, chat_id,
+            file_path, msk_now(), source if source in {"bot", "operator", "ai"} else None,
+        ),
     )
     conn.commit()
     conn.close()
@@ -834,18 +938,14 @@ def get_appeal_by_id(appeal_id: int) -> sqlite3.Row | None:
     return row
 
 
-def list_appeals(
+def _appeals_query(
     status: str | None = None,
     category: str | None = None,
     priority: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     ls: str | None = None,
-) -> list[sqlite3.Row]:
-    """
-    Список обращений с фильтрами для операторского портала.
-    Все параметры опциональны.
-    """
+) -> tuple[str, list]:
     query = "SELECT * FROM appeals WHERE 1=1"
     params: list = []
     if status:
@@ -861,17 +961,49 @@ def list_appeals(
         query += " AND created_at >= ?"
         params.append(date_from)
     if date_to:
-        query += " AND created_at <= ?"
-        params.append(date_to)
+        try:
+            next_day = (datetime.fromisoformat(date_to).date() + timedelta(days=1)).isoformat()
+        except (ValueError, OverflowError):
+            query += " AND created_at <= ?"
+            params.append(date_to)
+        else:
+            query += " AND created_at < ?"
+            params.append(next_day)
     if ls:
         query += " AND ls = ?"
         params.append(ls)
     query += " ORDER BY created_at DESC"
+    return query, params
+
+
+def list_appeals(
+    status: str | None = None,
+    category: str | None = None,
+    priority: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    ls: str | None = None,
+) -> list[sqlite3.Row]:
+    """Список обращений с фильтрами для операторского портала."""
+    query, params = _appeals_query(status, category, priority, date_from, date_to, ls)
 
     conn = get_conn()
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
+
+
+def iter_appeals(
+    status: str | None = None,
+    category: str | None = None,
+    priority: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    ls: str | None = None,
+):
+    """Stream every matching appeal without loading the result set into memory."""
+    query, params = _appeals_query(status, category, priority, date_from, date_to, ls)
+    yield from _iter_query(query, params)
 
 
 def update_appeal_status(
@@ -1634,8 +1766,8 @@ def list_lschet(
     *,
     limit: int = 50,
     offset: int = 0,
-) -> list[sqlite3.Row]:
-    """Return one bounded page of accounts for the administrative directory."""
+) -> list[dict[str, object]]:
+    """Return one bounded page of accounts with their linked MAX user IDs."""
     if limit < 1 or limit > 100:
         raise ValueError("Размер страницы должен быть от 1 до 100")
     if offset < 0:
@@ -1644,17 +1776,87 @@ def list_lschet(
     conn = get_conn()
     try:
         if not params:
-            return conn.execute(
+            rows = conn.execute(
                 "SELECT id, number, fio, address FROM licschet "
                 "ORDER BY number LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
-        return conn.execute(
-            "SELECT id, number, fio, address FROM licschet WHERE "
-            "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
-            "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
-            (*params, limit, offset),
+        else:
+            rows = conn.execute(
+                "SELECT id, number, fio, address FROM licschet WHERE "
+                "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+                "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+
+        accounts = [dict(row) for row in rows]
+        if not accounts:
+            return []
+
+        numbers = [str(account["number"]) for account in accounts]
+        placeholders = ",".join("?" for _ in numbers)
+        bindings = conn.execute(
+            f"SELECT ls, chat_id FROM bot_user_accounts WHERE ls IN ({placeholders}) "
+            "ORDER BY ls, chat_id",
+            numbers,
         ).fetchall()
+        max_ids_by_account: dict[str, list[str]] = {}
+        for binding in bindings:
+            max_ids_by_account.setdefault(str(binding["ls"]), []).append(
+                str(binding["chat_id"])
+            )
+        for account in accounts:
+            ids = max_ids_by_account.get(str(account["number"]), [])
+            account["max_ids"] = ", ".join(ids)
+            account["bindings"] = ids
+        return accounts
+    finally:
+        conn.close()
+
+
+def list_account_bindings(chat_id: int) -> list[sqlite3.Row]:
+    """Return all durable account bindings for one MAX user in stable order."""
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT a.ls,l.fio,l.address,a.created_at FROM bot_user_accounts a "
+            "JOIN licschet l ON l.number=a.ls WHERE a.chat_id=? ORDER BY a.ls",
+            (chat_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def bind_bot_user_account(chat_id: int, ls: str) -> None:
+    """Add one idempotent MAX-to-account relation; both parents must exist."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) VALUES(?,?,?)",
+            (chat_id, ls, msk_now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def unlink_bot_user_account(chat_id: int, ls: str) -> bool:
+    """Remove one relation while preserving the bot user and all history."""
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM bot_user_accounts WHERE chat_id=? AND ls=?", (chat_id, ls)
+        )
+        replacement = conn.execute(
+            "SELECT ls FROM bot_user_accounts WHERE chat_id=? ORDER BY created_at,ls LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE bot_users SET ls=?, authorized_1c=? WHERE chat_id=?",
+            (replacement["ls"] if replacement else None, 1 if replacement else 0, chat_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -2207,6 +2409,12 @@ def upsert_bot_user(
                 authorized_1c,
             ),
         )
+        if ls:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) "
+                "SELECT ?,number,? FROM licschet WHERE number=?",
+                (chat_id, msk_now(), ls),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -2706,12 +2914,13 @@ def mark_appointment(appointment_id: int, status: str) -> None:
     conn.close()
 
 
-def get_appointments(
+def _appointments_query(
     branch_id: int | None = None,
     date: str | None = None,
     status: str | None = None,
-) -> list[sqlite3.Row]:
-    """Список записей для операторского портала (REQ-СОТ-05-01)."""
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> tuple[str, list]:
     query = """
         SELECT a.*, b.name AS branch_name, b.address AS branch_address
         FROM appointments a
@@ -2728,12 +2937,42 @@ def get_appointments(
     if status:
         query += " AND a.status=?"
         params.append(status)
+    if date_from:
+        query += " AND a.slot_date>=?"
+        params.append(date_from)
+    if date_to:
+        query += " AND a.slot_date<=?"
+        params.append(date_to)
     query += " ORDER BY a.slot_date, a.slot_time"
+    return query, params
+
+
+def get_appointments(
+    branch_id: int | None = None,
+    date: str | None = None,
+    status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[sqlite3.Row]:
+    """Список записей для операторского портала (REQ-СОТ-05-01)."""
+    query, params = _appointments_query(branch_id, date, status, date_from, date_to)
 
     conn = get_conn()
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
+
+
+def iter_appointments(
+    branch_id: int | None = None,
+    date: str | None = None,
+    status: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """Stream every matching appointment without loading all rows into memory."""
+    query, params = _appointments_query(branch_id, date, status, date_from, date_to)
+    yield from _iter_query(query, params)
 
 
 def get_appointment(appointment_id: int) -> sqlite3.Row | None:
