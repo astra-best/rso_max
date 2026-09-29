@@ -48,6 +48,17 @@ def _create_account(client, **data):
     )
 
 
+def _account_cells(response_text: str, number: str) -> list[str]:
+    row = re.search(
+        rf"<tr>\s*<td>{re.escape(number)}</td>.*?</tr>",
+        response_text,
+        re.DOTALL,
+    )
+    assert row is not None
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", row.group(0), re.DOTALL)
+    return [re.sub(r"<[^>]+>", "", cell).strip() for cell in cells]
+
+
 def test_admin_can_add_and_list_account_with_escaped_fields(accounts_db) -> None:
     client = _logged_in_client("admin")
 
@@ -87,6 +98,24 @@ def test_duplicate_account_does_not_overwrite_existing_data(accounts_db) -> None
     assert account is not None
     assert (account["fio"], account["address"]) == ("Первый", "Старый адрес")
     assert len(db.list_lschet()) == 1
+
+
+def test_accounts_list_shows_linked_max_ids_in_stable_order(accounts_db) -> None:
+    client = _logged_in_client("admin")
+    assert db.create_lschet("LS-ONE", "Один", "Адрес 1")
+    assert db.create_lschet("LS-MANY", "Несколько", "Адрес 2")
+    assert db.create_lschet("LS-NONE", "Без связи", "Адрес 3")
+    db.upsert_bot_user(202, "LS-ONE", "Один")
+    db.upsert_bot_user(900, "LS-MANY", "Несколько")
+    db.upsert_bot_user(100, "LS-MANY", "Несколько")
+
+    response = client.get("/accounts")
+
+    assert response.status_code == 200
+    assert "<th>MAX ID</th>" in response.text
+    assert _account_cells(response.text, "LS-ONE")[3] == "202"
+    assert _account_cells(response.text, "LS-MANY")[3] == "100, 900"
+    assert _account_cells(response.text, "LS-NONE")[3] == "—"
 
 
 @pytest.mark.parametrize(

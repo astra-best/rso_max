@@ -1732,8 +1732,8 @@ def list_lschet(
     *,
     limit: int = 50,
     offset: int = 0,
-) -> list[sqlite3.Row]:
-    """Return one bounded page of accounts for the administrative directory."""
+) -> list[dict[str, object]]:
+    """Return one bounded page of accounts with their linked MAX user IDs."""
     if limit < 1 or limit > 100:
         raise ValueError("Размер страницы должен быть от 1 до 100")
     if offset < 0:
@@ -1742,17 +1742,40 @@ def list_lschet(
     conn = get_conn()
     try:
         if not params:
-            return conn.execute(
+            rows = conn.execute(
                 "SELECT id, number, fio, address FROM licschet "
                 "ORDER BY number LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
-        return conn.execute(
-            "SELECT id, number, fio, address FROM licschet WHERE "
-            "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
-            "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
-            (*params, limit, offset),
+        else:
+            rows = conn.execute(
+                "SELECT id, number, fio, address FROM licschet WHERE "
+                "number LIKE ? ESCAPE '\\' OR fio LIKE ? ESCAPE '\\' "
+                "OR address LIKE ? ESCAPE '\\' ORDER BY number LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+
+        accounts = [dict(row) for row in rows]
+        if not accounts:
+            return []
+
+        numbers = [str(account["number"]) for account in accounts]
+        placeholders = ",".join("?" for _ in numbers)
+        bindings = conn.execute(
+            f"SELECT ls, chat_id FROM bot_users WHERE ls IN ({placeholders}) "
+            "ORDER BY ls, chat_id",
+            numbers,
         ).fetchall()
+        max_ids_by_account: dict[str, list[str]] = {}
+        for binding in bindings:
+            max_ids_by_account.setdefault(str(binding["ls"]), []).append(
+                str(binding["chat_id"])
+            )
+        for account in accounts:
+            account["max_ids"] = ", ".join(
+                max_ids_by_account.get(str(account["number"]), [])
+            )
+        return accounts
     finally:
         conn.close()
 

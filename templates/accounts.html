@@ -68,7 +68,7 @@
     <div class="card-body p-0">
         <table class="table">
             <thead>
-                <tr><th>Номер</th><th>ФИО</th><th>Адрес</th></tr>
+                <tr><th>Номер</th><th>ФИО</th><th>Адрес</th><th>MAX ID</th></tr>
             </thead>
             <tbody>
                 {% for account in accounts %}
@@ -76,9 +76,10 @@
                     <td>{{ account['number'] }}</td>
                     <td>{{ account['fio'] or '—' }}</td>
                     <td>{{ account['address'] or '—' }}</td>
+                    <td>{{ account['max_ids'] or '—' }}</td>
                 </tr>
                 {% else %}
-                <tr><td colspan="3" class="text-center text-muted py-5">Лицевые счета ещё не добавлены</td></tr>
+                <tr><td colspan="4" class="text-center text-muted py-5">Лицевые счета ещё не добавлены</td></tr>
                 {% endfor %}
             </tbody>
         </table>
