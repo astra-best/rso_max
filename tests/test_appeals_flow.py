@@ -307,6 +307,7 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_points(monkeypatch):
     patched_submit = Mock()
     monkeypatch.setattr(bot, "send_message", patched_sender)
     monkeypatch.setattr(bot, "_submit_appeal", patched_submit)
+    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat_id: "100001")
 
     bot._start_appeal(42)
 
@@ -318,6 +319,11 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_points(monkeypatch):
 
 
 def test_all_bot_appeal_wrappers_delegate(monkeypatch):
+    monkeypatch.setattr(
+        bot, "_ensure_bound_flow_account",
+        lambda _chat, _after, selected=None: selected or "100001",
+    )
+    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat: "100001")
     names_and_calls = [
         (
             "set_category",

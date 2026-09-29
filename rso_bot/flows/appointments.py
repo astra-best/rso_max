@@ -123,6 +123,7 @@ def show_branch_select(
     state = deps.get_state(chat_id)
     state["state"] = deps.branch_state
     state["ls"] = ls
+    state["flow_ls"] = ls
     deps.touch(state)
 
     rows = [

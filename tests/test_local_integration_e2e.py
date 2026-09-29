@@ -124,6 +124,7 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         """Exercise the real callback/message flow, including saved-LS authorization."""
         chat_id = 70001
         ls = "TEST-LS-001"
+        db.create_lschet(ls, "Тестовый пользователь", "Тестовый адрес")
         db.upsert_bot_user(chat_id, ls, "", authorized_1c=True)
         db.upsert_1c_meters(
             ls,

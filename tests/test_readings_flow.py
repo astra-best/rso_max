@@ -192,7 +192,12 @@ def test_invalid_meter_selection_does_not_mutate_state(argument) -> None:
 @pytest.mark.parametrize("argument", ["x", "1", "-1"])
 def test_invalid_meter_callback_returns_to_menu_without_invalid_state(argument) -> None:
     chat_id = 777
-    bot.user_states[chat_id] = {"state": bot.S.METER_SELECT, "meters": [meter()]}
+    bot.user_states[chat_id] = {
+        "state": bot.S.METER_SELECT,
+        "meters": [meter()],
+        "ls": "100001",
+        "flow_ls": "100001",
+    }
     update = {
         "callback": {
             "callback_id": "callback-invalid-meter",
@@ -202,6 +207,8 @@ def test_invalid_meter_callback_returns_to_menu_without_invalid_state(argument) 
     }
     with (
         patch.object(bot, "_ack_callback"),
+        patch.object(bot, "_is_authenticated", return_value=True),
+        patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
         patch.object(bot, "send_main_menu") as menu,
     ):
         bot.handle_callback(update)
@@ -438,6 +445,7 @@ def test_1c_auth_continues_deferred_readings_flow() -> None:
     with (
         patch.object(bot, "_validate_ls", return_value=True),
         patch.object(bot, "_save_ls"),
+        patch.object(bot, "_is_authenticated", return_value=True),
         patch.object(bot, "_show_meter_select") as show_meter_select,
     ):
         bot._on_await_ls_1c(chat_id, state, "100001")

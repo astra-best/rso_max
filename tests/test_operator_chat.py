@@ -75,12 +75,10 @@ def test_no_active_operator_rejects_without_queue(operator_db):
     assert operator_chat.get_open_dialog_for_chat(10) is None
 
 
-def test_auth_required_and_anonymous(operator_db):
+def test_legacy_require_auth_is_ignored_in_favor_of_module_public_policy(operator_db):
     op = _operator("op1")
     operator_chat.start_shift(op)
     _settings(require_auth=True)
-    assert operator_chat.request_dialog(11, profile=None, faq_context=None, ai_messages=[])["status"] == "auth_required"
-    _settings(require_auth=False)
     row = operator_chat.request_dialog(11, profile=None, faq_context="FAQ", ai_messages=[])
     assert row["status"] == "active"
     assert row["authenticated"] == 0

@@ -106,6 +106,8 @@ def show_meter_select(chat_id: int, account: str, deps: ReadingDependencies) -> 
     meter_list = [dict(meter) for meter in meters]
     state = deps.get_state(chat_id)
     state["state"] = deps.meter_select_state
+    state["ls"] = account
+    state["flow_ls"] = account
     state["meters"] = meter_list
     deps.touch(state)
 

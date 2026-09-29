@@ -76,7 +76,19 @@
                     <td>{{ account['number'] }}</td>
                     <td>{{ account['fio'] or '—' }}</td>
                     <td>{{ account['address'] or '—' }}</td>
-                    <td>{{ account['max_ids'] or '—' }}</td>
+                    <td>
+                        <span>{{ account['max_ids'] or '—' }}</span>
+                        {% for max_id in account['bindings'] %}
+                        <form method="POST" action="{{ url_for('account_unlink') }}"
+                              style="display:inline-flex;align-items:center;gap:4px;margin:2px"
+                              onsubmit="return confirm('Отвязать MAX ID {{ max_id }} от ЛС {{ account['number'] }}?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="chat_id" value="{{ max_id }}">
+                            <input type="hidden" name="ls" value="{{ account['number'] }}">
+                            <input class="btn btn-sm btn-danger" type="submit" value="Отвязать {{ max_id }}">
+                        </form>
+                        {% endfor %}
+                    </td>
                 </tr>
                 {% else %}
                 <tr><td colspan="4" class="text-center text-muted py-5">Лицевые счета ещё не добавлены</td></tr>

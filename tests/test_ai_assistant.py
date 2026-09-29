@@ -522,6 +522,7 @@ def test_operator_cannot_open_ai_admin_page(ai_db):
 def test_main_menu_and_router_expose_ai_entry(monkeypatch):
     sender = Mock()
     monkeypatch.setattr(bot, "send_buttons", sender)
+    monkeypatch.setattr(bot, "_is_authenticated", lambda _chat: True)
     bot.send_main_menu(42)
     payloads = [row[0]["payload"] for row in sender.call_args.args[2]]
     assert "ai_start" in payloads

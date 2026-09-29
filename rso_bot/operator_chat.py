@@ -42,7 +42,7 @@ REPORT_REASONS = {
 }
 MODULE_KEYS = (
     "auth", "appeal", "appeal_status", "readings", "faq", "ai",
-    "receipt", "appointment",
+    "receipt", "appointment", "operator", "accounts",
 )
 
 
@@ -205,13 +205,55 @@ def module_enabled(key: str) -> bool:
     return get_module_settings().get(key, False)
 
 
-def update_module_settings(values: dict[str, bool]) -> None:
+def get_module_access_settings() -> dict[str, dict[str, bool]]:
+    defaults = {
+        key: {"enabled": True, "allow_unauthenticated": key in {"auth", "faq", "operator"}}
+        for key in MODULE_KEYS
+    }
+    try:
+        with _connection() as conn:
+            rows = conn.execute(
+                "SELECT module_key,enabled,allow_unauthenticated FROM module_settings"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return defaults
+    for row in rows:
+        defaults[row["module_key"]] = {
+            "enabled": bool(row["enabled"]),
+            "allow_unauthenticated": bool(row["allow_unauthenticated"]),
+        }
+    return defaults
+
+
+def module_accessible(key: str, *, authenticated: bool) -> bool:
+    # Authorization is the recovery path for every private module.  Hiding or
+    # disabling that path would strand every unauthenticated user, so the bot
+    # always exposes it until a durable account binding exists.
+    if key == "auth" and not authenticated:
+        return True
+    value = get_module_access_settings().get(key)
+    return bool(
+        value and value["enabled"]
+        and (authenticated or value["allow_unauthenticated"])
+    )
+
+
+def update_module_settings(
+    values: dict[str, bool],
+    unauthenticated: dict[str, bool] | None = None,
+) -> None:
+    current = get_module_access_settings()
     with _connection() as conn:
         for key in MODULE_KEYS:
             conn.execute(
-                "INSERT INTO module_settings(module_key,enabled) VALUES(?,?) "
-                "ON CONFLICT(module_key) DO UPDATE SET enabled=excluded.enabled",
-                (key, int(bool(values.get(key)))),
+                "INSERT INTO module_settings(module_key,enabled,allow_unauthenticated) "
+                "VALUES(?,?,?) ON CONFLICT(module_key) DO UPDATE SET "
+                "enabled=excluded.enabled,allow_unauthenticated=excluded.allow_unauthenticated",
+                (
+                    key, int(bool(values.get(key))),
+                    int(bool((unauthenticated or {}).get(key))) if unauthenticated is not None
+                    else int(current.get(key, {}).get("allow_unauthenticated", False)),
+                ),
             )
 
 
@@ -406,8 +448,6 @@ def request_dialog(
     if not settings["enabled"] or not has_active_operators(now):
         return {"status": "unavailable"}
     authenticated = bool(profile and profile.get("ls"))
-    if settings["require_auth"] and not authenticated:
-        return {"status": "auth_required"}
     with _connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         any_active = conn.execute(

@@ -873,6 +873,30 @@ def account_create():
     return redirect(url_for("accounts_page"))
 
 
+@app.route("/accounts/unlink", methods=["POST"])
+@admin_required
+@csrf_protected
+def account_unlink():
+    try:
+        chat_id = int(request.form.get("chat_id", ""))
+    except (TypeError, ValueError):
+        abort(400)
+    ls = request.form.get("ls", "").strip()
+    if not ls:
+        abort(400)
+    try:
+        removed = db.unlink_bot_user_account(chat_id, ls)
+    except sqlite3.DatabaseError:
+        log.error("Ошибка БД при отвязке лицевого счёта")
+        flash("Не удалось отвязать лицевой счёт. Попробуйте позже.", "error")
+    else:
+        flash(
+            "Привязка удалена" if removed else "Привязка уже отсутствует",
+            "success" if removed else "error",
+        )
+    return redirect(url_for("accounts_page"))
+
+
 # ── Управление пользователями ─────────────────────────────────────────────────
 
 @app.route("/users")
@@ -1338,7 +1362,9 @@ def operator_chat_settings_page():
         try:
             operator_chat.update_settings(
                 enabled=request.form.get("enabled") == "on",
-                require_auth=request.form.get("require_auth") == "on",
+                # Deprecated: module_settings.allow_unauthenticated is the
+                # single authoritative access policy for operator chat.
+                require_auth=False,
                 heartbeat_timeout_sec=request.form.get("heartbeat_timeout_sec"),
                 reconnect_grace_sec=request.form.get("reconnect_grace_sec"),
                 max_active_dialogs=request.form.get("max_active_dialogs"),
@@ -1348,7 +1374,10 @@ def operator_chat_settings_page():
                 report_threshold=request.form.get("report_threshold"),
                 evidence_retention_days=request.form.get("evidence_retention_days"),
             )
-            operator_chat.update_module_settings({key: request.form.get(f"module_{key}") == "on" for key in operator_chat.MODULE_KEYS})
+            operator_chat.update_module_settings(
+                {key: request.form.get(f"module_{key}") == "on" for key in operator_chat.MODULE_KEYS},
+                {key: request.form.get(f"public_{key}") == "on" for key in operator_chat.MODULE_KEYS},
+            )
         except (ValueError, TypeError) as exc:
             flash(str(exc), "error")
         else:
@@ -1356,7 +1385,7 @@ def operator_chat_settings_page():
             return redirect(url_for("operator_chat_settings_page"))
     return render_template(
         "operator_chat_settings.html", user=session["user"], csrf_token=_csrf_token(),
-        settings=operator_chat.get_settings(), modules=operator_chat.get_module_settings(),
+        settings=operator_chat.get_settings(), modules=operator_chat.get_module_access_settings(),
         ratings=operator_chat.rating_report(),
     )
 

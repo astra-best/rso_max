@@ -231,6 +231,26 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "bot_users", "authorized_1c", "INTEGER NOT NULL DEFAULT 0")
+    # ``bot_users.ls`` is retained as a backwards-compatible last-used value.
+    # Authorization is determined exclusively from this normalized relation.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_user_accounts (
+            chat_id INTEGER NOT NULL REFERENCES bot_users(chat_id) ON DELETE CASCADE,
+            ls TEXT NOT NULL REFERENCES licschet(number) ON UPDATE CASCADE ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, ls)
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_bot_user_accounts_ls "
+        "ON bot_user_accounts(ls, chat_id)"
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) "
+        "SELECT u.chat_id,u.ls,COALESCE(u.last_seen,?) FROM bot_users u "
+        "JOIN licschet l ON l.number=u.ls WHERE u.ls IS NOT NULL AND u.ls<>''",
+        (msk_now(),),
+    )
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS pokazaniya (
@@ -600,19 +620,33 @@ def init_db() -> None:
     """)
 
     # Центральные feature flags главного меню. Данные модулей не удаляются.
+    module_columns = {
+        row[1] for row in c.execute("PRAGMA table_info(module_settings)").fetchall()
+    }
     c.execute("""
         CREATE TABLE IF NOT EXISTS module_settings (
             module_key TEXT PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 1
+            enabled INTEGER NOT NULL DEFAULT 1,
+            allow_unauthenticated INTEGER NOT NULL DEFAULT 0
         )
     """)
-    for module_key in (
-        "auth", "appeal", "appeal_status", "readings", "faq", "ai",
-        "receipt", "appointment",
-    ):
+    added_public_flag = bool(module_columns) and "allow_unauthenticated" not in module_columns
+    _ensure_column(c, "module_settings", "allow_unauthenticated", "INTEGER NOT NULL DEFAULT 0")
+    module_defaults = {
+        "auth": True, "appeal": False, "appeal_status": False,
+        "readings": False, "faq": True, "ai": False, "receipt": False,
+        "appointment": False, "operator": True, "accounts": False,
+    }
+    for module_key, allow_unauthenticated in module_defaults.items():
         c.execute(
-            "INSERT OR IGNORE INTO module_settings (module_key, enabled) VALUES (?, 1)",
-            (module_key,),
+            "INSERT OR IGNORE INTO module_settings "
+            "(module_key, enabled, allow_unauthenticated) VALUES (?, 1, ?)",
+            (module_key, int(allow_unauthenticated)),
+        )
+    if added_public_flag:
+        c.executemany(
+            "UPDATE module_settings SET allow_unauthenticated=? WHERE module_key=?",
+            [(int(value), key) for key, value in module_defaults.items()],
         )
     # TODO Этап 10 (табличный редактор скриптов): при сохранении рёбер
     # добавить валидацию на отсутствие циклов в графе (DFS/топологическая сортировка).
@@ -1762,7 +1796,7 @@ def list_lschet(
         numbers = [str(account["number"]) for account in accounts]
         placeholders = ",".join("?" for _ in numbers)
         bindings = conn.execute(
-            f"SELECT ls, chat_id FROM bot_users WHERE ls IN ({placeholders}) "
+            f"SELECT ls, chat_id FROM bot_user_accounts WHERE ls IN ({placeholders}) "
             "ORDER BY ls, chat_id",
             numbers,
         ).fetchall()
@@ -1772,10 +1806,57 @@ def list_lschet(
                 str(binding["chat_id"])
             )
         for account in accounts:
-            account["max_ids"] = ", ".join(
-                max_ids_by_account.get(str(account["number"]), [])
-            )
+            ids = max_ids_by_account.get(str(account["number"]), [])
+            account["max_ids"] = ", ".join(ids)
+            account["bindings"] = ids
         return accounts
+    finally:
+        conn.close()
+
+
+def list_account_bindings(chat_id: int) -> list[sqlite3.Row]:
+    """Return all durable account bindings for one MAX user in stable order."""
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT a.ls,l.fio,l.address,a.created_at FROM bot_user_accounts a "
+            "JOIN licschet l ON l.number=a.ls WHERE a.chat_id=? ORDER BY a.ls",
+            (chat_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def bind_bot_user_account(chat_id: int, ls: str) -> None:
+    """Add one idempotent MAX-to-account relation; both parents must exist."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) VALUES(?,?,?)",
+            (chat_id, ls, msk_now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def unlink_bot_user_account(chat_id: int, ls: str) -> bool:
+    """Remove one relation while preserving the bot user and all history."""
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM bot_user_accounts WHERE chat_id=? AND ls=?", (chat_id, ls)
+        )
+        replacement = conn.execute(
+            "SELECT ls FROM bot_user_accounts WHERE chat_id=? ORDER BY created_at,ls LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE bot_users SET ls=?, authorized_1c=? WHERE chat_id=?",
+            (replacement["ls"] if replacement else None, 1 if replacement else 0, chat_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -2328,6 +2409,12 @@ def upsert_bot_user(
                 authorized_1c,
             ),
         )
+        if ls:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_user_accounts(chat_id,ls,created_at) "
+                "SELECT ?,number,? FROM licschet WHERE number=?",
+                (chat_id, msk_now(), ls),
+            )
         conn.commit()
     finally:
         conn.close()

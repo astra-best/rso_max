@@ -73,6 +73,7 @@ from rso_bot import max_transport, operator_chat
 from rso_bot import scheduler as bot_scheduler
 from rso_bot import states as session_states
 from rso_bot.flows import (
+    accounts,
     ai_assistant,
     appeals,
     appointments,
@@ -239,7 +240,18 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
     Главное меню — показывается сразу без авторизации (раздел 6.2 ТЗ).
     ЛС-зависимые функции спрашивают ЛС внутри своего флоу.
     """
+    state = _get_state(chat_id)
+    state.pop("flow_ls", None)
+    state.pop("after_account_select", None)
+    authenticated = _is_authenticated(chat_id)
     enabled = operator_chat.get_module_settings()
+    access = operator_chat.get_module_access_settings()
+    try:
+        operator_available = (
+            operator_chat.has_active_operators() if enabled.get("operator") else False
+        )
+    except sqlite3.DatabaseError:
+        operator_available = False
     options = [
         ("appeal", "📝 Подать обращение", "appeal_start"),
         ("appeal_status", "📋 Проверить статус обращения", "my_appeals"),
@@ -248,9 +260,18 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
         ("ai", "🤖 Спросить у ИИ-помощника", "ai_start"),
         ("receipt", "📄 Последняя квитанция", "kvitanciya"),
         ("appointment", "🗓️ Записаться на приём", "appointment_start"),
+        ("operator", "🎧 Связаться с оператором", "operator_start"),
+        ("accounts", "👤 Мои лицевые счета", "accounts_list"),
     ]
-    rows = [[_cb(label, payload)] for key, label, payload in options if enabled.get(key)]
-    if enabled.get("auth") and ENABLE_1C_INTEGRATION and not _get_saved_ls(chat_id):
+    rows = [
+        [_cb(label, payload)] for key, label, payload in options
+        if enabled.get(key) and (
+            authenticated
+            or key == "auth"
+            or access.get(key, {}).get("allow_unauthenticated", False)
+        ) and (key != "operator" or operator_available)
+    ]
+    if not authenticated:
         rows.insert(0, [_cb("🔐 Авторизоваться", "auth_1c")])
     return send_buttons(chat_id, text, rows) if rows else send_message(chat_id, text)
 
@@ -260,6 +281,75 @@ def send_main_menu(chat_id: int, text: str = "Выберите действие:
 def _get_saved_ls(chat_id: int) -> str | None:
     """Compatibility wrapper for loading a saved account."""
     return auth.get_saved_ls(chat_id, _account_dependencies())
+
+
+def _is_authenticated(chat_id: int) -> bool:
+    """Use only durable MAX↔account relations as authorization truth."""
+    try:
+        return bool(db.list_account_bindings(chat_id))
+    except sqlite3.DatabaseError:
+        log.error("Не удалось проверить авторизацию по привязкам лицевых счетов")
+        return False
+
+
+def _bound_account_numbers(chat_id: int) -> set[str] | None:
+    """Return current durable memberships, or ``None`` when they cannot be read."""
+    try:
+        return {str(row["ls"]) for row in db.list_account_bindings(chat_id)}
+    except sqlite3.DatabaseError:
+        log.error("Не удалось проверить привязки лицевых счетов")
+        return None
+
+
+def _cancel_revoked_account_flow(chat_id: int, state: dict | None = None) -> None:
+    """Cancel a stale LS-bound action without substituting another account."""
+    if state is None:
+        state = _get_state(chat_id)
+    _clear_flow(state)
+    state.pop("ls", None)
+    state.pop("authorized_1c", None)
+    _touch(state)
+    send_main_menu(
+        chat_id,
+        "Выбранный лицевой счёт больше не привязан. Начните действие заново.",
+    )
+
+
+def _ensure_bound_flow_account(
+    chat_id: int,
+    continuation: str,
+    *,
+    selected: str | None = None,
+) -> str | None:
+    """Validate a selected account immediately before an LS-bound transition.
+
+    Revocation clears both compatibility and canonical selection caches.  The
+    original scenario is then restarted through the common 0/1/N selector, so
+    a stale in-memory account can never reach a side effect.
+    """
+    state = _get_state(chat_id)
+    account = selected or state.get("flow_ls") or state.get("ls")
+    bindings = _bound_account_numbers(chat_id)
+    if bindings is None:
+        state.pop("flow_ls", None)
+        state.pop("ls", None)
+        send_main_menu(chat_id, "Не удалось проверить привязку лицевого счёта.")
+        return None
+    if account and str(account) in bindings:
+        account = str(account)
+        state["flow_ls"] = account
+        state["ls"] = account
+        return account
+
+    if account:
+        _cancel_revoked_account_flow(chat_id, state)
+        return None
+
+    state.pop("flow_ls", None)
+    state.pop("ls", None)
+    state.pop("appeal_status_ls", None)
+    _request_ls(chat_id, continuation)
+    return None
 
 
 def _save_ls(chat_id: int, ls: str, fio: str | None = None) -> None:
@@ -294,6 +384,7 @@ def _account_dependencies() -> auth.AccountDependencies:
         get_ls=db.get_ls,
         integration_enabled=ENABLE_1C_INTEGRATION,
         logger=log,
+        list_account_bindings=db.list_account_bindings,
     )
 
 
@@ -321,12 +412,29 @@ def _reset_meter_input(st: dict) -> None:
 
 def _request_ls(chat_id: int, after: str) -> None:
     """Compatibility wrapper for requesting an account."""
+    state = _get_state(chat_id)
+    if state.pop("revoked_selected_ls", None):
+        _cancel_revoked_account_flow(chat_id, state)
+        return
     auth.request_ls(chat_id, after, _auth_flow_dependencies())
 
 
 def _start_1c_auth(chat_id: int, after: str | None = None) -> None:
     """Compatibility wrapper for local account authorization."""
     auth.start_1c_auth(chat_id, after, _auth_flow_dependencies())
+
+
+def _account_management_dependencies() -> accounts.AccountManagementDependencies:
+    return accounts.AccountManagementDependencies(
+        list_bindings=db.list_account_bindings,
+        make_callback=_cb,
+        send_buttons=send_buttons,
+        start_auth=_start_1c_auth,
+    )
+
+
+def _show_accounts(chat_id: int) -> None:
+    accounts.show(chat_id, _account_management_dependencies())
 
 
 # ── Ввод и валидация показаний ────────────────────────────────────────────────
@@ -377,6 +485,9 @@ def _appeal_dependencies() -> appeals.AppealDependencies:
 
 def _start_appeal(chat_id: int) -> None:
     """Compatibility wrapper for starting the extracted appeal flow."""
+    if not _get_saved_ls(chat_id):
+        _request_ls(chat_id, "appeal_start")
+        return
     appeals.start_appeal(chat_id, _appeal_dependencies())
 
 
@@ -401,19 +512,29 @@ def _appeal_got_ls(chat_id: int, ls_input: str) -> None:
 
 def _submit_appeal(chat_id: int, ls: str) -> None:
     """Compatibility wrapper for submitting an extracted appeal flow."""
-    appeals.submit_appeal(chat_id, ls, _appeal_dependencies())
+    account = _ensure_bound_flow_account(chat_id, "appeal", selected=ls)
+    if account:
+        appeals.submit_appeal(chat_id, account, _appeal_dependencies())
 
 
 # ── Флоу «Мои обращения» ─────────────────────────────────────────────────────
 
 def _show_my_appeals(chat_id: int) -> None:
     """Compatibility wrapper for listing active appeals."""
+    account = _get_saved_ls(chat_id)
+    if not account:
+        _request_ls(chat_id, "my_appeals")
+        return
+    account = _ensure_bound_flow_account(chat_id, "my_appeals", selected=account)
+    if not account:
+        return
+    _get_state(chat_id)["appeal_status_ls"] = account
     appeals.show_my_appeals(chat_id, _appeal_dependencies())
 
 
 # ── Движок FAQ (раздел 6.3) ──────────────────────────────────────────────────
 
-def _faq_dependencies() -> faq.FaqDependencies:
+def _faq_dependencies(chat_id: int | None = None) -> faq.FaqDependencies:
     """Build FAQ dependencies from runtime patch points in this entry point."""
     return faq.FaqDependencies(
         list_scripts=client_api.list_scripts,
@@ -429,38 +550,41 @@ def _faq_dependencies() -> faq.FaqDependencies:
         script_list_state=S.SCRIPT_LIST,
         script_node_state=S.SCRIPT_NODE,
         menu_state=S.MENU,
-        operator_available=operator_chat.has_active_operators,
-        ai_available=lambda: operator_chat.module_enabled("ai"),
-        appeal_available=lambda: operator_chat.module_enabled("appeal"),
+        operator_available=lambda: operator_chat.has_active_operators() and (
+            operator_chat.module_accessible("operator", authenticated=_is_authenticated(chat_id))
+            if chat_id is not None else operator_chat.module_enabled("operator")
+        ),
+        ai_available=lambda: operator_chat.module_accessible("ai", authenticated=_is_authenticated(chat_id)) if chat_id is not None else operator_chat.module_enabled("ai"),
+        appeal_available=lambda: operator_chat.module_accessible("appeal", authenticated=_is_authenticated(chat_id)) if chat_id is not None else operator_chat.module_enabled("appeal"),
         record_event=analytics.record_event,
     )
 
 
 def _show_scripts_list(chat_id: int) -> None:
     """Compatibility wrapper for the extracted FAQ flow."""
-    faq.show_scripts_list(chat_id, _faq_dependencies())
+    faq.show_scripts_list(chat_id, _faq_dependencies(chat_id))
 
 
 def _open_script(chat_id: int, script_id: int) -> None:
     """Compatibility wrapper for opening an FAQ tree."""
-    faq.open_script(chat_id, script_id, _faq_dependencies())
+    faq.open_script(chat_id, script_id, _faq_dependencies(chat_id))
 
 
 def _show_script_node(chat_id: int) -> None:
     """Compatibility wrapper for rendering the active FAQ node."""
-    faq.show_script_node(chat_id, _faq_dependencies())
+    faq.show_script_node(chat_id, _faq_dependencies(chat_id))
 
 
 def _navigate_script_node(chat_id: int, node_id: int) -> None:
     """Compatibility wrapper for moving through the active FAQ tree."""
-    faq.navigate_script_node(chat_id, node_id, _faq_dependencies())
+    faq.navigate_script_node(chat_id, node_id, _faq_dependencies(chat_id))
 
 
 def _show_faq_scripts_page(chat_id: int, arg: str) -> None:
     token, separator, page_raw = arg.rpartition(":")
     if not separator:
         raise ValueError("invalid FAQ scripts page")
-    faq.show_scripts_page(chat_id, token, int(page_raw), _faq_dependencies())
+    faq.show_scripts_page(chat_id, token, int(page_raw), _faq_dependencies(chat_id))
 
 
 def _show_faq_node_page(chat_id: int, arg: str) -> None:
@@ -469,7 +593,7 @@ def _show_faq_node_page(chat_id: int, arg: str) -> None:
         raise ValueError("invalid FAQ node page")
     faq.show_node_page(
         chat_id, int(parts[0]), int(parts[1]), parts[2], int(parts[3]),
-        _faq_dependencies(),
+        _faq_dependencies(chat_id),
     )
 
 
@@ -479,7 +603,7 @@ def _navigate_faq_bound(chat_id: int, arg: str) -> None:
         raise ValueError("invalid FAQ action")
     faq.navigate_bound_action(
         chat_id, int(parts[0]), int(parts[1]), int(parts[2]), parts[3],
-        _faq_dependencies(),
+        _faq_dependencies(chat_id),
     )
 
 
@@ -497,18 +621,15 @@ def _ai_sensitive_values(chat_id: int) -> list[str]:
     values: list[str] = []
     user = db.get_bot_user(chat_id)
     if user:
-        values.extend([user["ls"] or "", user["fio"] or ""])
-        if user["ls"]:
-            try:
-                account = db.get_ls(user["ls"])
-            except ValueError:
-                account = None
-            if account:
-                values.extend([account["fio"] or "", account["address"] or ""])
+        values.append(user["fio"] or "")
+        for binding in db.list_account_bindings(chat_id):
+            values.extend([
+                binding["ls"] or "", binding["fio"] or "", binding["address"] or "",
+            ])
     return [value for value in values if value]
 
 
-def _ai_dependencies() -> ai_assistant.AIDependencies:
+def _ai_dependencies(chat_id: int | None = None) -> ai_assistant.AIDependencies:
     return ai_assistant.AIDependencies(
         get_settings=db.get_ai_settings,
         get_session=db.get_ai_session,
@@ -529,30 +650,37 @@ def _ai_dependencies() -> ai_assistant.AIDependencies:
         get_operation_date=db.server_local_date,
         logger=log,
         question_state=S.AI_QUESTION,
-        operator_available=operator_chat.has_active_operators,
-        appeal_available=lambda: operator_chat.module_enabled("appeal"),
+        operator_available=lambda: operator_chat.has_active_operators() and (
+            operator_chat.module_accessible("operator", authenticated=_is_authenticated(chat_id))
+            if chat_id is not None else operator_chat.module_enabled("operator")
+        ),
+        appeal_available=lambda: (
+            operator_chat.module_accessible("appeal", authenticated=_is_authenticated(chat_id))
+            if chat_id is not None else operator_chat.module_enabled("appeal")
+        ),
         record_event=analytics.record_event,
     )
 
 
 def _start_ai(chat_id: int, faq_context: str | None = None) -> None:
-    ai_assistant.start(chat_id, _ai_dependencies(), faq_context=faq_context)
+    ai_assistant.start(chat_id, _ai_dependencies(chat_id), faq_context=faq_context)
 
 
 def _on_ai_question(chat_id: int, state: dict, text: str) -> None:
     del state
-    ai_assistant.ask(chat_id, text, _ai_dependencies())
+    ai_assistant.ask(chat_id, text, _ai_dependencies(chat_id))
 
 
 # ── Диалог с оператором ──────────────────────────────────────────────────────
 
 def _operator_profile(chat_id: int) -> dict | None:
+    ls = _get_saved_ls(chat_id)
     user = db.get_bot_user(chat_id)
-    if not user or not user["ls"]:
+    if not user or not ls:
         return None
-    account = db.get_ls(user["ls"])
+    account = db.get_ls(ls)
     return {
-        "ls": user["ls"],
+        "ls": ls,
         "fio": (account["fio"] if account else None) or user["fio"],
         "address": account["address"] if account else None,
     }
@@ -571,14 +699,28 @@ def _start_operator_chat(chat_id: int) -> None:
         state = _get_state(chat_id)
         _clear_flow(state)
         rows = []
-        if operator_chat.module_enabled("appeal"):
+        if operator_chat.module_accessible(
+            "appeal", authenticated=_is_authenticated(chat_id)
+        ):
             rows.append([_cb("📝 Оформить обращение", "appeal_start")])
         rows.append([_cb("🏠 Главное меню", "main_menu")])
-        suffix = " Вы можете оформить обращение." if operator_chat.module_enabled("appeal") else ""
+        suffix = (
+            " Вы можете оформить обращение."
+            if operator_chat.module_accessible(
+                "appeal", authenticated=_is_authenticated(chat_id)
+            )
+            else ""
+        )
         send_buttons(chat_id, f"Сейчас нет доступных операторов.{suffix}", rows)
         return
-    profile = _operator_profile(chat_id)
-    if settings["require_auth"] and not profile:
+    bindings = _bound_account_numbers(chat_id)
+    if bindings is None:
+        send_main_menu(chat_id, "Не удалось проверить привязку лицевого счёта.")
+        return
+    profile = None
+    if bindings:
+        profile = _operator_profile(chat_id)
+    if bindings and not profile:
         _request_ls(chat_id, "operator")
         return
     ai_session = db.get_ai_session(chat_id, create_if_missing=False)
@@ -592,9 +734,6 @@ def _start_operator_chat(chat_id: int) -> None:
     if dialog["status"] == "blocked":
         _clear_flow(state)
         send_main_menu(chat_id, "Связь с оператором временно недоступна.")
-        return
-    if dialog["status"] == "auth_required":
-        _request_ls(chat_id, "operator")
         return
     state["state"] = S.OPERATOR_CHAT
     _touch(state)
@@ -859,7 +998,9 @@ def _start_pokazaniya(chat_id: int) -> None:
 
 def _show_meter_select(chat_id: int, ls: str) -> None:
     """Compatibility wrapper for displaying meter selection."""
-    readings.show_meter_select(chat_id, ls, _reading_dependencies())
+    account = _ensure_bound_flow_account(chat_id, "pokazaniya", selected=ls)
+    if account:
+        readings.show_meter_select(chat_id, account, _reading_dependencies())
 
 
 def _ask_meter_value(chat_id: int) -> None:
@@ -914,7 +1055,15 @@ def _appointment_dependencies() -> appointments.AppointmentDependencies:
 
 def _start_appointment_flow(chat_id: int, ls: str | None = None) -> None:
     """Compatibility wrapper for starting the extracted appointment flow."""
-    appointments.start_appointment_flow(chat_id, ls, _appointment_dependencies())
+    account = ls or _get_saved_ls(chat_id)
+    if not account:
+        _request_ls(chat_id, "appointment")
+        return
+    account = _ensure_bound_flow_account(chat_id, "appointment", selected=account)
+    if account:
+        appointments.start_appointment_flow(
+            chat_id, account, _appointment_dependencies()
+        )
 
 
 def _show_active_appointment(chat_id: int, appointment) -> None:
@@ -958,11 +1107,18 @@ def _show_appointment_confirm(chat_id: int) -> None:
 
 def _finalize_appointment(chat_id: int) -> None:
     """Compatibility wrapper for persisting an appointment."""
-    appointments.finalize_appointment(chat_id, _appointment_dependencies())
+    account = _ensure_bound_flow_account(chat_id, "appointment")
+    if account:
+        appointments.finalize_appointment(chat_id, _appointment_dependencies())
 
 
 def _cancel_own_appointment(chat_id: int, appointment_id: int) -> None:
     """Compatibility wrapper for cancelling the caller's appointment."""
+    appointment = db.get_appointment(appointment_id)
+    if appointment and not _ensure_bound_flow_account(
+        chat_id, "appointment", selected=str(appointment["ls"])
+    ):
+        return
     appointments.cancel_own_appointment(
         chat_id, appointment_id, _appointment_dependencies()
     )
@@ -1003,7 +1159,9 @@ def _receipt_flow_dependencies() -> receipts.ReceiptFlowDependencies:
 
 def _deliver_kvitanciya(chat_id: int, ls: str) -> None:
     """Compatibility wrapper for delivering a receipt and reopening the menu."""
-    receipts.deliver(chat_id, ls, _receipt_flow_dependencies())
+    account = _ensure_bound_flow_account(chat_id, "kvitanciya", selected=ls)
+    if account:
+        receipts.deliver(chat_id, account, _receipt_flow_dependencies())
 
 
 def _send_pdf(chat_id: int, ls: str) -> None:
@@ -1028,12 +1186,20 @@ def _ack_callback(callback_id: str) -> None:
 
 def _cb_confirm_appeal(chat_id: int, st: dict, arg: str) -> None:
     """Compatibility wrapper for confirming appeal closure."""
-    appeals.confirm_appeal(chat_id, st, arg, _appeal_dependencies())
+    account = _ensure_bound_flow_account(
+        chat_id, "my_appeals", selected=st.get("appeal_status_ls")
+    )
+    if account:
+        appeals.confirm_appeal(chat_id, st, arg, _appeal_dependencies())
 
 
 def _cb_reopen_appeal(chat_id: int, st: dict, arg: str) -> None:
     """Compatibility wrapper for starting appeal reopening."""
-    appeals.begin_reopen(chat_id, st, arg, _appeal_dependencies())
+    account = _ensure_bound_flow_account(
+        chat_id, "my_appeals", selected=st.get("appeal_status_ls")
+    )
+    if account:
+        appeals.begin_reopen(chat_id, st, arg, _appeal_dependencies())
 
 
 def _cb_select_meter(chat_id: int, st: dict, arg: str) -> None:
@@ -1052,6 +1218,39 @@ def _cb_operator_rate(chat_id: int, st: dict, arg: str) -> None:
     if not separator:
         raise ValueError("invalid rating payload")
     _rate_operator(chat_id, int(dialog), int(rating))
+
+
+def _cb_account_select(chat_id: int, st: dict, arg: str) -> None:
+    after = st.get("after_account_select")
+    module = _ACCOUNT_CONTINUATION_MODULES.get(after)
+    if module is None or not _module_guard(
+        chat_id, st, module, f"account_select:{arg}"
+    ):
+        st.pop("flow_ls", None)
+        st.pop("after_account_select", None)
+        return
+    try:
+        accounts_for_user = {
+            str(row["ls"]) for row in db.list_account_bindings(chat_id)
+        }
+    except sqlite3.DatabaseError:
+        st.pop("flow_ls", None)
+        st.pop("after_account_select", None)
+        send_main_menu(chat_id, "Не удалось проверить привязку лицевого счёта.")
+        return
+    if arg not in accounts_for_user:
+        st.pop("flow_ls", None)
+        st.pop("after_account_select", None)
+        send_main_menu(chat_id, "Привязка лицевого счёта больше недоступна.")
+        return
+    after = st.pop("after_account_select", None)
+    st["flow_ls"] = arg
+    st["ls"] = arg
+    action = _AFTER_LS_ACTIONS.get(after)
+    if action:
+        action(chat_id, arg)
+    else:
+        send_main_menu(chat_id)
 
 
 def _terminal_context_or_reject(chat_id: int, st: dict, arg: str) -> dict | None:
@@ -1085,7 +1284,9 @@ def _cb_faq_terminal_appeal(chat_id: int, st: dict, arg: str) -> None:
     if terminal is None:
         return
     _start_appeal(chat_id)
-    if st.get("state") == S.APPEAL_CATEGORY:
+    if st.get("state") in {
+        S.APPEAL_CATEGORY, S.ACCOUNT_SELECT, S.AWAIT_LS, S.AWAIT_LS_1C,
+    }:
         st.pop("ai_faq_context", None)
         _complete_terminal_transition(st, terminal, "appeal")
 
@@ -1096,7 +1297,9 @@ def _cb_faq_terminal_operator(chat_id: int, st: dict, arg: str) -> None:
         return
     context = st.get("ai_faq_context")
     _start_operator_chat(chat_id)
-    if st.get("state") in {S.OPERATOR_CHAT, S.AWAIT_LS, S.AWAIT_LS_1C}:
+    if st.get("state") in {
+        S.OPERATOR_CHAT, S.ACCOUNT_SELECT, S.AWAIT_LS, S.AWAIT_LS_1C,
+    }:
         _complete_terminal_transition(st, terminal, "operator")
     else:
         # Failed availability/blocked checks clear the flow; retain the bound
@@ -1142,6 +1345,7 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "faq_terminal_appeal": _cb_faq_terminal_appeal,
     "faq_terminal_operator": _cb_faq_terminal_operator,
     "faq_terminal_menu": _cb_faq_terminal_menu,
+    "account_select": _cb_account_select,
 }
 
 
@@ -1186,7 +1390,8 @@ def _cb_main_menu(chat_id: int, st: dict) -> None:
 
 def _cb_meter_confirm(chat_id: int, st: dict) -> None:
     """Compatibility wrapper for persisting a confirmed reading."""
-    readings.confirm(chat_id, st, _reading_dependencies())
+    if _ensure_bound_flow_account(chat_id, "pokazaniya"):
+        readings.confirm(chat_id, st, _reading_dependencies())
 
 
 def _cb_meter_retry(chat_id: int, st: dict) -> None:
@@ -1196,13 +1401,18 @@ def _cb_meter_retry(chat_id: int, st: dict) -> None:
 
 def _cb_ai_new(chat_id: int, st: dict) -> None:
     del st
-    ai_assistant.new_dialog(chat_id, _ai_dependencies())
+    ai_assistant.new_dialog(chat_id, _ai_dependencies(chat_id))
 
 
 def _cb_ai_appeal(chat_id: int, st: dict) -> None:
     if st.get("state") == S.AI_QUESTION:
         analytics.record_event("ai_transition_appeal")
-    ai_assistant.create_appeal_draft(chat_id, _ai_dependencies())
+    ai_assistant.create_appeal_draft(chat_id, _ai_dependencies(chat_id))
+
+
+def _cb_auth(chat_id: int, st: dict) -> None:
+    after = "__callback__" if st.get("after_auth_callback") else None
+    _start_1c_auth(chat_id, after)
 
 
 def _cb_appeal_draft_submit(chat_id: int, st: dict) -> None:
@@ -1216,7 +1426,9 @@ def _cb_appeal_draft_edit(chat_id: int, st: dict) -> None:
 
 
 _CALLBACK_STATIC: dict[str, callable] = {
-    "auth_1c":          lambda chat_id, st: _start_1c_auth(chat_id),
+    "auth_1c":          _cb_auth,
+    "accounts_list":    lambda chat_id, st: _show_accounts(chat_id),
+    "account_add":      lambda chat_id, st: _start_1c_auth(chat_id, "accounts"),
     "appeal_start":      _cb_appeal_start,
     "my_appeals":        lambda chat_id, st: _show_my_appeals(chat_id),
     "pokazaniya":        lambda chat_id, st: _start_pokazaniya(chat_id),
@@ -1241,27 +1453,56 @@ _CALLBACK_STATIC: dict[str, callable] = {
 }
 
 _CALLBACK_STATIC_MODULES = {
-    "auth_1c": "auth", "appeal_start": "appeal", "my_appeals": "appeal_status",
+    "auth_1c": "auth", "accounts_list": "accounts", "account_add": "accounts",
+    "appeal_start": "appeal", "my_appeals": "appeal_status",
     "pokazaniya": "readings", "meter_confirm": "readings", "meter_retry": "readings",
     "scripts_list": "faq", "ai_start": "ai", "ai_from_faq": "ai", "ai_more": "ai",
     "ai_new": "ai", "ai_appeal": "appeal", "appeal_draft_submit": "appeal",
     "appeal_draft_edit": "appeal", "kvitanciya": "receipt",
     "appointment_start": "appointment", "appt_skip_theme": "appointment",
-    "appt_confirm": "appointment",
+    "appt_confirm": "appointment", "operator_start": "operator",
 }
-_CALLBACK_STATIC_EXEMPT = {"main_menu", "cancel", "operator_start", "operator_cancel"}
+_CALLBACK_STATIC_EXEMPT = {"main_menu", "cancel", "operator_cancel"}
 _CALLBACK_PREFIX_MODULES = {
     "confirm": "appeal_status", "reopen": "appeal_status", "cat": "appeal",
     "script": "faq", "script_node": "faq", "faq_scripts_page": "faq",
     "faq_node_page": "faq", "meter": "readings",
     "faq_go": "faq",
     "faq_terminal_ai": "ai", "faq_terminal_appeal": "appeal",
+    "faq_terminal_operator": "operator",
     "appt_branch": "appointment", "appt_date": "appointment",
     "appt_time": "appointment", "appt_cancel": "appointment",
 }
-_CALLBACK_PREFIX_EXEMPT = {
-    "operator_rate", "faq_terminal_operator", "faq_terminal_menu",
+_CALLBACK_PREFIX_EXEMPT = {"operator_rate", "faq_terminal_menu", "account_select"}
+
+_STATE_ACCOUNT_CONTINUATIONS = {
+    S.METER_SELECT: "pokazaniya",
+    S.WAITING_VALUE1: "pokazaniya",
+    S.WAITING_VALUE2: "pokazaniya",
+    S.CONFIRM_POKAZANIYA: "pokazaniya",
+    S.APPOINTMENT_BRANCH: "appointment",
+    S.APPOINTMENT_DATE: "appointment",
+    S.APPOINTMENT_TIME: "appointment",
+    S.APPOINTMENT_THEME: "appointment",
+    S.APPOINTMENT_CONFIRM: "appointment",
+    S.REOPEN_COMMENT: "my_appeals",
 }
+
+
+def _guard_session_account(chat_id: int, state: dict) -> bool:
+    continuation = _STATE_ACCOUNT_CONTINUATIONS.get(state.get("state"))
+    if not continuation:
+        return True
+    selected = (
+        state.get("appeal_status_ls")
+        if continuation == "my_appeals"
+        else state.get("flow_ls") or state.get("ls")
+    )
+    return bool(
+        _ensure_bound_flow_account(
+            chat_id, continuation, selected=selected
+        )
+    )
 
 
 def _active_faq_source(st: dict) -> dict | None:
@@ -1300,6 +1541,31 @@ def _reject_disabled(chat_id: int, state: dict) -> None:
     send_main_menu(chat_id, "Раздел временно недоступен.")
 
 
+def _reject_unauthenticated(chat_id: int, state: dict, payload: str) -> None:
+    state["after_auth_callback"] = payload
+    state["state"] = S.MENU
+    _touch(state)
+    send_buttons(
+        chat_id,
+        "Для использования функции необходимо авторизоваться",
+        [[_cb("🔐 Авторизоваться", "auth_1c")], [_cb("🏠 Главное меню", "main_menu")]],
+    )
+
+
+def _module_guard(chat_id: int, state: dict, module: str | None, payload: str) -> bool:
+    authenticated = _is_authenticated(chat_id)
+    if module is None or (
+        not operator_chat.module_enabled(module)
+        and not (module == "auth" and not authenticated)
+    ):
+        _reject_disabled(chat_id, state)
+        return False
+    if not operator_chat.module_accessible(module, authenticated=authenticated):
+        _reject_unauthenticated(chat_id, state, payload)
+        return False
+    return True
+
+
 def handle_callback(update: dict) -> None:
     chat_id = update["message"]["recipient"]["chat_id"]
     payload = update["callback"]["payload"]
@@ -1313,6 +1579,18 @@ def handle_callback(update: dict) -> None:
     _touch(st)
     log.debug("callback chat_id=%s payload=%s", chat_id, payload)
     active_script = _active_faq_source(st)
+    state_module = _STATE_MODULES.get(st.get("state"))
+    if (
+        st.get("state") in _STATE_ACCOUNT_CONTINUATIONS
+        and state_module
+        and not operator_chat.module_enabled(state_module)
+    ):
+        _reject_disabled(chat_id, st)
+        return
+    if payload not in {"main_menu", "cancel"} and not _guard_session_account(
+        chat_id, st
+    ):
+        return
 
     # Payload с аргументом: "префикс:значение"
     if ":" in payload:
@@ -1320,10 +1598,9 @@ def handle_callback(update: dict) -> None:
         handler = _CALLBACK_PREFIXES.get(prefix)
         if handler:
             module = _CALLBACK_PREFIX_MODULES.get(prefix)
-            if prefix not in _CALLBACK_PREFIX_EXEMPT and (
-                module is None or not operator_chat.module_enabled(module)
+            if prefix not in _CALLBACK_PREFIX_EXEMPT and not _module_guard(
+                chat_id, st, module, payload
             ):
-                _reject_disabled(chat_id, st)
                 _record_faq_exit_after(st, active_script, payload)
                 return
             try:
@@ -1340,10 +1617,13 @@ def handle_callback(update: dict) -> None:
     handler = _CALLBACK_STATIC.get(payload)
     if handler:
         module = _CALLBACK_STATIC_MODULES.get(payload)
-        if payload not in _CALLBACK_STATIC_EXEMPT and (
-            module is None or not operator_chat.module_enabled(module)
+        if payload == "auth_1c" and _is_authenticated(chat_id):
+            # For an already-bound user this legacy payload is equivalent to
+            # "add account" and is governed by the accounts module.
+            module = "accounts"
+        if payload not in _CALLBACK_STATIC_EXEMPT and not _module_guard(
+            chat_id, st, module, payload
         ):
-            _reject_disabled(chat_id, st)
             _record_faq_exit_after(st, active_script, payload)
             return
         handler(chat_id, st)
@@ -1356,14 +1636,82 @@ def handle_callback(update: dict) -> None:
 # ── Обработчик входящих сообщений ─────────────────────────────────────────────
 
 # Действие после успешной валидации ЛС (ключ after_ls → функция)
-_AFTER_LS_ACTIONS: dict[str, callable] = {
+_RAW_AFTER_LS_ACTIONS: dict[str, callable] = {
     "my_appeals": lambda chat_id, ls: _show_my_appeals(chat_id),
     "pokazaniya": lambda chat_id, ls: _show_meter_select(chat_id, ls),
     "kvitanciya": _deliver_kvitanciya,
     "appointment": lambda chat_id, ls: _start_appointment_flow(chat_id, ls),
     "appeal":     lambda chat_id, ls: _submit_appeal(chat_id, ls),
     "operator":   lambda chat_id, ls: _start_operator_chat(chat_id),
+    "appeal_start": lambda chat_id, ls: appeals.start_appeal(chat_id, _appeal_dependencies()),
+    "accounts": lambda chat_id, ls: _show_accounts(chat_id),
+    "__callback__": lambda chat_id, ls: _resume_deferred_callback(chat_id),
 }
+
+_ACCOUNT_CONTINUATION_MODULES = {
+    "my_appeals": "appeal_status",
+    "pokazaniya": "readings",
+    "kvitanciya": "receipt",
+    "appointment": "appointment",
+    "appeal": "appeal",
+    "operator": "operator",
+    "appeal_start": "appeal",
+    "accounts": "accounts",
+    "__callback__": "auth",
+}
+
+
+def _run_after_ls_action(chat_id: int, ls: str, after: str) -> None:
+    """Recheck access at continuation time, including admin changes mid-flow."""
+    action = _RAW_AFTER_LS_ACTIONS.get(after)
+    module = _ACCOUNT_CONTINUATION_MODULES.get(after)
+    state = _get_state(chat_id)
+    if action is None or module is None:
+        send_main_menu(chat_id)
+        return
+    if after == "__callback__":
+        action(chat_id, ls)
+        return
+    if not _module_guard(chat_id, state, module, ""):
+        return
+    action(chat_id, ls)
+
+
+_AFTER_LS_ACTIONS: dict[str, callable] = {
+    key: (lambda chat_id, ls, continuation=key: _run_after_ls_action(
+        chat_id, ls, continuation
+    ))
+    for key in _RAW_AFTER_LS_ACTIONS
+}
+
+
+def _resume_deferred_callback(chat_id: int) -> None:
+    st = _get_state(chat_id)
+    payload = st.pop("after_auth_callback", None)
+    if not isinstance(payload, str):
+        send_main_menu(chat_id)
+        return
+    if ":" in payload:
+        prefix, _, arg = payload.partition(":")
+        handler = _CALLBACK_PREFIXES.get(prefix)
+        if handler:
+            module = _CALLBACK_PREFIX_MODULES.get(prefix)
+            if prefix not in _CALLBACK_PREFIX_EXEMPT and not _module_guard(
+                chat_id, st, module, payload
+            ):
+                return
+            handler(chat_id, st, arg)
+            return
+    handler = _CALLBACK_STATIC.get(payload)
+    if handler:
+        module = _CALLBACK_STATIC_MODULES.get(payload)
+        if payload not in _CALLBACK_STATIC_EXEMPT and not _module_guard(
+            chat_id, st, module, payload
+        ):
+            return
+        handler(chat_id, st)
+        return
+    send_main_menu(chat_id)
 
 
 def _auth_flow_dependencies() -> auth.AuthFlowDependencies:
@@ -1383,6 +1731,9 @@ def _auth_flow_dependencies() -> auth.AuthFlowDependencies:
         continuations=_AFTER_LS_ACTIONS,
         integration_enabled=ENABLE_1C_INTEGRATION,
         logger=log,
+        list_account_bindings=db.list_account_bindings,
+        send_buttons=send_buttons,
+        make_callback=_cb,
     )
 
 
@@ -1431,6 +1782,7 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
 
 _STATE_MODULES = {
     S.AWAIT_LS: "auth", S.AWAIT_LS_1C: "auth",
+    S.ACCOUNT_SELECT: "accounts",
     S.APPEAL_CATEGORY: "appeal", S.APPEAL_BODY: "appeal",
     S.REOPEN_COMMENT: "appeal_status", S.SCRIPT_LIST: "faq", S.SCRIPT_NODE: "faq",
     S.AI_QUESTION: "ai", S.METER_SELECT: "readings", S.WAITING_VALUE1: "readings",
@@ -1517,20 +1869,35 @@ def handle_message(message: dict) -> None:
     st = _get_state(chat_id)
     _touch(st)
 
+    state_module = _STATE_MODULES.get(st.get("state"))
+    if (
+        st.get("state") in _STATE_ACCOUNT_CONTINUATIONS
+        and state_module
+        and not operator_chat.module_enabled(state_module)
+    ):
+        _reject_disabled(chat_id, st)
+        return
+    if not _guard_session_account(chat_id, st):
+        return
+
     state_name = st.get("state")
     module = _STATE_MODULES.get(state_name)
     if state_name in {S.AWAIT_LS, S.AWAIT_LS_1C}:
-        module = {
-            "my_appeals": "appeal_status", "pokazaniya": "readings",
-            "kvitanciya": "receipt", "appointment": "appointment", "appeal": "appeal",
-        }.get(st.get("after_ls"), module)
-        if state_name == S.AWAIT_LS_1C and not st.get("after_ls"):
-            module = "auth"
+        after_key = (
+            st.get("after_ls") if state_name == S.AWAIT_LS
+            else st.get("after_1c_auth")
+        )
+        target_module = _ACCOUNT_CONTINUATION_MODULES.get(after_key)
+        if target_module and not operator_chat.module_enabled(target_module):
+            _reject_disabled(chat_id, st)
+            return
+        # Account input itself remains available to unauthenticated users; the
+        # continuation is guarded again after the durable binding is written.
+        module = "auth"
     handler = _MESSAGE_HANDLERS.get(state_name)
-    if handler and state_name not in _STATE_EXEMPT and (
-        module is None or not operator_chat.module_enabled(module)
+    if handler and state_name not in _STATE_EXEMPT and not _module_guard(
+        chat_id, st, module, ""
     ):
-        _reject_disabled(chat_id, st)
         return
 
     if handler:

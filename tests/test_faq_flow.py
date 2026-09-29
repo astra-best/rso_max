@@ -473,16 +473,16 @@ def test_disabled_faq_rejects_pagination_callback(monkeypatch):
     menu.assert_called_once_with(987654, "Раздел временно недоступен.")
 
 
-def test_main_menu_with_all_modules_disabled_is_plain_text(monkeypatch):
+def test_main_menu_with_all_modules_disabled_still_offers_auth(monkeypatch):
     monkeypatch.setattr(bot.operator_chat, "get_module_settings", lambda: {})
-    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat_id: None)
+    monkeypatch.setattr(bot, "_is_authenticated", lambda _chat_id: False)
     text_sender = Mock(return_value=True)
     buttons_sender = Mock()
     monkeypatch.setattr(bot, "send_message", text_sender)
     monkeypatch.setattr(bot, "send_buttons", buttons_sender)
-    assert bot.send_main_menu(12, "Нет доступных разделов") is True
-    text_sender.assert_called_once_with(12, "Нет доступных разделов")
-    buttons_sender.assert_not_called()
+    bot.send_main_menu(12, "Нет доступных разделов")
+    text_sender.assert_not_called()
+    assert buttons_sender.call_args.args[2] == [[bot._cb("🔐 Авторизоваться", "auth_1c")]]
 
 
 def _bot_callback(payload: str) -> dict:
@@ -515,6 +515,7 @@ def test_terminal_ai_requires_current_bound_context_and_deduplicates(monkeypatch
     monkeypatch.setattr(bot, "_start_ai", starter)
     monkeypatch.setattr(bot.analytics, "record_event", events)
     monkeypatch.setattr(bot.operator_chat, "module_enabled", lambda _key: True)
+    monkeypatch.setattr(bot, "_is_authenticated", lambda _chat: True)
     monkeypatch.setattr(bot, "send_message", Mock())
 
     bot.handle_callback(_bot_callback(f"faq_terminal_ai:{argument}"))

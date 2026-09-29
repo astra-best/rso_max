@@ -12,6 +12,7 @@ class S:
     APPEAL_BODY = "appeal_body"
     AWAIT_LS = "await_ls"
     AWAIT_LS_1C = "await_ls_1c"
+    ACCOUNT_SELECT = "account_select"
 
     REOPEN_COMMENT = "reopen_comment"
 
@@ -49,6 +50,11 @@ FLOW_KEYS = (
     # Cleans sessions left by deployments that still used the OTP flow.
     "pending_1c_ls",
     "after_1c_auth",
+    "after_account_select",
+    "after_auth_callback",
+    "flow_ls",
+    "appeal_status_ls",
+    "revoked_selected_ls",
     "ai_last_exchange",
     "ai_faq_context",
     "faq_terminal",
