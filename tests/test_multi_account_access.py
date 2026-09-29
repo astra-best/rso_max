@@ -4,10 +4,10 @@ import re
 import sqlite3
 from unittest.mock import Mock
 
-import database as db
 import bot
+import database as db
 import web
-from rso_bot.flows import auth
+from rso_bot.flows import accounts, auth
 from rso_bot.states import S
 
 
@@ -60,6 +60,39 @@ def test_many_to_many_bind_and_unlink_preserves_bot_user(tmp_path, monkeypatch):
     conn = db.get_conn()
     assert conn.execute("SELECT COUNT(*) FROM pokazaniya WHERE chat_id=10").fetchone()[0] == 1
     conn.close()
+
+
+def test_customer_account_list_never_exposes_stored_fio():
+    """The MAX-facing account screen may show an address, but never a name."""
+    send_buttons = Mock()
+    deps = accounts.AccountManagementDependencies(
+        list_bindings=lambda _chat_id: [
+            {
+                "ls": "LS-1",
+                "fio": "Секретное ФИО из базы",
+                "address": "ул. Тестовая, 1",
+            },
+            {
+                "ls": "LS-2",
+                "fio": "ФИО из API 1С",
+                "address": None,
+            },
+        ],
+        make_callback=lambda text, payload: {"text": text, "payload": payload},
+        send_buttons=send_buttons,
+        start_auth=Mock(),
+    )
+
+    accounts.show(42, deps)
+
+    message = send_buttons.call_args.args[1]
+    assert message == (
+        "👤 Мои лицевые счета:\n"
+        "• LS-1 — ул. Тестовая, 1\n"
+        "• LS-2"
+    )
+    assert "Секретное ФИО из базы" not in message
+    assert "ФИО из API 1С" not in message
 
 
 def test_durable_bindings_override_stale_session(tmp_path, monkeypatch):

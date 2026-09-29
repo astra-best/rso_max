@@ -23,8 +23,12 @@ def show(chat_id: int, deps: AccountManagementDependencies) -> None:
     lines = ["👤 Мои лицевые счета:"]
     for row in bindings:
         ls = str(row["ls"])
-        details = " — ".join(value for value in (row["fio"], row["address"]) if value)
-        lines.append(f"• {ls}" + (f" — {details}" if details else ""))
+        # ФИО хранится для внутренних административных и операторских
+        # сценариев, но не должно возвращаться клиенту в MAX.  Даже если
+        # list_bindings() по-прежнему отдаёт поле fio, пользовательское
+        # представление намеренно использует только ЛС и адрес.
+        address = row["address"]
+        lines.append(f"• {ls}" + (f" — {address}" if address else ""))
     deps.send_buttons(
         chat_id,
         "\n".join(lines),
