@@ -53,12 +53,13 @@ def start_appeal(
     chat_id: int,
     deps: AppealDependencies,
     draft_body: str | None = None,
+    source: str = "bot",
 ) -> None:
     """Start appeal creation by asking the user for a category."""
     state = deps.get_state(chat_id)
     state["state"] = deps.category_state
     if draft_body:
-        state["appeal"] = {"body": draft_body, "is_draft": True}
+        state["appeal"] = {"body": draft_body, "is_draft": True, "source": source}
     else:
         state.pop("appeal", None)
     deps.touch(state)
@@ -154,13 +155,16 @@ def submit_appeal(chat_id: int, ls: str, deps: AppealDependencies) -> None:
     state = deps.get_state(chat_id)
     appeal = state.get("appeal", {})
 
-    data, error = deps.create_appeal(
-        ls=ls,
-        channel="max",
-        category=appeal.get("category", "прочее"),
-        body=appeal.get("body", ""),
-        chat_id=chat_id,
-    )
+    create_args = {
+        "ls": ls,
+        "channel": "max",
+        "category": appeal.get("category", "прочее"),
+        "body": appeal.get("body", ""),
+        "chat_id": chat_id,
+    }
+    if appeal.get("source") in {"ai", "operator"}:
+        create_args["source"] = appeal["source"]
+    data, error = deps.create_appeal(**create_args)
 
     state["state"] = deps.menu_state
     state.pop("appeal", None)

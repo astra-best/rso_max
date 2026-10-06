@@ -13,6 +13,7 @@ import httpx
 import pytest
 from PIL import Image
 
+import analytics
 import bot
 import database as db
 import web
@@ -74,12 +75,10 @@ def test_no_active_operator_rejects_without_queue(operator_db):
     assert operator_chat.get_open_dialog_for_chat(10) is None
 
 
-def test_auth_required_and_anonymous(operator_db):
+def test_legacy_require_auth_is_ignored_in_favor_of_module_public_policy(operator_db):
     op = _operator("op1")
     operator_chat.start_shift(op)
     _settings(require_auth=True)
-    assert operator_chat.request_dialog(11, profile=None, faq_context=None, ai_messages=[])["status"] == "auth_required"
-    _settings(require_auth=False)
     row = operator_chat.request_dialog(11, profile=None, faq_context="FAQ", ai_messages=[])
     assert row["status"] == "active"
     assert row["authenticated"] == 0
@@ -107,6 +106,46 @@ def test_least_loaded_fifo_capacity_and_cancel(operator_db, monkeypatch):
     assert assigned == [{"dialog_id": d4["id"], "chat_id": 4, "operator_id": first}]
 
 
+def test_legacy_never_assigned_waiting_dialog_gets_exact_timing(operator_db):
+    _settings(max_active_dialogs=1, inactivity_timeout_min=60)
+    operator_id = _operator("legacy-waiting-op")
+    created = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    assigned_at = created + timedelta(minutes=2)
+    conn = db.get_conn()
+    cursor = conn.execute(
+        """INSERT INTO operator_dialogs
+           (chat_id,status,queue_seq,authenticated,ai_context_json,created_at,
+            last_activity_at,analytics_legacy,reassignment_pending)
+           VALUES(701,'waiting',1,0,'[]',?,?,1,0)""",
+        (created.isoformat(timespec="seconds"), created.isoformat(timespec="seconds")),
+    )
+    dialog_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    operator_chat.start_shift(operator_id, now=assigned_at)
+
+    assert operator_chat.assign_waiting(now=assigned_at) == [{
+        "dialog_id": dialog_id, "chat_id": 701, "operator_id": operator_id,
+    }]
+    operator_chat.close_dialog(
+        dialog_id, operator_id, now=assigned_at + timedelta(minutes=10),
+    )
+
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT analytics_legacy,first_assigned_at FROM operator_dialogs WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    conn.close()
+    assert row["analytics_legacy"] == 0
+    assert row["first_assigned_at"] == assigned_at.isoformat(timespec="seconds")
+    report = analytics.build_dashboard(
+        analytics.parse_period("2026-09-01", "2026-09-01")
+    )
+    assert report["operator"]["avg_wait_seconds"] == 120.0
+    assert report["operator"]["avg_duration_seconds"] == 600.0
+
+
 def test_stale_operator_requeues_warns_and_times_out(operator_db):
     _settings(heartbeat_timeout_min=5, inactivity_timeout_min=30, warning_before_min=5)
     op = _operator("stale")
@@ -116,6 +155,64 @@ def test_stale_operator_requeues_warns_and_times_out(operator_db):
     events = operator_chat.process_timeouts(now=base + timedelta(minutes=6))
     assert [item["chat_id"] for item in events["requeued"]] == [5]
     assert operator_chat.get_open_dialog_for_chat(5)["status"] == "waiting"
+    conn = db.get_conn()
+    tracked = conn.execute(
+        "SELECT event_type,dialog_id FROM analytics_events"
+    ).fetchall()
+    conn.close()
+    assert [(row["event_type"], row["dialog_id"]) for row in tracked] == [
+        ("operator_assigned", events["requeued"][0]["id"]),
+        ("operator_connection_lost", events["requeued"][0]["id"]),
+    ]
+
+
+def test_reassignment_telemetry_and_first_assignment_are_durable(operator_db):
+    _settings(heartbeat_timeout_min=5, max_active_dialogs=2)
+    first, second = _operator("lost-owner"), _operator("new-owner")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(first, now=base)
+    dialog = operator_chat.request_dialog(
+        55, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    operator_chat.start_shift(second, now=base + timedelta(minutes=6))
+    result = operator_chat.process_timeouts(now=base + timedelta(minutes=6))
+    assert result["assigned"][0]["operator_id"] == second
+    saved = operator_chat.get_open_dialog_for_chat(55)
+    assert saved["first_assigned_at"] == dialog["assigned_at"]
+    conn = db.get_conn()
+    event_types = [
+        row["event_type"] for row in conn.execute(
+            "SELECT event_type FROM analytics_events WHERE dialog_id=? ORDER BY id",
+            (dialog["id"],),
+        )
+    ]
+    conn.close()
+    assert event_types == [
+        "operator_assigned", "operator_connection_lost",
+        "operator_assigned", "operator_reassigned",
+    ]
+
+
+def test_single_assignment_event_is_deduplicated(operator_db):
+    _settings(max_active_dialogs=2)
+    owner = _operator("one-owner")
+    base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    operator_chat.start_shift(owner, now=base)
+    first = operator_chat.request_dialog(
+        56, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    second = operator_chat.request_dialog(
+        56, profile=None, faq_context=None, ai_messages=[], now=base,
+    )
+    assert first["id"] == second["id"]
+    conn = db.get_conn()
+    count = conn.execute(
+        """SELECT COUNT(*) n FROM analytics_events
+           WHERE dialog_id=? AND event_type='operator_assigned'""",
+        (first["id"],),
+    ).fetchone()["n"]
+    conn.close()
+    assert count == 1
 
 
 def test_messages_object_auth_close_and_unique_rating(operator_db):

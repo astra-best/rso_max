@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+import analytics
 import database as db
 
 ACTIVE_STATUSES = ("waiting", "active")
@@ -41,7 +42,7 @@ REPORT_REASONS = {
 }
 MODULE_KEYS = (
     "auth", "appeal", "appeal_status", "readings", "faq", "ai",
-    "receipt", "appointment",
+    "receipt", "appointment", "operator", "accounts",
 )
 
 
@@ -204,13 +205,55 @@ def module_enabled(key: str) -> bool:
     return get_module_settings().get(key, False)
 
 
-def update_module_settings(values: dict[str, bool]) -> None:
+def get_module_access_settings() -> dict[str, dict[str, bool]]:
+    defaults = {
+        key: {"enabled": True, "allow_unauthenticated": key in {"auth", "faq", "operator"}}
+        for key in MODULE_KEYS
+    }
+    try:
+        with _connection() as conn:
+            rows = conn.execute(
+                "SELECT module_key,enabled,allow_unauthenticated FROM module_settings"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return defaults
+    for row in rows:
+        defaults[row["module_key"]] = {
+            "enabled": bool(row["enabled"]),
+            "allow_unauthenticated": bool(row["allow_unauthenticated"]),
+        }
+    return defaults
+
+
+def module_accessible(key: str, *, authenticated: bool) -> bool:
+    # Authorization is the recovery path for every private module.  Hiding or
+    # disabling that path would strand every unauthenticated user, so the bot
+    # always exposes it until a durable account binding exists.
+    if key == "auth" and not authenticated:
+        return True
+    value = get_module_access_settings().get(key)
+    return bool(
+        value and value["enabled"]
+        and (authenticated or value["allow_unauthenticated"])
+    )
+
+
+def update_module_settings(
+    values: dict[str, bool],
+    unauthenticated: dict[str, bool] | None = None,
+) -> None:
+    current = get_module_access_settings()
     with _connection() as conn:
         for key in MODULE_KEYS:
             conn.execute(
-                "INSERT INTO module_settings(module_key,enabled) VALUES(?,?) "
-                "ON CONFLICT(module_key) DO UPDATE SET enabled=excluded.enabled",
-                (key, int(bool(values.get(key)))),
+                "INSERT INTO module_settings(module_key,enabled,allow_unauthenticated) "
+                "VALUES(?,?,?) ON CONFLICT(module_key) DO UPDATE SET "
+                "enabled=excluded.enabled,allow_unauthenticated=excluded.allow_unauthenticated",
+                (
+                    key, int(bool(values.get(key))),
+                    int(bool((unauthenticated or {}).get(key))) if unauthenticated is not None
+                    else int(current.get(key, {}).get("allow_unauthenticated", False)),
+                ),
             )
 
 
@@ -405,8 +448,6 @@ def request_dialog(
     if not settings["enabled"] or not has_active_operators(now):
         return {"status": "unavailable"}
     authenticated = bool(profile and profile.get("ls"))
-    if settings["require_auth"] and not authenticated:
-        return {"status": "auth_required"}
     with _connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         any_active = conn.execute(
@@ -438,8 +479,9 @@ def request_dialog(
         cur = conn.execute(
             """INSERT INTO operator_dialogs
                (chat_id,operator_id,status,queue_seq,authenticated,client_fio,client_ls,
-                client_address,faq_context,ai_context_json,created_at,assigned_at,last_activity_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                client_address,faq_context,ai_context_json,created_at,assigned_at,last_activity_at,
+                analytics_legacy)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
             (
                 chat_id, operator_id, status, queue_seq, int(authenticated),
                 profile.get("fio") if authenticated else None,
@@ -450,6 +492,17 @@ def request_dialog(
                 _iso(now), _iso(now) if operator_id else None, _iso(now),
             ),
         )
+        if operator_id:
+            conn.execute(
+                "UPDATE operator_dialogs SET first_assigned_at=? WHERE id=?",
+                (_iso(now), cur.lastrowid),
+            )
+            analytics.record_event_in_transaction(
+                conn, "operator_assigned", dialog_id=cur.lastrowid,
+                operator_id=operator_id,
+                dedupe_key=f"operator:{cur.lastrowid}:assigned:1",
+                occurred_at=now,
+            )
         dialog_id = cur.lastrowid
         if status == "active":
             conn.execute(
@@ -518,11 +571,23 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
             if not waiting or not operator_id:
                 break
             was_reassignment = bool(waiting["reassignment_pending"])
+            is_first_known_assignment = bool(
+                waiting["analytics_legacy"]
+                and waiting["operator_id"] is None
+                and waiting["assigned_at"] is None
+                and waiting["first_assigned_at"] is None
+                and not was_reassignment
+            )
             cur = conn.execute(
                 """UPDATE operator_dialogs SET status='active',operator_id=?,assigned_at=?,
-                   last_activity_at=?,warned_at=NULL,reassignment_pending=0
+                   first_assigned_at=COALESCE(first_assigned_at,?),
+                   last_activity_at=?,warned_at=NULL,reassignment_pending=0,
+                   analytics_legacy=CASE WHEN ? THEN 0 ELSE analytics_legacy END
                    WHERE id=? AND status='waiting'""",
-                (operator_id, _iso(now), _iso(now), waiting["id"]),
+                (
+                    operator_id, _iso(now), _iso(now), _iso(now),
+                    int(is_first_known_assignment), waiting["id"],
+                ),
             )
             if not cur.rowcount:
                 continue
@@ -552,6 +617,19 @@ def assign_waiting(now: datetime | None = None) -> list[dict[str, Any]]:
                 now=now,
             )
             assigned.append({"dialog_id": waiting["id"], "chat_id": waiting["chat_id"], "operator_id": operator_id})
+            analytics.record_event_in_transaction(
+                conn, "operator_assigned", dialog_id=waiting["id"],
+                operator_id=operator_id,
+                dedupe_key=f"operator:{waiting['id']}:assigned:{assignment_no}",
+                occurred_at=now,
+            )
+            if was_reassignment:
+                analytics.record_event_in_transaction(
+                    conn, "operator_reassigned", dialog_id=waiting["id"],
+                    operator_id=operator_id,
+                    dedupe_key=f"operator:{waiting['id']}:reassigned:{assignment_no}",
+                    occurred_at=now,
+                )
     return assigned
 
 
@@ -861,17 +939,72 @@ def rating_report() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def list_history(limit: int = 200) -> list[dict[str, Any]]:
-    limit = max(1, min(int(limit), 500))
-    with _connection() as conn:
-        rows = conn.execute(
-            """SELECT d.*,u.name operator_name FROM operator_dialogs d
+def _history_query(
+    limit: int | None = 200,
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> tuple[str, list[Any]]:
+    query = """SELECT d.*,u.name operator_name FROM operator_dialogs d
                LEFT JOIN users u ON u.id=d.operator_id
-               WHERE d.status IN ('closed','timed_out','cancelled')
-               ORDER BY COALESCE(d.closed_at,d.created_at) DESC,d.id DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
+               WHERE d.status IN ('closed','timed_out','cancelled')"""
+    params: list[Any] = []
+    if status in {"closed", "timed_out", "cancelled"}:
+        query += " AND d.status=?"
+        params.append(status)
+    if operator_id is not None:
+        query += " AND d.operator_id=?"
+        params.append(operator_id)
+    if date_from:
+        query += " AND COALESCE(d.closed_at,d.created_at)>=?"
+        params.append(date_from)
+    if date_to:
+        query += " AND COALESCE(d.closed_at,d.created_at)<?"
+        params.append(date_to)
+    query += " ORDER BY COALESCE(d.closed_at,d.created_at) DESC,d.id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+    return query, params
+
+
+def list_history(
+    limit: int | None = 200,
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict[str, Any]]:
+    query, params = _history_query(
+        limit, status=status, operator_id=operator_id,
+        date_from=date_from, date_to=date_to,
+    )
+    with _connection() as conn:
+        rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def iter_history(
+    *,
+    status: str | None = None,
+    operator_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    batch_size: int = 500,
+):
+    """Stream all matching closed dialogs without the UI history limit."""
+    query, params = _history_query(
+        None, status=status, operator_id=operator_id,
+        date_from=date_from, date_to=date_to,
+    )
+    with _connection() as conn:
+        cursor = conn.execute(query, params)
+        while batch := cursor.fetchmany(batch_size):
+            for row in batch:
+                yield dict(row)
 
 
 def get_history_dialog(dialog_id: int) -> dict[str, Any] | None:
@@ -1142,6 +1275,11 @@ def process_timeouts(now: datetime | None = None) -> dict[str, list[dict[str, An
                 (queue_seq, _iso(now), row["id"]),
             )
             result["requeued"].append(dict(row))
+            analytics.record_event_in_transaction(
+                conn, "operator_connection_lost", dialog_id=row["id"],
+                dedupe_key=f"operator:{row['id']}:lost:{row['assigned_at']}",
+                occurred_at=now,
+            )
         warn_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"] - settings["warning_before_min"])))
         close_at = _iso(now - timedelta(minutes=int(settings["inactivity_timeout_min"])))
         warns = conn.execute(

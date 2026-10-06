@@ -110,6 +110,7 @@ async def create_appeal(payload: AppealCreate) -> AppealCreateOut:
         chat_id=payload.chat_id,
         file_path=payload.file_path,
         priority=priority,
+        source=payload.source,
     )
     log.info("Создано обращение %s  channel=%s  category=%s  priority=%s",
              ticket_no, payload.channel, category, priority)
