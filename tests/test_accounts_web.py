@@ -397,6 +397,32 @@ def test_excel_import_accepts_canonical_hyphen_and_underscore(
     assert db.get_ls("TEST-LS_001") is not None
 
 
+def test_excel_import_updates_account_without_losing_max_binding(
+    accounts_db, tmp_path
+) -> None:
+    assert db.create_lschet("100001", "Старое ФИО", "Старый адрес")
+    original_account_id = db.get_ls("100001")["id"]
+    db.upsert_bot_user(123456789, "100001", None, authorized_1c=True)
+    assert [row["ls"] for row in db.list_account_bindings(123456789)] == ["100001"]
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "ЛС и ФИО"
+    sheet.append(["ЛС", "ФИО", "Адрес"])
+    sheet.append(["100001", "Новое ФИО", "Новый адрес"])
+    path = tmp_path / "updated-account.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    db.import_from_excel(str(path))
+
+    account = db.get_ls("100001")
+    assert account["id"] == original_account_id
+    assert account["fio"] == "Новое ФИО"
+    assert account["address"] == "Новый адрес"
+    assert [row["ls"] for row in db.list_account_bindings(123456789)] == ["100001"]
+
+
 @pytest.mark.parametrize(
     ("fio", "address"),
     [("Иван\u200bИванов", "Адрес"), ("Иван Иванов", "Дом\u202e1")],

@@ -2111,7 +2111,9 @@ def import_from_excel(filepath: str = "Данные_по_ЛС.xlsx") -> None:
         conn.execute("BEGIN IMMEDIATE")
         if has_accounts_sheet:
             conn.executemany(
-                "INSERT OR REPLACE INTO licschet (number, fio, address) VALUES (?, ?, ?)",
+                "INSERT INTO licschet (number, fio, address) VALUES (?, ?, ?) "
+                "ON CONFLICT(number) DO UPDATE SET "
+                "fio=excluded.fio, address=excluded.address",
                 accounts,
             )
 

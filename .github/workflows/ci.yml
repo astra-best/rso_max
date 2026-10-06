@@ -5,11 +5,13 @@ on:
   pull_request:
     branches:
       - main
+      - Main_test
       - "integration/**"
       - "review/**"
   push:
     branches:
       - main
+      - Main_test
       - "integration/**"
       - "review/**"
 
