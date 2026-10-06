@@ -87,6 +87,14 @@ def test_ai_draft_is_preserved_and_can_be_submitted_or_edited():
     assert "изменённый текст" in deps.send_message.call_args.args[1]
 
 
+def test_ai_draft_source_is_forwarded_without_changing_plain_bot_contract():
+    deps, state = _dependencies(saved_ls="100001")
+    appeals.start_appeal(42, deps, draft_body="Вопрос\nОтвет", source="ai")
+    state["appeal"]["category"] = "прочее"
+    appeals.submit_appeal(42, "100001", deps)
+    assert deps.create_appeal.call_args.kwargs["source"] == "ai"
+
+
 def test_body_submits_with_saved_ls_or_requests_authorization_without_it():
     saved, state = _dependencies(saved_ls="100001")
     state["appeal"] = {"category": "авария"}
@@ -299,6 +307,7 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_points(monkeypatch):
     patched_submit = Mock()
     monkeypatch.setattr(bot, "send_message", patched_sender)
     monkeypatch.setattr(bot, "_submit_appeal", patched_submit)
+    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat_id: "100001")
 
     bot._start_appeal(42)
 
@@ -310,6 +319,11 @@ def test_bot_wrappers_delegate_and_keep_runtime_patch_points(monkeypatch):
 
 
 def test_all_bot_appeal_wrappers_delegate(monkeypatch):
+    monkeypatch.setattr(
+        bot, "_ensure_bound_flow_account",
+        lambda _chat, _after, selected=None: selected or "100001",
+    )
+    monkeypatch.setattr(bot, "_get_saved_ls", lambda _chat: "100001")
     names_and_calls = [
         (
             "set_category",

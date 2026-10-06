@@ -115,6 +115,7 @@ def test_authorized_account_is_restored_after_process_session_restart(
 ) -> None:
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "auth-restart.sqlite"))
     db.init_db()
+    db.create_lschet("100001")
     db.upsert_bot_user(42, "100001", "Иванов", authorized_1c=True)
     bot.user_states.clear()
     monkeypatch.setattr(bot, "ENABLE_1C_INTEGRATION", True)
@@ -419,6 +420,7 @@ def test_handle_message_redacts_all_user_input_from_debug_log(
     handler = MagicMock()
     monkeypatch.setattr(bot, "_get_state", MagicMock(return_value=state))
     monkeypatch.setattr(bot, "_touch", MagicMock())
+    monkeypatch.setattr(bot, "_is_authenticated", lambda _chat_id: True)
     handlers = {} if message_state == S.MENU else {message_state: handler}
     monkeypatch.setattr(bot, "_MESSAGE_HANDLERS", handlers)
     monkeypatch.setattr(bot, "send_main_menu", MagicMock())

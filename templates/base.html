@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}РСО Портал{% endblock %} — РСО Портал</title>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Unbounded:wght@400;700&display=swap" rel="stylesheet">
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         :root {
@@ -221,6 +220,10 @@
         {% endif %}
         {% if user.role == 'admin' %}
         <div class="nav-label">Администратор</div>
+        <a href="{{ url_for('analytics_dashboard') }}"
+           class="nav-item {% if request.endpoint == 'analytics_dashboard' %}active{% endif %}">
+            📈 Аналитика
+        </a>
         <a href="{{ url_for('branches_page') }}"
            class="nav-item {% if request.endpoint in ('branches_page','branch_detail','branch_create','branch_update') %}active{% endif %}">
             🏢 Филиалы
