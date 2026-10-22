@@ -110,7 +110,23 @@ log = _setup_logger()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(128 * 1024 * 1024)))
+if MAX_CONTENT_LENGTH <= 0:
+    raise RuntimeError("MAX_CONTENT_LENGTH must be a positive number of bytes")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=MAX_CONTENT_LENGTH,
+)
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    flash(
+        f"Размер запроса превышает допустимый лимит {MAX_CONTENT_LENGTH} байт",
+        "error",
+    )
+    return redirect(url_for("upload_page"))
 
 
 @app.get("/healthz")
@@ -802,24 +818,29 @@ def upload_file():
         flash("Файл не выбран", "error")
         return redirect(url_for("upload_page"))
     file = request.files["file"]
-    if not file.filename or not file.filename.endswith(".xlsx"):
-        flash("Допускается только .xlsx", "error")
+    if not file.filename or not file.filename.lower().endswith(".txt"):
+        flash("Допускается только .txt с JSON", "error")
         return redirect(url_for("upload_page"))
 
-    upload_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    filepath = os.path.join(upload_dir, "Данные_по_ЛС.xlsx")
     try:
-        os.makedirs(upload_dir, exist_ok=True)
-        file.save(filepath)
-        db.import_from_excel(filepath)
+        payload = file.stream.read(MAX_CONTENT_LENGTH + 1)
+        if len(payload) > MAX_CONTENT_LENGTH:
+            flash(
+                f"Размер файла превышает допустимый лимит {MAX_CONTENT_LENGTH} байт",
+                "error",
+            )
+            return redirect(url_for("upload_page"))
+        result = db.import_from_1c_json(payload)
     except Exception as exc:
-        log.exception("Ошибка импорта Excel")
+        log.exception("Ошибка импорта JSON из 1С")
         flash(f"Ошибка импорта: {exc}", "error")
         return redirect(url_for("upload_page"))
 
-    flash("Файл успешно загружен и импортирован", "success")
+    flash(
+        f"Импорт завершён: обработано лицевых счетов {result['accounts_imported']}",
+        "success",
+    )
     return redirect(url_for("upload_page"))
-
 
 # ── Управление лицевыми счетами ──────────────────────────────────────────────
 

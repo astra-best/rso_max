@@ -179,7 +179,7 @@ def test_web_healthz_is_public():
     assert response.get_json() == {"status": "ok"}
 
 
-def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
+def test_upload_displays_json_import_failure(clean_db, monkeypatch):
     import web
 
     ok, _ = db.create_user("upload-admin", "initial-password", "Admin", "admin")
@@ -189,32 +189,117 @@ def test_upload_displays_excel_import_failure(clean_db, tmp_path, monkeypatch):
         "/login",
         data={"username": "upload-admin", "password": "initial-password"},
     )
-    monkeypatch.setattr(web, "DB_PATH", str(tmp_path / "database.sqlite"))
     imported = {}
 
-    def fail_import(filepath):
-        imported["filepath"] = filepath
-        raise RuntimeError("Для импорта Excel не установлен openpyxl")
+    def fail_import(payload):
+        imported["payload"] = payload
+        raise RuntimeError("invalid JSON")
 
-    monkeypatch.setattr(web.db, "import_from_excel", fail_import)
+    monkeypatch.setattr(web.db, "import_from_1c_json", fail_import)
     response = client.post(
         "/upload",
-        data={"file": (io.BytesIO(b"not-an-xlsx"), "meters.xlsx")},
+        data={"file": (io.BytesIO(b"[]"), "export.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 302
-    assert imported["filepath"] == str(tmp_path / "Данные_по_ЛС.xlsx")
-    assert (tmp_path / "Данные_по_ЛС.xlsx").is_file()
+    assert imported["payload"] == b"[]"
     with client.session_transaction() as session:
-        assert (
+        assert session["_flashes"][-1] == ("error", "Ошибка импорта: invalid JSON")
+
+
+def test_upload_imports_json_successfully(clean_db, monkeypatch):
+    import web
+
+    ok, _ = db.create_user("success-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "success-admin", "password": "initial-password"},
+    )
+    imported = {}
+
+    def succeed_import(payload):
+        imported["payload"] = payload
+        return {"accounts_imported": 2}
+
+    monkeypatch.setattr(web.db, "import_from_1c_json", succeed_import)
+
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"[]"), "export.txt")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    assert imported["payload"] == b"[]"
+    with client.session_transaction() as session:
+        assert session["_flashes"][-1] == (
+            "success",
+            "Импорт завершён: обработано лицевых счетов 2",
+        )
+
+
+def test_upload_bounds_file_read_and_reports_oversize(clean_db, monkeypatch):
+    import web
+
+    ok, _ = db.create_user("bounded-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "bounded-admin", "password": "initial-password"},
+    )
+    monkeypatch.setattr(web, "MAX_CONTENT_LENGTH", 4)
+    monkeypatch.setitem(web.app.config, "MAX_CONTENT_LENGTH", 2048)
+    monkeypatch.setattr(
+        web.db,
+        "import_from_1c_json",
+        lambda _payload: pytest.fail("Oversized file must not reach importer"),
+    )
+
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"12345"), "export.txt")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    with client.session_transaction() as session:
+        assert session["_flashes"][-1] == (
             "error",
-            "Ошибка импорта: Для импорта Excel не установлен openpyxl",
-        ) in session["_flashes"]
+            "Размер файла превышает допустимый лимит 4 байт",
+        )
 
 
-def test_upload_reports_file_save_failure(clean_db, tmp_path, monkeypatch):
-    from werkzeug.datastructures import FileStorage
+def test_upload_request_limit_returns_clear_error(clean_db, monkeypatch):
+    import web
 
+    ok, _ = db.create_user("request-limit-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "request-limit-admin", "password": "initial-password"},
+    )
+    monkeypatch.setattr(web, "MAX_CONTENT_LENGTH", 128)
+    monkeypatch.setitem(web.app.config, "MAX_CONTENT_LENGTH", 128)
+
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b"x" * 512), "export.txt")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    with client.session_transaction() as session:
+        assert session["_flashes"][-1] == (
+            "error",
+            "Размер запроса превышает допустимый лимит 128 байт",
+        )
+
+
+def test_upload_rejects_excel_without_importing(clean_db, monkeypatch):
     import web
 
     ok, _ = db.create_user("save-admin", "initial-password", "Admin", "admin")
@@ -224,12 +309,11 @@ def test_upload_reports_file_save_failure(clean_db, tmp_path, monkeypatch):
         "/login",
         data={"username": "save-admin", "password": "initial-password"},
     )
-    monkeypatch.setattr(web, "DB_PATH", str(tmp_path / "database.sqlite"))
-
-    def fail_save(_self, _destination, _buffer_size=16384):
-        raise OSError("read-only filesystem")
-
-    monkeypatch.setattr(FileStorage, "save", fail_save)
+    monkeypatch.setattr(
+        web.db,
+        "import_from_1c_json",
+        lambda _payload: pytest.fail("Excel upload must not reach importer"),
+    )
     response = client.post(
         "/upload",
         data={"file": (io.BytesIO(b"not-an-xlsx"), "meters.xlsx")},
@@ -237,7 +321,28 @@ def test_upload_reports_file_save_failure(clean_db, tmp_path, monkeypatch):
     )
     assert response.status_code == 302
     with client.session_transaction() as session:
-        assert ("error", "Ошибка импорта: read-only filesystem") in session["_flashes"]
+        assert session["_flashes"][-1][0] == "error"
+
+
+def test_upload_page_advertises_only_json_text_files(clean_db):
+    import web
+
+    ok, _ = db.create_user("page-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "page-admin", "password": "initial-password"},
+    )
+    response = client.get("/upload")
+    assert response.status_code == 200
+    assert web.app.config["MAX_CONTENT_LENGTH"] == web.MAX_CONTENT_LENGTH
+    assert b'accept=".txt"' in response.data
+    assert b".xlsx" not in response.data
+    assert "Импорт выгрузки 1С".encode() in response.data
+    assert "Показания из файла не создаются".encode() in response.data
+    assert b">TXT</div>" in response.data
+    assert b"??" not in response.data
 
 
 def test_bot_poll_heartbeat_is_written_atomically(tmp_path, monkeypatch):

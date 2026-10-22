@@ -207,6 +207,69 @@ def init_db() -> None:
             address TEXT
         )
     """)
+    _ensure_column(c, "licschet", "one_c_id", "TEXT")
+    duplicate_external_id_groups = c.execute(
+        "SELECT COUNT(*) FROM ("
+        "SELECT one_c_id FROM licschet WHERE one_c_id IS NOT NULL AND one_c_id<>'' "
+        "GROUP BY one_c_id HAVING COUNT(*)>1)"
+    ).fetchone()[0]
+    if duplicate_external_id_groups:
+        log.error(
+            "Detected %s duplicate legacy PersonalAccountID groups; "
+            "preserving rows and skipping unique index",
+            duplicate_external_id_groups,
+        )
+    else:
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_licschet_one_c_id "
+            "ON licschet(one_c_id) WHERE one_c_id IS NOT NULL AND one_c_id<>''"
+        )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            one_c_id TEXT UNIQUE NOT NULL,
+            name TEXT,
+            resource_id TEXT,
+            resource_name TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS licschet_metering_points (
+            licschet_id INTEGER NOT NULL REFERENCES licschet(id) ON DELETE CASCADE,
+            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id) ON DELETE CASCADE,
+            PRIMARY KEY (licschet_id, metering_point_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_meters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            one_c_id TEXT UNIQUE NOT NULL,
+            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id),
+            meter_number TEXT,
+            differentiation_type_id TEXT,
+            meter_type TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_meter_scales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meter_id INTEGER NOT NULL REFERENCES metering_meters(id) ON DELETE CASCADE,
+            one_c_id TEXT NOT NULL,
+            name TEXT,
+            UNIQUE(meter_id, one_c_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_tariff_zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scale_id INTEGER NOT NULL REFERENCES metering_meter_scales(id) ON DELETE CASCADE,
+            one_c_id TEXT NOT NULL,
+            name TEXT,
+            UNIQUE(scale_id, one_c_id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_metering_meters_point ON metering_meters(metering_point_id)")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS schetchiki (
@@ -1910,10 +1973,224 @@ def get_ls(number: str) -> sqlite3.Row | None:
 
 
 def get_schetchiki(ls: str) -> list[sqlite3.Row]:
+    double_tariff = "\u0414\u0432\u0443\u0445\u0442\u0430\u0440\u0438\u0444\u043d\u044b\u0439"
+    single_tariff = "\u041e\u0434\u043d\u043e\u0442\u0430\u0440\u0438\u0444\u043d\u044b\u0439"
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM schetchiki WHERE ls=?", (ls,)).fetchall()
-    conn.close()
-    return rows
+    try:
+        account = conn.execute(
+            "SELECT id FROM licschet WHERE number=?", (normalize_lschet_number(ls),)
+        ).fetchone()
+        imported = []
+        if account:
+            imported = conn.execute(
+                "SELECT p.resource_name AS resource_type, m.meter_number, "
+                "CASE WHEN ("
+                "SELECT COUNT(*) FROM metering_meter_scales s "
+                "JOIN metering_tariff_zones z ON z.scale_id=s.id "
+                "WHERE s.meter_id=m.id) > 1 THEN ? ELSE ? END AS meter_type, "
+                "'0' AS initial1, '0' AS initial2 "
+                "FROM licschet_metering_points lp "
+                "JOIN metering_points p ON p.id=lp.metering_point_id "
+                "JOIN metering_meters m ON m.metering_point_id=p.id "
+                "WHERE lp.licschet_id=? ORDER BY m.id",
+                (double_tariff, single_tariff, account["id"]),
+            ).fetchall()
+        legacy = conn.execute(
+            "SELECT * FROM schetchiki WHERE ls=? ORDER BY id", (ls,)
+        ).fetchall()
+        imported_numbers = {row["meter_number"] for row in imported}
+        return list(imported) + [
+            row for row in legacy if row["meter_number"] not in imported_numbers
+        ]
+    finally:
+        conn.close()
+
+
+def _json_id(value, label: str) -> str:
+    if value is None or not str(value).strip():
+        raise ValueError(f"В JSON отсутствует {label}")
+    return str(value).strip()
+
+
+def _prepare_1c_json(payload: str | bytes) -> list[dict]:
+    try:
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8-sig")
+        records = json.loads(payload.lstrip("\ufeff"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Файл должен содержать JSON в кодировке UTF-8") from exc
+    if not isinstance(records, list):
+        raise ValueError("Корневое значение JSON должно быть массивом")
+
+    prepared = []
+    seen_accounts = set()
+    seen_account_ids = set()
+    seen_meter_ids = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Каждый элемент JSON должен быть объектом")
+        raw_number = record.get("PersonalAccount")
+        if raw_number is None or not str(raw_number).strip():
+            continue
+        try:
+            number = normalize_lschet_number(str(raw_number))
+        except ValueError as exc:
+            raise ValueError(f"Некорректный номер ЛС: {raw_number!r}") from exc
+        if number in seen_accounts:
+            continue
+        seen_accounts.add(number)
+        account_id = _json_id(record.get("PersonalAccountID"), "PersonalAccountID")
+        if account_id in seen_account_ids:
+            raise ValueError(f"Повтор PersonalAccountID в выгрузке: {account_id}")
+        seen_account_ids.add(account_id)
+        item = {
+            "number": number,
+            "one_c_id": account_id,
+            "fio": record.get("FIO"),
+            "address": record.get("Address"),
+            "points": [],
+        }
+        points = record.get("MeteringPoints", [])
+        if not isinstance(points, list):
+            raise ValueError("MeteringPoints должно быть массивом")
+        for point in points:
+            if not isinstance(point, dict):
+                raise ValueError("Точка учёта должна быть объектом")
+            point_item = {
+                "one_c_id": _json_id(point.get("MeteringPointID"), "MeteringPointID"),
+                "name": point.get("MeteringPoint"),
+                "resource_id": point.get("ResourceID"),
+                "resource_name": point.get("Resource"),
+                "meters": [],
+            }
+            meters = point.get("Meters", [])
+            if not isinstance(meters, list):
+                raise ValueError("Meters должно быть массивом")
+            for meter in meters:
+                if not isinstance(meter, dict):
+                    raise ValueError("Прибор учёта должен быть объектом")
+                meter_id = _json_id(meter.get("MeterID"), "MeterID")
+                if meter_id in seen_meter_ids:
+                    raise ValueError(f"Повтор MeterID в выгрузке: {meter_id}")
+                seen_meter_ids.add(meter_id)
+                meter_number = str(meter.get("MeterNumber") or "").strip()
+                if not meter_number:
+                    raise ValueError("В JSON у прибора отсутствует MeterNumber")
+                scales = meter.get("Scales", [])
+                if not isinstance(scales, list):
+                    raise ValueError("Scales должно быть массивом")
+                scale_items = []
+                for scale in scales:
+                    if not isinstance(scale, dict):
+                        raise ValueError("Шкала должна быть объектом")
+                    zones = scale.get("TariffZones", [])
+                    if not isinstance(zones, list):
+                        raise ValueError("TariffZones должно быть массивом")
+                    zone_items = []
+                    for zone in zones:
+                        if not isinstance(zone, dict):
+                            raise ValueError("Тарифная зона должна быть объектом")
+                        zone_items.append({
+                            "one_c_id": _json_id(zone.get("TariffZoneID"), "TariffZoneID"),
+                            "name": zone.get("TariffZone"),
+                        })
+                    scale_items.append({
+                        "one_c_id": _json_id(scale.get("ScaleID"), "ScaleID"),
+                        "name": scale.get("Scale"),
+                        "zones": zone_items,
+                    })
+                point_item["meters"].append({
+                    "one_c_id": meter_id,
+                    "meter_number": meter_number,
+                    "differentiation_type_id": meter.get("DifferentiationTypeID"),
+                    "meter_type": meter.get("DifferentiationType"),
+                    "scales": scale_items,
+                })
+            item["points"].append(point_item)
+        prepared.append(item)
+    return prepared
+
+
+def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
+    """Atomically upsert nested 1C account, point, meter, scale and zone data."""
+    prepared = _prepare_1c_json(payload)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for account in prepared:
+            conflicting_account = conn.execute(
+                "SELECT 1 FROM licschet WHERE one_c_id=? AND number<>? LIMIT 1",
+                (account["one_c_id"], account["number"]),
+            ).fetchone()
+            if conflicting_account:
+                raise ValueError(
+                    "PersonalAccountID уже закреплён за другим лицевым счётом"
+                )
+            fio = _normalize_optional_lschet_field(
+                account["fio"], label="ФИО", max_length=256
+            )
+            address = _normalize_optional_lschet_field(
+                account["address"], label="Адрес", max_length=512
+            )
+            conn.execute(
+                "INSERT INTO licschet(number,fio,address,one_c_id) VALUES(?,?,?,?) "
+                "ON CONFLICT(number) DO UPDATE SET "
+                "one_c_id=excluded.one_c_id, "
+                "fio=CASE WHEN excluded.fio IS NULL THEN licschet.fio ELSE excluded.fio END, "
+                "address=CASE WHEN excluded.address IS NULL THEN licschet.address ELSE excluded.address END",
+                (account["number"], fio, address, account["one_c_id"]),
+            )
+            account_row = conn.execute(
+                "SELECT id FROM licschet WHERE number=?", (account["number"],)
+            ).fetchone()
+            for point in account["points"]:
+                conn.execute(
+                    "INSERT INTO metering_points(one_c_id,name,resource_id,resource_name) "
+                    "VALUES(?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
+                    "name=excluded.name,resource_id=excluded.resource_id,resource_name=excluded.resource_name",
+                    (point["one_c_id"], point["name"], point["resource_id"], point["resource_name"]),
+                )
+                point_row = conn.execute(
+                    "SELECT id FROM metering_points WHERE one_c_id=?", (point["one_c_id"],)
+                ).fetchone()
+                conn.execute(
+                    "INSERT OR IGNORE INTO licschet_metering_points(licschet_id,metering_point_id) VALUES(?,?)",
+                    (account_row["id"], point_row["id"]),
+                )
+                for meter in point["meters"]:
+                    conn.execute(
+                        "INSERT INTO metering_meters(one_c_id,metering_point_id,meter_number,differentiation_type_id,meter_type) "
+                        "VALUES(?,?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
+                        "metering_point_id=excluded.metering_point_id,meter_number=excluded.meter_number,"
+                        "differentiation_type_id=excluded.differentiation_type_id,meter_type=excluded.meter_type",
+                        (meter["one_c_id"], point_row["id"], meter["meter_number"], meter["differentiation_type_id"], meter["meter_type"]),
+                    )
+                    meter_row = conn.execute(
+                        "SELECT id FROM metering_meters WHERE one_c_id=?", (meter["one_c_id"],)
+                    ).fetchone()
+                    for scale in meter["scales"]:
+                        conn.execute(
+                            "INSERT INTO metering_meter_scales(meter_id,one_c_id,name) VALUES(?,?,?) "
+                            "ON CONFLICT(meter_id,one_c_id) DO UPDATE SET name=excluded.name",
+                            (meter_row["id"], scale["one_c_id"], scale["name"]),
+                        )
+                        scale_row = conn.execute(
+                            "SELECT id FROM metering_meter_scales WHERE meter_id=? AND one_c_id=?",
+                            (meter_row["id"], scale["one_c_id"]),
+                        ).fetchone()
+                        for zone in scale["zones"]:
+                            conn.execute(
+                                "INSERT INTO metering_tariff_zones(scale_id,one_c_id,name) VALUES(?,?,?) "
+                                "ON CONFLICT(scale_id,one_c_id) DO UPDATE SET name=excluded.name",
+                                (scale_row["id"], zone["one_c_id"], zone["name"]),
+                            )
+        conn.commit()
+        return {"accounts_imported": len(prepared)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _validate_1c_meter(meter: dict) -> None:
