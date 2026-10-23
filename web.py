@@ -837,9 +837,18 @@ def upload_file():
         return redirect(url_for("upload_page"))
 
     flash(
-        f"Импорт завершён: обработано лицевых счетов {result['accounts_imported']}",
+        f"Импорт завершён: ЛС {result.get('accounts_imported', 0)}, "
+        f"точек учёта {result.get('points_imported', 0)}, "
+        f"приборов {result.get('meters_imported', 0)}, "
+        f"шкал {result.get('scales_imported', 0)}, "
+        f"тарифных зон {result.get('zones_imported', 0)}",
         "success",
     )
+    if result.get("skipped", 0) > 0:
+        flash(
+            f"Пропущено элементов: {result['skipped']}, подробности в логе",
+            "warning",
+        )
     return redirect(url_for("upload_page"))
 
 # ── Управление лицевыми счетами ──────────────────────────────────────────────

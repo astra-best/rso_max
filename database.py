@@ -229,23 +229,21 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS metering_points (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             one_c_id TEXT UNIQUE NOT NULL,
+            licschet_id INTEGER NOT NULL REFERENCES licschet(id) ON DELETE CASCADE,
             name TEXT,
             resource_id TEXT,
             resource_name TEXT
         )
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS licschet_metering_points (
-            licschet_id INTEGER NOT NULL REFERENCES licschet(id) ON DELETE CASCADE,
-            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id) ON DELETE CASCADE,
-            PRIMARY KEY (licschet_id, metering_point_id)
-        )
-    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_metering_points_licschet "
+        "ON metering_points(licschet_id)"
+    )
     c.execute("""
         CREATE TABLE IF NOT EXISTS metering_meters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             one_c_id TEXT UNIQUE NOT NULL,
-            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id),
+            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id) ON DELETE CASCADE,
             meter_number TEXT,
             differentiation_type_id TEXT,
             meter_type TEXT
@@ -1989,10 +1987,9 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
                 "JOIN metering_tariff_zones z ON z.scale_id=s.id "
                 "WHERE s.meter_id=m.id) > 1 THEN ? ELSE ? END AS meter_type, "
                 "'0' AS initial1, '0' AS initial2 "
-                "FROM licschet_metering_points lp "
-                "JOIN metering_points p ON p.id=lp.metering_point_id "
+                "FROM metering_points p "
                 "JOIN metering_meters m ON m.metering_point_id=p.id "
-                "WHERE lp.licschet_id=? ORDER BY m.id",
+                "WHERE p.licschet_id=? ORDER BY m.id",
                 (double_tariff, single_tariff, account["id"]),
             ).fetchall()
         legacy = conn.execute(
@@ -2006,13 +2003,37 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
         conn.close()
 
 
-def _json_id(value, label: str) -> str:
-    if value is None or not str(value).strip():
-        raise ValueError(f"В JSON отсутствует {label}")
-    return str(value).strip()
+_ONE_C_ID_MAX_LENGTH = 64
+_ONE_C_LOG_VALUE_MAX_LENGTH = 80
 
 
-def _prepare_1c_json(payload: str | bytes) -> list[dict]:
+def _json_id(value, label: str) -> tuple[str | None, str | None]:
+    """Return ``(id, None)`` for a valid 1C GUID or ``(None, skip reason)``."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, f"отсутствует {label}"
+    if not isinstance(value, str):
+        return None, f"некорректный тип/формат ID {label}"
+    normalized = value.strip()
+    if len(normalized) > _ONE_C_ID_MAX_LENGTH or any(
+        unicodedata.category(char).startswith("C") for char in normalized
+    ):
+        return None, f"некорректный тип/формат ID {label}"
+    return normalized, None
+
+
+def _json_text_fields(source: dict, *labels: str) -> tuple[dict, str | None]:
+    """Return optional text fields or the skip reason for the first non-string one."""
+    values = {}
+    for label in labels:
+        value = source.get(label)
+        if value is not None and not isinstance(value, str):
+            return {}, f"некорректный тип поля {label}"
+        values[label] = value
+    return values, None
+
+
+def _load_1c_json(payload: str | bytes) -> list:
+    """Parse the upload; only an unreadable file rejects the whole import."""
     try:
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8-sig")
@@ -2021,142 +2042,308 @@ def _prepare_1c_json(payload: str | bytes) -> list[dict]:
         raise ValueError("Файл должен содержать JSON в кодировке UTF-8") from exc
     if not isinstance(records, list):
         raise ValueError("Корневое значение JSON должно быть массивом")
+    return records
 
-    prepared = []
-    seen_accounts = set()
-    seen_account_ids = set()
-    seen_meter_ids = set()
+
+class _OneCJsonSkips:
+    """Counts skipped JSON elements and logs each one without file content."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def skip(self, path: str, reason: str, **ids) -> None:
+        self.count += 1
+        # repr() экранирует переводы строк и управляющие символы из выгрузки.
+        details = ", ".join(
+            f"{key}={str(value)[:_ONE_C_LOG_VALUE_MAX_LENGTH]!r}"
+            for key, value in ids.items() if value
+        )
+        log.warning(
+            "Импорт JSON 1С: пропущен элемент %s: %s%s",
+            path, reason, f" ({details})" if details else "",
+        )
+
+
+def _json_list(value, path: str, label: str, skips: _OneCJsonSkips, **ids) -> list:
+    """Return a nested array; a missing key means empty, a non-array is skipped."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        skips.skip(path, f"{label} должно быть массивом", **ids)
+        return []
+    return value
+
+
+# Идентичные ЛС пропускаются, возможно нужно будет изменить
+def _duplicate_1c_account_numbers(records: list) -> set[str]:
+    """Return normalized ЛС numbers occurring more than once in the file."""
+    counts: dict[str, int] = {}
     for record in records:
         if not isinstance(record, dict):
-            raise ValueError("Каждый элемент JSON должен быть объектом")
+            continue
         raw_number = record.get("PersonalAccount")
-        if raw_number is None or not str(raw_number).strip():
+        if not isinstance(raw_number, str):
             continue
         try:
-            number = normalize_lschet_number(str(raw_number))
-        except ValueError as exc:
-            raise ValueError(f"Некорректный номер ЛС: {raw_number!r}") from exc
-        if number in seen_accounts:
+            number = normalize_lschet_number(raw_number)
+        except ValueError:
             continue
-        seen_accounts.add(number)
-        account_id = _json_id(record.get("PersonalAccountID"), "PersonalAccountID")
+        counts[number] = counts.get(number, 0) + 1
+    return {number for number, count in counts.items() if count > 1}
+
+
+def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict], int]:
+    """Validate parsed 1C records, skipping bad elements with their subtree.
+
+    ``account_conflicts(one_c_id, number)`` reports a PersonalAccountID that
+    the database already binds to another account number. ФИО и адрес в
+    выгрузке 1С отсутствуют и не читаются.
+    """
+    skips = _OneCJsonSkips()
+    prepared = []
+    duplicate_numbers = _duplicate_1c_account_numbers(records)
+    seen_account_ids = set()
+    seen_point_ids = set()
+    seen_meter_ids = set()
+    for index, record in enumerate(records):
+        path = f"[{index}]"
+        if not isinstance(record, dict):
+            skips.skip(path, "лицевой счёт должен быть объектом")
+            continue
+        raw_number = record.get("PersonalAccount")
+        account_id, account_id_error = _json_id(
+            record.get("PersonalAccountID"), "PersonalAccountID"
+        )
+        if raw_number is not None and not isinstance(raw_number, str):
+            skips.skip(
+                path, "некорректный тип поля PersonalAccount",
+                PersonalAccountID=account_id,
+            )
+            continue
+        if raw_number is None or not raw_number.strip():
+            skips.skip(path, "пустой номер ЛС", PersonalAccountID=account_id)
+            continue
+        try:
+            number = normalize_lschet_number(raw_number)
+        except ValueError:
+            skips.skip(
+                path, "некорректный номер ЛС",
+                ЛС=raw_number, PersonalAccountID=account_id,
+            )
+            continue
+        if number in duplicate_numbers:
+            skips.skip(
+                path, "номер ЛС повторяется в выгрузке, пропущены все вхождения",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
+        if account_id_error:
+            skips.skip(path, account_id_error, ЛС=number)
+            continue
         if account_id in seen_account_ids:
-            raise ValueError(f"Повтор PersonalAccountID в выгрузке: {account_id}")
+            skips.skip(
+                path, "повтор PersonalAccountID в выгрузке",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
+        if account_conflicts and account_conflicts(account_id, number):
+            skips.skip(
+                path, "PersonalAccountID уже закреплён за другим лицевым счётом",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
         seen_account_ids.add(account_id)
-        item = {
-            "number": number,
-            "one_c_id": account_id,
-            "fio": record.get("FIO"),
-            "address": record.get("Address"),
-            "points": [],
-        }
-        points = record.get("MeteringPoints", [])
-        if not isinstance(points, list):
-            raise ValueError("MeteringPoints должно быть массивом")
-        for point in points:
+        item = {"number": number, "one_c_id": account_id, "points": []}
+        account_ids = {"ЛС": number, "PersonalAccountID": account_id}
+        points = _json_list(
+            record.get("MeteringPoints"), f"{path}.MeteringPoints",
+            "MeteringPoints", skips, **account_ids,
+        )
+        for point_index, point in enumerate(points):
+            point_path = f"{path}.MeteringPoints[{point_index}]"
             if not isinstance(point, dict):
-                raise ValueError("Точка учёта должна быть объектом")
+                skips.skip(point_path, "точка учёта должна быть объектом", **account_ids)
+                continue
+            point_id, error = _json_id(point.get("MeteringPointID"), "MeteringPointID")
+            if error:
+                skips.skip(point_path, error, **account_ids)
+                continue
+            if point_id in seen_point_ids:
+                # Точка учёта принадлежит ровно одному ЛС: первое вхождение побеждает.
+                skips.skip(
+                    point_path, "повтор MeteringPointID в выгрузке",
+                    MeteringPointID=point_id, **account_ids,
+                )
+                continue
+            point_ids = {**account_ids, "MeteringPointID": point_id}
+            point_fields, error = _json_text_fields(
+                point, "MeteringPoint", "ResourceID", "Resource"
+            )
+            if error:
+                skips.skip(point_path, error, **point_ids)
+                continue
+            seen_point_ids.add(point_id)
             point_item = {
-                "one_c_id": _json_id(point.get("MeteringPointID"), "MeteringPointID"),
-                "name": point.get("MeteringPoint"),
-                "resource_id": point.get("ResourceID"),
-                "resource_name": point.get("Resource"),
+                "one_c_id": point_id,
+                "name": point_fields["MeteringPoint"],
+                "resource_id": point_fields["ResourceID"],
+                "resource_name": point_fields["Resource"],
                 "meters": [],
             }
-            meters = point.get("Meters", [])
-            if not isinstance(meters, list):
-                raise ValueError("Meters должно быть массивом")
-            for meter in meters:
+            meters = _json_list(
+                point.get("Meters"), f"{point_path}.Meters", "Meters", skips, **point_ids
+            )
+            for meter_index, meter in enumerate(meters):
+                meter_path = f"{point_path}.Meters[{meter_index}]"
                 if not isinstance(meter, dict):
-                    raise ValueError("Прибор учёта должен быть объектом")
-                meter_id = _json_id(meter.get("MeterID"), "MeterID")
+                    skips.skip(meter_path, "прибор учёта должен быть объектом", **point_ids)
+                    continue
+                meter_id, error = _json_id(meter.get("MeterID"), "MeterID")
+                if error:
+                    skips.skip(meter_path, error, **point_ids)
+                    continue
                 if meter_id in seen_meter_ids:
-                    raise ValueError(f"Повтор MeterID в выгрузке: {meter_id}")
-                seen_meter_ids.add(meter_id)
-                meter_number = str(meter.get("MeterNumber") or "").strip()
+                    skips.skip(
+                        meter_path, "повтор MeterID в выгрузке",
+                        MeterID=meter_id, **point_ids,
+                    )
+                    continue
+                meter_ids = {**point_ids, "MeterID": meter_id}
+                raw_meter_number = meter.get("MeterNumber")
+                if raw_meter_number is not None and not isinstance(raw_meter_number, str):
+                    skips.skip(meter_path, "некорректный тип поля MeterNumber", **meter_ids)
+                    continue
+                meter_number = (raw_meter_number or "").strip()
                 if not meter_number:
-                    raise ValueError("В JSON у прибора отсутствует MeterNumber")
-                scales = meter.get("Scales", [])
-                if not isinstance(scales, list):
-                    raise ValueError("Scales должно быть массивом")
+                    skips.skip(meter_path, "отсутствует MeterNumber", **meter_ids)
+                    continue
+                meter_fields, error = _json_text_fields(
+                    meter, "DifferentiationTypeID", "DifferentiationType"
+                )
+                if error:
+                    skips.skip(meter_path, error, **meter_ids)
+                    continue
+                seen_meter_ids.add(meter_id)
+                scales = _json_list(
+                    meter.get("Scales"), f"{meter_path}.Scales", "Scales", skips, **meter_ids
+                )
                 scale_items = []
-                for scale in scales:
+                seen_scale_ids = set()
+                for scale_index, scale in enumerate(scales):
+                    scale_path = f"{meter_path}.Scales[{scale_index}]"
                     if not isinstance(scale, dict):
-                        raise ValueError("Шкала должна быть объектом")
-                    zones = scale.get("TariffZones", [])
-                    if not isinstance(zones, list):
-                        raise ValueError("TariffZones должно быть массивом")
+                        skips.skip(scale_path, "шкала должна быть объектом", **meter_ids)
+                        continue
+                    scale_id, error = _json_id(scale.get("ScaleID"), "ScaleID")
+                    if error:
+                        skips.skip(scale_path, error, **meter_ids)
+                        continue
+                    if scale_id in seen_scale_ids:
+                        skips.skip(
+                            scale_path, "повтор ScaleID у прибора",
+                            ScaleID=scale_id, **meter_ids,
+                        )
+                        continue
+                    scale_ids = {**meter_ids, "ScaleID": scale_id}
+                    scale_fields, error = _json_text_fields(scale, "Scale")
+                    if error:
+                        skips.skip(scale_path, error, **scale_ids)
+                        continue
+                    seen_scale_ids.add(scale_id)
+                    zones = _json_list(
+                        scale.get("TariffZones"), f"{scale_path}.TariffZones",
+                        "TariffZones", skips, **scale_ids,
+                    )
                     zone_items = []
-                    for zone in zones:
+                    seen_zone_ids = set()
+                    for zone_index, zone in enumerate(zones):
+                        zone_path = f"{scale_path}.TariffZones[{zone_index}]"
                         if not isinstance(zone, dict):
-                            raise ValueError("Тарифная зона должна быть объектом")
-                        zone_items.append({
-                            "one_c_id": _json_id(zone.get("TariffZoneID"), "TariffZoneID"),
-                            "name": zone.get("TariffZone"),
-                        })
+                            skips.skip(zone_path, "тарифная зона должна быть объектом", **scale_ids)
+                            continue
+                        zone_id, error = _json_id(zone.get("TariffZoneID"), "TariffZoneID")
+                        if error:
+                            skips.skip(zone_path, error, **scale_ids)
+                            continue
+                        if zone_id in seen_zone_ids:
+                            skips.skip(
+                                zone_path, "повтор TariffZoneID в шкале",
+                                TariffZoneID=zone_id, **scale_ids,
+                            )
+                            continue
+                        zone_fields, error = _json_text_fields(zone, "TariffZone")
+                        if error:
+                            skips.skip(zone_path, error, TariffZoneID=zone_id, **scale_ids)
+                            continue
+                        seen_zone_ids.add(zone_id)
+                        zone_items.append({"one_c_id": zone_id, "name": zone_fields["TariffZone"]})
                     scale_items.append({
-                        "one_c_id": _json_id(scale.get("ScaleID"), "ScaleID"),
-                        "name": scale.get("Scale"),
+                        "one_c_id": scale_id,
+                        "name": scale_fields["Scale"],
                         "zones": zone_items,
                     })
                 point_item["meters"].append({
                     "one_c_id": meter_id,
                     "meter_number": meter_number,
-                    "differentiation_type_id": meter.get("DifferentiationTypeID"),
-                    "meter_type": meter.get("DifferentiationType"),
+                    "differentiation_type_id": meter_fields["DifferentiationTypeID"],
+                    "meter_type": meter_fields["DifferentiationType"],
                     "scales": scale_items,
                 })
             item["points"].append(point_item)
         prepared.append(item)
-    return prepared
+    return prepared, skips.count
 
 
 def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
-    """Atomically upsert nested 1C account, point, meter, scale and zone data."""
-    prepared = _prepare_1c_json(payload)
+    """Atomically upsert nested 1C data, skipping and logging invalid elements.
+
+    Only an unreadable file (not UTF-8, invalid JSON, non-array root) is
+    rejected as a whole; any unexpected error rolls the transaction back.
+    """
+    records = _load_1c_json(payload)
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        for account in prepared:
-            conflicting_account = conn.execute(
+
+        def account_conflicts(one_c_id: str, number: str) -> bool:
+            return conn.execute(
                 "SELECT 1 FROM licschet WHERE one_c_id=? AND number<>? LIMIT 1",
-                (account["one_c_id"], account["number"]),
-            ).fetchone()
-            if conflicting_account:
-                raise ValueError(
-                    "PersonalAccountID уже закреплён за другим лицевым счётом"
-                )
-            fio = _normalize_optional_lschet_field(
-                account["fio"], label="ФИО", max_length=256
-            )
-            address = _normalize_optional_lschet_field(
-                account["address"], label="Адрес", max_length=512
-            )
+                (one_c_id, number),
+            ).fetchone() is not None
+
+        prepared, skipped = _prepare_1c_json(records, account_conflicts)
+        summary = {
+            "accounts_imported": len(prepared),
+            "points_imported": 0,
+            "meters_imported": 0,
+            "scales_imported": 0,
+            "zones_imported": 0,
+            "skipped": skipped,
+        }
+        for account in prepared:
             conn.execute(
-                "INSERT INTO licschet(number,fio,address,one_c_id) VALUES(?,?,?,?) "
-                "ON CONFLICT(number) DO UPDATE SET "
-                "one_c_id=excluded.one_c_id, "
-                "fio=CASE WHEN excluded.fio IS NULL THEN licschet.fio ELSE excluded.fio END, "
-                "address=CASE WHEN excluded.address IS NULL THEN licschet.address ELSE excluded.address END",
-                (account["number"], fio, address, account["one_c_id"]),
+                # ФИО и адрес не приходят из 1С: существующие значения не трогаем.
+                "INSERT INTO licschet(number,one_c_id) VALUES(?,?) "
+                "ON CONFLICT(number) DO UPDATE SET one_c_id=excluded.one_c_id",
+                (account["number"], account["one_c_id"]),
             )
             account_row = conn.execute(
                 "SELECT id FROM licschet WHERE number=?", (account["number"],)
             ).fetchone()
             for point in account["points"]:
+                # 1С может перенести точку учёта на другой ЛС при повторной выгрузке.
                 conn.execute(
-                    "INSERT INTO metering_points(one_c_id,name,resource_id,resource_name) "
-                    "VALUES(?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
-                    "name=excluded.name,resource_id=excluded.resource_id,resource_name=excluded.resource_name",
-                    (point["one_c_id"], point["name"], point["resource_id"], point["resource_name"]),
+                    "INSERT INTO metering_points(one_c_id,licschet_id,name,resource_id,resource_name) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
+                    "licschet_id=excluded.licschet_id,name=excluded.name,"
+                    "resource_id=excluded.resource_id,resource_name=excluded.resource_name",
+                    (point["one_c_id"], account_row["id"], point["name"],
+                     point["resource_id"], point["resource_name"]),
                 )
                 point_row = conn.execute(
                     "SELECT id FROM metering_points WHERE one_c_id=?", (point["one_c_id"],)
                 ).fetchone()
-                conn.execute(
-                    "INSERT OR IGNORE INTO licschet_metering_points(licschet_id,metering_point_id) VALUES(?,?)",
-                    (account_row["id"], point_row["id"]),
-                )
+                summary["points_imported"] += 1
                 for meter in point["meters"]:
                     conn.execute(
                         "INSERT INTO metering_meters(one_c_id,metering_point_id,meter_number,differentiation_type_id,meter_type) "
@@ -2168,6 +2355,7 @@ def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
                     meter_row = conn.execute(
                         "SELECT id FROM metering_meters WHERE one_c_id=?", (meter["one_c_id"],)
                     ).fetchone()
+                    summary["meters_imported"] += 1
                     for scale in meter["scales"]:
                         conn.execute(
                             "INSERT INTO metering_meter_scales(meter_id,one_c_id,name) VALUES(?,?,?) "
@@ -2178,14 +2366,19 @@ def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
                             "SELECT id FROM metering_meter_scales WHERE meter_id=? AND one_c_id=?",
                             (meter_row["id"], scale["one_c_id"]),
                         ).fetchone()
+                        summary["scales_imported"] += 1
                         for zone in scale["zones"]:
                             conn.execute(
                                 "INSERT INTO metering_tariff_zones(scale_id,one_c_id,name) VALUES(?,?,?) "
                                 "ON CONFLICT(scale_id,one_c_id) DO UPDATE SET name=excluded.name",
                                 (scale_row["id"], zone["one_c_id"], zone["name"]),
                             )
+                            summary["zones_imported"] += 1
         conn.commit()
-        return {"accounts_imported": len(prepared)}
+        if skipped:
+            log.warning("Импорт JSON 1С: всего пропущено элементов %d", skipped)
+        log.info("Импорт JSON 1С завершён: %s", summary)
+        return summary
     except Exception:
         conn.rollback()
         raise

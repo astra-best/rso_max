@@ -221,7 +221,14 @@ def test_upload_imports_json_successfully(clean_db, monkeypatch):
 
     def succeed_import(payload):
         imported["payload"] = payload
-        return {"accounts_imported": 2}
+        return {
+            "accounts_imported": 2,
+            "points_imported": 3,
+            "meters_imported": 4,
+            "scales_imported": 5,
+            "zones_imported": 6,
+            "skipped": 0,
+        }
 
     monkeypatch.setattr(web.db, "import_from_1c_json", succeed_import)
 
@@ -236,7 +243,72 @@ def test_upload_imports_json_successfully(clean_db, monkeypatch):
     with client.session_transaction() as session:
         assert session["_flashes"][-1] == (
             "success",
-            "Импорт завершён: обработано лицевых счетов 2",
+            "Импорт завершён: ЛС 2, точек учёта 3, приборов 4, шкал 5, тарифных зон 6",
+        )
+        assert all(category != "warning" for category, _ in session["_flashes"])
+
+
+def test_upload_reports_skipped_elements_from_real_import(clean_db):
+    import json
+
+    import web
+
+    ok, _ = db.create_user("skip-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "skip-admin", "password": "initial-password"},
+    )
+    payload = json.dumps([
+        {"PersonalAccountID": "A-1", "PersonalAccount": "100-1", "MeteringPoints": []},
+        {"PersonalAccountID": "A-2", "PersonalAccount": "100-2", "MeteringPoints": []},
+        {"PersonalAccountID": "A-3", "PersonalAccount": "100-2", "MeteringPoints": []},
+        {"PersonalAccount": "100-4", "MeteringPoints": []},
+    ]).encode()
+
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(payload), "export.txt")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    assert db.get_ls("100-1") is not None
+    assert db.get_ls("100-2") is None
+    with client.session_transaction() as session:
+        assert session["_flashes"][-2:] == [
+            (
+                "success",
+                "Импорт завершён: ЛС 1, точек учёта 0, приборов 0, шкал 0, тарифных зон 0",
+            ),
+            ("warning", "Пропущено элементов: 3, подробности в логе"),
+        ]
+
+
+def test_upload_rejects_invalid_json_without_writing(clean_db):
+    import web
+
+    ok, _ = db.create_user("bad-json-admin", "initial-password", "Admin", "admin")
+    assert ok
+    client = web.app.test_client()
+    client.post(
+        "/login",
+        data={"username": "bad-json-admin", "password": "initial-password"},
+    )
+
+    response = client.post(
+        "/upload",
+        data={"file": (io.BytesIO(b'[{"PersonalAccount": "100-1"'), "export.txt")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 302
+    assert db.get_ls("100-1") is None
+    with client.session_transaction() as session:
+        assert session["_flashes"][-1] == (
+            "error",
+            "Ошибка импорта: Файл должен содержать JSON в кодировке UTF-8",
         )
 
 
