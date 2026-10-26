@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Жители бота{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Жители бота</h1>
+        <p class="text-muted small mt-1">Привязки чатов MAX к лицевым счетам. Откройте жителя, чтобы заменить лицевой счёт или сбросить авторизацию.</p>
+    </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header">
+        <strong>Список жителей</strong>
+        <span class="badge badge-primary">{{ total }}</span>
+    </div>
+    <div class="card-body">
+        <form method="GET" action="{{ url_for('residents_page') }}" class="form-inline">
+            <input type="search" name="q" value="{{ query }}" class="form-control"
+                   style="max-width:360px" maxlength="100" placeholder="MAX ID, ЛС, ФИО или адрес">
+            <button type="submit" class="btn btn-secondary">Найти</button>
+            {% if query %}
+                <a href="{{ url_for('residents_page') }}" class="btn btn-outline-secondary">Сбросить</a>
+            {% endif %}
+        </form>
+    </div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>MAX ID</th>
+                    <th>Лицевые счета</th>
+                    <th>Статус</th>
+                    <th>Последняя активность</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in residents %}
+                <tr>
+                    <td><code>{{ r['chat_id'] }}</code></td>
+                    <td>
+                        {% for a in r['accounts'] %}
+                            <div>{{ a['ls'] }}{% if a['fio'] %} · {{ a['fio'] }}{% endif %}
+                                {% if a['address'] %}<span class="text-muted small"> — {{ a['address'] }}</span>{% endif %}</div>
+                        {% else %}—{% endfor %}
+                    </td>
+                    <td>
+                        {% if r['accounts'] %}
+                            <span class="badge badge-success">Авторизован</span>
+                        {% else %}
+                            <span class="badge badge-secondary">Не авторизован</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-muted">{{ r['last_seen'] or '—' }}</td>
+                    <td class="text-right">
+                        <a href="{{ url_for('resident_detail', chat_id=r['chat_id']) }}"
+                           class="btn btn-sm btn-secondary">Открыть</a>
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5" class="text-center text-muted py-5">
+                    {% if query %}Никого не нашлось{% else %}Жители ещё не писали боту{% endif %}
+                </td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <div class="card-footer d-flex align-items-center justify-content-between">
+        <span>Страница {{ page }} из {{ total_pages }}</span>
+        <div class="d-flex gap-2">
+            {% if page > 1 %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('residents_page', q=query, page=page-1) }}">← Назад</a>
+            {% endif %}
+            {% if page < total_pages %}
+                <a class="btn btn-sm btn-secondary"
+                   href="{{ url_for('residents_page', q=query, page=page+1) }}">Вперёд →</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

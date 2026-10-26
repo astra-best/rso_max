@@ -884,17 +884,132 @@ def account_unlink():
     ls = request.form.get("ls", "").strip()
     if not ls:
         abort(400)
+    actor = session["user"]
     try:
-        removed = db.unlink_bot_user_account(chat_id, ls)
+        # Same operation as before, now recorded in the resident's history.
+        db.admin_unlink_bot_user_account(
+            chat_id, ls, actor_user_id=actor["id"], actor_name=actor["name"],
+            notify=False,
+        )
+    except ValueError:
+        flash("Привязка уже отсутствует", "error")
     except sqlite3.DatabaseError:
         log.error("Ошибка БД при отвязке лицевого счёта")
         flash("Не удалось отвязать лицевой счёт. Попробуйте позже.", "error")
     else:
-        flash(
-            "Привязка удалена" if removed else "Привязка уже отсутствует",
-            "success" if removed else "error",
-        )
+        flash("Привязка удалена", "success")
     return redirect(url_for("accounts_page"))
+
+
+# ── Жители бота: смена ЛС и сброс авторизации ────────────────────────────────
+
+@app.route("/residents")
+@admin_required
+def residents_page():
+    query = db.normalize_lschet_search(request.args.get("q"))
+    try:
+        requested_page = int(request.args.get("page", "1"))
+    except ValueError:
+        requested_page = 1
+    total = db.count_residents(query)
+    total_pages = max(1, (total + _ACCOUNTS_PAGE_SIZE - 1) // _ACCOUNTS_PAGE_SIZE)
+    page = min(max(requested_page, 1), total_pages)
+    residents = db.list_residents(
+        query, limit=_ACCOUNTS_PAGE_SIZE, offset=(page - 1) * _ACCOUNTS_PAGE_SIZE,
+    )
+    return render_template(
+        "residents.html", residents=residents, page=page, query=query,
+        total=total, total_pages=total_pages, user=session["user"],
+    )
+
+
+@app.route("/residents/<int:chat_id>")
+@admin_required
+def resident_detail(chat_id: int):
+    resident = db.get_bot_user(chat_id)
+    if resident is None:
+        flash("Житель не найден", "error")
+        return redirect(url_for("residents_page"))
+    return render_template(
+        "resident_detail.html",
+        resident=resident,
+        accounts=db.list_account_bindings(chat_id),
+        events=db.list_bot_user_account_events(chat_id),
+        event_types=db.ACCOUNT_EVENT_TYPES,
+        event_reasons=db.ACCOUNT_EVENT_REASONS,
+        csrf_token=_csrf_token(),
+        user=session["user"],
+    )
+
+
+def _resident_action(chat_id: int, action, success_message: str):
+    """Run one resident mutation and translate its errors into flash messages."""
+    try:
+        action()
+    except ValueError as exc:
+        flash(str(exc), "error")
+    except sqlite3.DatabaseError:
+        log.error("Ошибка БД при изменении привязки жителя chat_id=%s", chat_id)
+        flash("Не удалось сохранить изменения. Попробуйте позже.", "error")
+    else:
+        log.info(
+            "Привязка жителя изменена chat_id=%s admin_id=%s",
+            chat_id, session["user"]["id"],
+        )
+        flash(success_message, "success")
+    return redirect(url_for("resident_detail", chat_id=chat_id))
+
+
+def _resident_common_args() -> dict:
+    actor = session["user"]
+    return {
+        "actor_user_id": actor["id"],
+        "actor_name": actor["name"],
+        "comment": request.form.get("comment"),
+        "notify": request.form.get("notify") == "on",
+    }
+
+
+@app.route("/residents/<int:chat_id>/change-ls", methods=["POST"])
+@admin_required
+@csrf_protected
+def resident_change_ls(chat_id: int):
+    """«Сменился лицевой счёт»: replace the account now or let the resident add it."""
+    old_ls = request.form.get("old_ls", "")
+    mode = request.form.get("mode", "replace")
+    common = _resident_common_args()
+    if mode == "unlink":
+        return _resident_action(
+            chat_id,
+            lambda: db.admin_unlink_bot_user_account(chat_id, old_ls, **common),
+            "Лицевой счёт отвязан. Новый житель добавит сам в боте.",
+        )
+    if mode != "replace":
+        flash("Неизвестный вариант смены лицевого счёта", "error")
+        return redirect(url_for("resident_detail", chat_id=chat_id))
+    return _resident_action(
+        chat_id,
+        lambda: db.admin_replace_bot_user_account(
+            chat_id, old_ls, request.form.get("new_ls", ""), **common,
+        ),
+        "Лицевой счёт жителя заменён.",
+    )
+
+
+@app.route("/residents/<int:chat_id>/reset-auth", methods=["POST"])
+@admin_required
+@csrf_protected
+def resident_reset_auth(chat_id: int):
+    """«Изменилась почта/пароль»: revoke all bindings until the next login."""
+    reason = request.form.get("reason", "")
+    if reason not in {"email_changed", "password_changed"}:
+        flash("Укажите, что изменилось: почта или пароль", "error")
+        return redirect(url_for("resident_detail", chat_id=chat_id))
+    return _resident_action(
+        chat_id,
+        lambda: db.admin_reset_bot_user_auth(chat_id, reason, **_resident_common_args()),
+        "Авторизация жителя сброшена. При следующем обращении бот попросит войти заново.",
+    )
 
 
 # ── Управление пользователями ─────────────────────────────────────────────────

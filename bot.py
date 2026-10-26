@@ -430,11 +430,31 @@ def _account_management_dependencies() -> accounts.AccountManagementDependencies
         make_callback=_cb,
         send_buttons=send_buttons,
         start_auth=_start_1c_auth,
+        unlink_binding=db.self_unlink_bot_user_account,
+        send_main_menu=send_main_menu,
     )
 
 
 def _show_accounts(chat_id: int) -> None:
     accounts.show(chat_id, _account_management_dependencies())
+
+
+def _cb_account_unlink(chat_id: int, st: dict, arg: str) -> None:
+    _clear_flow(st)
+    accounts.confirm_unlink(chat_id, arg, _account_management_dependencies())
+
+
+def _cb_account_unlink_yes(chat_id: int, st: dict, arg: str) -> None:
+    _clear_flow(st)
+    if str(st.get("ls")) == arg:
+        # Compatibility cache must not keep pointing at the removed account.
+        st.pop("ls", None)
+        st.pop("authorized_1c", None)
+    try:
+        accounts.unlink(chat_id, arg, _account_management_dependencies())
+    except sqlite3.DatabaseError:
+        log.error("Не удалось отвязать лицевой счёт chat_id=%s", chat_id)
+        send_main_menu(chat_id, "⚠️ Не удалось отвязать лицевой счёт. Попробуйте позже.")
 
 
 # ── Ввод и валидация показаний ────────────────────────────────────────────────
@@ -1346,6 +1366,8 @@ _CALLBACK_PREFIXES: dict[str, callable] = {
     "faq_terminal_operator": _cb_faq_terminal_operator,
     "faq_terminal_menu": _cb_faq_terminal_menu,
     "account_select": _cb_account_select,
+    "account_unlink": _cb_account_unlink,
+    "account_unlink_yes": _cb_account_unlink_yes,
 }
 
 
@@ -1472,6 +1494,7 @@ _CALLBACK_PREFIX_MODULES = {
     "faq_terminal_operator": "operator",
     "appt_branch": "appointment", "appt_date": "appointment",
     "appt_time": "appointment", "appt_cancel": "appointment",
+    "account_unlink": "accounts", "account_unlink_yes": "accounts",
 }
 _CALLBACK_PREFIX_EXEMPT = {"operator_rate", "faq_terminal_menu", "account_select"}
 

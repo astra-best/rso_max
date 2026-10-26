@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Житель {{ resident['chat_id'] }}{% endblock %}
+
+{% block head %}
+<style>
+    .choice { display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; cursor: pointer; font-size: 12px; }
+    .choice:hover { border-color: var(--accent); }
+    .choice input { margin-top: 2px; accent-color: var(--accent); }
+    .choice strong { display: block; margin-bottom: 2px; }
+    .choice:has(input:checked) { border-color: var(--accent); background: rgba(0,200,255,0.05); }
+    .check-line { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; margin-bottom: 14px; }
+    .scenario-hint { font-size: 11px; color: var(--muted); line-height: 1.6; margin-bottom: 14px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <a href="{{ url_for('residents_page') }}" class="text-muted small">← Жители бота</a>
+        <h1 class="mt-1">Житель · MAX ID {{ resident['chat_id'] }}</h1>
+        <p class="text-muted small mt-1">Последняя активность: {{ resident['last_seen'] or '—' }}</p>
+    </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+        <div class="alert alert-{{ category }}">{{ message }}</div>
+    {% endfor %}
+{% endwith %}
+
+<div class="card">
+    <div class="card-header"><strong>Привязанные лицевые счета</strong>
+        {% if accounts %}<span class="badge badge-success">Авторизован</span>
+        {% else %}<span class="badge badge-secondary">Не авторизован</span>{% endif %}
+    </div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead><tr><th>Лицевой счёт</th><th>ФИО</th><th>Адрес</th><th>Привязан</th></tr></thead>
+            <tbody>
+                {% for a in accounts %}
+                <tr>
+                    <td>{{ a['ls'] }}</td>
+                    <td>{{ a['fio'] or '—' }}</td>
+                    <td>{{ a['address'] or '—' }}</td>
+                    <td class="text-muted">{{ a['created_at'] }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="4" class="text-center text-muted py-5">Лицевые счета не привязаны</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% if accounts %}
+<div class="row">
+    <div class="col-md-7">
+        <div class="card">
+            <div class="card-header"><strong>🔁 Сменился лицевой счёт</strong></div>
+            <div class="card-body">
+                <p class="scenario-hint">
+                    У жителя новый лицевой счёт: переезд, смена владельца, объединение счетов.
+                    Обращения и показания по старому счёту остаются в истории.
+                    Житель может сделать это и сам в боте: «Мои лицевые счета» → добавить новый и отвязать старый.
+                </p>
+                <form method="POST" action="{{ url_for('resident_change_ls', chat_id=resident['chat_id']) }}" id="change-ls-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <div class="form-group">
+                        <label for="old-ls">Какой лицевой счёт сменился</label>
+                        <select id="old-ls" name="old_ls" class="form-control">
+                            {% for a in accounts %}<option value="{{ a['ls'] }}">{{ a['ls'] }}{% if a['address'] %} — {{ a['address'] }}{% endif %}</option>{% endfor %}
+                        </select>
+                    </div>
+                    <label class="choice">
+                        <input type="radio" name="mode" value="replace" checked>
+                        <span><strong>Заменить на новый</strong>
+                            <span class="text-muted">Личность жителя подтверждена. Новый счёт сразу доступен в боте, повторный вход не нужен.</span></span>
+                    </label>
+                    <label class="choice">
+                        <input type="radio" name="mode" value="unlink">
+                        <span><strong>Отвязать, новый житель добавит сам</strong>
+                            <span class="text-muted">Старый счёт отвязывается, новый житель добавит через авторизацию в боте.</span></span>
+                    </label>
+                    <div class="form-group" id="new-ls-group" style="margin-top:14px">
+                        <label for="new-ls">Новый лицевой счёт</label>
+                        <input id="new-ls" type="text" name="new_ls" class="form-control"
+                               maxlength="64" placeholder="Номер из справочника лицевых счетов" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="ls-comment">Комментарий (основание)</label>
+                        <input id="ls-comment" type="text" name="comment" class="form-control"
+                               maxlength="500" placeholder="Например: заявление от 21.10, договор купли-продажи">
+                    </div>
+                    <label class="check-line"><input type="checkbox" name="notify" checked> Уведомить жителя в боте</label>
+                    <button type="submit" class="btn btn-primary">Сменить лицевой счёт</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-5">
+        <div class="card">
+            <div class="card-header"><strong>🔐 Изменилась почта/пароль</strong></div>
+            <div class="card-body">
+                <p class="scenario-hint">
+                    Контактная почта или пароль от личного кабинета изменились, например после утечки или смены владельца почты.
+                    Снимаются <strong>все</strong> привязки этого чата, и бот снова попросит авторизоваться.
+                </p>
+                <div class="alert alert-warning" style="font-size:11px">
+                    Повторный вход в боте сейчас проверяет только, что номер лицевого счёта есть в справочнике.
+                    Посторонний, который знает номер, сможет привязаться снова, поэтому сброс не заменяет блокировку доступа.
+                </div>
+                <form method="POST" action="{{ url_for('resident_reset_auth', chat_id=resident['chat_id']) }}"
+                      onsubmit="return confirm('Сбросить все привязки жителя? Ему нужно будет авторизоваться заново.')">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <label class="choice"><input type="radio" name="reason" value="email_changed" checked>
+                        <span><strong>Изменилась почта</strong></span></label>
+                    <label class="choice"><input type="radio" name="reason" value="password_changed">
+                        <span><strong>Изменился пароль</strong></span></label>
+                    <div class="form-group" style="margin-top:14px">
+                        <label for="reset-comment">Комментарий</label>
+                        <input id="reset-comment" type="text" name="comment" class="form-control" maxlength="500">
+                    </div>
+                    <label class="check-line"><input type="checkbox" name="notify" checked> Уведомить жителя в боте</label>
+                    <button type="submit" class="btn btn-outline-danger">Сбросить авторизацию</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header"><strong>История изменений</strong><span class="badge badge-secondary">{{ events|length }}</span></div>
+    <div class="card-body p-0">
+        <table class="table">
+            <thead><tr><th>Когда</th><th>Событие</th><th>Причина</th><th>ЛС</th><th>Кто</th><th>Комментарий</th></tr></thead>
+            <tbody>
+                {% for e in events %}
+                <tr>
+                    <td class="text-muted">{{ e['created_at'] }}</td>
+                    <td>{{ event_types.get(e['event_type'], e['event_type']) }}
+                        {% if e['notified'] %}<div class="text-muted small">уведомление поставлено в очередь</div>{% endif %}</td>
+                    <td>{{ event_reasons.get(e['reason'], e['reason']) }}</td>
+                    <td>{{ e['old_ls'] or '—' }} → {{ e['new_ls'] or '—' }}</td>
+                    <td>{{ e['actor_name'] or 'Житель (бот)' }}</td>
+                    <td class="text-muted">{{ e['comment'] or '—' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="6" class="text-center text-muted py-5">Изменений ещё не было</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+(function () {
+    var form = document.getElementById('change-ls-form');
+    if (!form) return;
+    var group = document.getElementById('new-ls-group');
+    var input = document.getElementById('new-ls');
+    function sync() {
+        var unlink = form.querySelector('input[name=mode]:checked').value === 'unlink';
+        group.style.display = unlink ? 'none' : '';
+        input.required = !unlink;
+    }
+    form.querySelectorAll('input[name=mode]').forEach(function (r) { r.addEventListener('change', sync); });
+    sync();
+})();
+</script>
+{% endblock %}
