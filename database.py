@@ -24,6 +24,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -208,6 +209,7 @@ def init_db() -> None:
         )
     """)
     _ensure_column(c, "licschet", "one_c_id", "TEXT")
+    _ensure_column(c, "licschet", "room_key_id", "TEXT")
     duplicate_external_id_groups = c.execute(
         "SELECT COUNT(*) FROM ("
         "SELECT one_c_id FROM licschet WHERE one_c_id IS NOT NULL AND one_c_id<>'' "
@@ -338,6 +340,25 @@ def init_db() -> None:
         UPDATE pokazaniya SET sent_to_1c=1
         WHERE chat_id=0 AND created_at='2000-01-01 00:00' AND sent_to_1c=0
           AND batch_id IS NULL
+    """)
+    # Показания по приборам из выгрузки 1С: GUID прибора хранится в заголовке,
+    # значения по парам «шкала, тарифная зона» — в pokazaniya_values.
+    # У старых строк (value1/value2) колонка остаётся NULL.
+    _ensure_column(c, "pokazaniya", "meter_one_c_id", "TEXT")
+    # GUID и названия шкалы/зоны — снимок на момент подачи, без FK на таблицы
+    # metering_*: история не теряется при переименовании или удалении в 1С.
+    # Порядок значений — порядок вставки (id).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pokazaniya_values (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            pokazaniya_id  INTEGER NOT NULL REFERENCES pokazaniya(id) ON DELETE CASCADE,
+            scale_one_c_id TEXT NOT NULL,
+            scale_name     TEXT,
+            zone_one_c_id  TEXT NOT NULL,
+            zone_name      TEXT,
+            value          TEXT NOT NULL,
+            UNIQUE (pokazaniya_id, scale_one_c_id, zone_one_c_id)
+        )
     """)
 
     c.execute("""
@@ -1425,6 +1446,66 @@ def add_pokazaniya(
         conn.close()
 
 
+def add_pokazaniya_values(
+    chat_id: int,
+    ls: str,
+    resource_type: str | None,
+    meter_number: str | None,
+    meter_one_c_id: str,
+    values: Sequence[Mapping],
+) -> int:
+    """
+    Сохраняет показания прибора из выгрузки 1С: заголовок в pokazaniya
+    (value1/value2 = NULL) и по строке на каждую пару «шкала, зона» в
+    pokazaniya_values. Всё в одной транзакции — либо всё, либо ничего.
+
+    values — элементы с ключами scale_one_c_id, scale_name, zone_one_c_id,
+    zone_name, value в порядке ввода. Возвращает id заголовка.
+    """
+    if not values:
+        raise ValueError("Нет значений показаний для сохранения")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "INSERT INTO pokazaniya "
+            "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, "
+            "meter_one_c_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)",
+            (chat_id, ls, resource_type, meter_number, msk_now(), meter_one_c_id),
+        )
+        reading_id = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO pokazaniya_values "
+            "(pokazaniya_id, scale_one_c_id, scale_name, zone_one_c_id, zone_name, value) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    reading_id,
+                    item["scale_one_c_id"],
+                    item.get("scale_name"),
+                    item["zone_one_c_id"],
+                    item.get("zone_name"),
+                    # Без str(): пустое значение отвергается NOT NULL и
+                    # откатывает всю запись, а не сохраняется как "None".
+                    item["value"],
+                )
+                for item in values
+            ],
+        )
+        conn.commit()
+        return reading_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reading_value_label(scale_name: str | None, zone_name: str | None) -> str:
+    """Подпись пары «Шкала, Зона»; пустые названия из 1С заменяются общими."""
+    return f"{scale_name or 'Шкала'}, {zone_name or 'Зона'}"
+
+
 def get_pokazaniya() -> list[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute("SELECT * FROM pokazaniya ORDER BY id DESC").fetchall()
@@ -1446,20 +1527,48 @@ def get_pokazaniya_with_prev() -> list[dict]:
     """
     Показания с предыдущими значениями и разницей (для таблицы в портале).
     Использует оконные функции LAG — один запрос вместо N+1.
+
+    Показания нового формата (по шкалам и зонам 1С) получают values_text вида
+    «Актив, День: 123; Актив, Ночь: 45»; предыдущих значений и разницы у них
+    нет. В цепочку LAG старых показаний они не попадают, чтобы не обрывать её.
     """
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT *,
-               LAG(value1) OVER (PARTITION BY ls, meter_number ORDER BY id) AS prev_value1,
-               LAG(value2) OVER (PARTITION BY ls, meter_number ORDER BY id) AS prev_value2
-        FROM pokazaniya
-        ORDER BY id DESC
-    """).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute("""
+            SELECT *,
+                   LAG(value1) OVER w AS prev_value1,
+                   LAG(value2) OVER w AS prev_value2
+            FROM pokazaniya
+            WINDOW w AS (
+                PARTITION BY ls, meter_number, meter_one_c_id IS NULL ORDER BY id
+            )
+            ORDER BY id DESC
+        """).fetchall()
+        value_rows = conn.execute(
+            "SELECT pokazaniya_id, scale_name, zone_name, value "
+            "FROM pokazaniya_values ORDER BY pokazaniya_id, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    values_by_reading: dict[int, list[str]] = {}
+    for value in value_rows:
+        values_by_reading.setdefault(value["pokazaniya_id"], []).append(
+            f"{reading_value_label(value['scale_name'], value['zone_name'])}: "
+            f"{value['value']}"
+        )
 
     result = []
     for r in rows:
         r = dict(r)
+        parts = values_by_reading.get(r["id"])
+        r["value_lines"] = parts or []
+        r["values_text"] = "; ".join(parts) if parts else None
+        if r["meter_one_c_id"] is not None:
+            r["prev_value1"] = r["prev_value2"] = None
+            r["diff1"] = r["diff2"] = None
+            result.append(r)
+            continue
         try:
             r["diff1"] = round(float(r["value1"]) - float(r["prev_value1"]), 2) \
                 if r["prev_value1"] is not None else None
@@ -1971,8 +2080,10 @@ def get_ls(number: str) -> sqlite3.Row | None:
 
 
 def get_schetchiki(ls: str) -> list[sqlite3.Row]:
-    double_tariff = "\u0414\u0432\u0443\u0445\u0442\u0430\u0440\u0438\u0444\u043d\u044b\u0439"
-    single_tariff = "\u041e\u0434\u043d\u043e\u0442\u0430\u0440\u0438\u0444\u043d\u044b\u0439"
+    """Счётчики ЛС: приборы из выгрузки 1С, затем старые из schetchiki.
+
+    meter_type у приборов 1С — название типа дифференциации из выгрузки.
+    """
     conn = get_conn()
     try:
         account = conn.execute(
@@ -1982,15 +2093,11 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
         if account:
             imported = conn.execute(
                 "SELECT p.resource_name AS resource_type, m.meter_number, "
-                "CASE WHEN ("
-                "SELECT COUNT(*) FROM metering_meter_scales s "
-                "JOIN metering_tariff_zones z ON z.scale_id=s.id "
-                "WHERE s.meter_id=m.id) > 1 THEN ? ELSE ? END AS meter_type, "
-                "'0' AS initial1, '0' AS initial2 "
+                "m.meter_type, '0' AS initial1, '0' AS initial2 "
                 "FROM metering_points p "
                 "JOIN metering_meters m ON m.metering_point_id=p.id "
                 "WHERE p.licschet_id=? ORDER BY m.id",
-                (double_tariff, single_tariff, account["id"]),
+                (account["id"],),
             ).fetchall()
         legacy = conn.execute(
             "SELECT * FROM schetchiki WHERE ls=? ORDER BY id", (ls,)
@@ -2003,22 +2110,80 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
         conn.close()
 
 
-_ONE_C_ID_MAX_LENGTH = 64
+def get_1c_meters_with_zones(ls: str) -> list[dict]:
+    """
+    Приборы учёта ЛС из выгрузки 1С с парами «шкала, тарифная зона» для бота.
+
+    Порядок — порядок импорта: приборы по metering_meters.id, внутри прибора
+    все зоны первой шкалы, затем следующей (metering_meter_scales.id,
+    metering_tariff_zones.id). Приборы без единой пары не возвращаются:
+    вводить по ним нечего. Счётчики из schetchiki сюда не входят.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT m.id AS meter_id, m.one_c_id AS meter_one_c_id, "
+            "p.resource_name AS resource_type, m.meter_number, m.meter_type, "
+            "s.one_c_id AS scale_one_c_id, s.name AS scale_name, "
+            "z.one_c_id AS zone_one_c_id, z.name AS zone_name "
+            "FROM licschet l "
+            "JOIN metering_points p ON p.licschet_id=l.id "
+            "JOIN metering_meters m ON m.metering_point_id=p.id "
+            "JOIN metering_meter_scales s ON s.meter_id=m.id "
+            "JOIN metering_tariff_zones z ON z.scale_id=s.id "
+            "WHERE l.number=? ORDER BY m.id, s.id, z.id",
+            (normalize_lschet_number(ls),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    meters: dict[int, dict] = {}
+    for row in rows:
+        meter = meters.get(row["meter_id"])
+        if meter is None:
+            meter = meters[row["meter_id"]] = {
+                "meter_one_c_id": row["meter_one_c_id"],
+                "resource_type": row["resource_type"],
+                "meter_number": row["meter_number"],
+                "meter_type": row["meter_type"],
+                "zones": [],
+            }
+        meter["zones"].append({
+            "scale_one_c_id": row["scale_one_c_id"],
+            "scale_name": row["scale_name"],
+            "zone_one_c_id": row["zone_one_c_id"],
+            "zone_name": row["zone_name"],
+            "label": reading_value_label(row["scale_name"], row["zone_name"]),
+        })
+    return list(meters.values())
+
+
+_EMPTY_1C_GUID = "00000000-0000-0000-0000-000000000000"
+_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 _ONE_C_LOG_VALUE_MAX_LENGTH = 80
 
 
+def _is_guid(value) -> bool:
+    """True, если значение — строка в формате GUID (в том числе пустая ссылка 1С)."""
+    return isinstance(value, str) and _GUID_RE.fullmatch(value) is not None
+
+
 def _json_id(value, label: str) -> tuple[str | None, str | None]:
-    """Return ``(id, None)`` for a valid 1C GUID or ``(None, skip reason)``."""
+    """Проверить ID элемента выгрузки 1С: ``(id, None)`` или ``(None, причина пропуска)``.
+
+    ID обязан быть GUID (``_is_guid``) ровно в том виде, как пришёл из 1С:
+    пробелы по краям не обрезаются. None, пустая или пробельная строка и пустая
+    ссылка 1С (``_EMPTY_1C_GUID``) — «отсутствует <label>»; любое другое
+    значение не в формате GUID — «некорректный тип/формат ID <label>».
+    Некорректное значение не возвращается, поэтому не может попасть в лог.
+    """
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, f"отсутствует {label}"
-    if not isinstance(value, str):
+    if value == _EMPTY_1C_GUID:
+        return None, f"отсутствует {label}"
+    if not _is_guid(value):
         return None, f"некорректный тип/формат ID {label}"
-    normalized = value.strip()
-    if len(normalized) > _ONE_C_ID_MAX_LENGTH or any(
-        unicodedata.category(char).startswith("C") for char in normalized
-    ):
-        return None, f"некорректный тип/формат ID {label}"
-    return normalized, None
+    return value, None
 
 
 def _json_text_fields(source: dict, *labels: str) -> tuple[dict, str | None]:
@@ -2152,8 +2317,24 @@ def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict],
                 ЛС=number, PersonalAccountID=account_id,
             )
             continue
+        # Ключ помещения нужен только для обмена с 1С; у нескольких ЛС он может совпадать.
+        # Сохраняется любой GUID, включая пустую ссылку 1С; всё остальное — пустая ссылка.
+        room_key_id = record.get("RoomKeyID")
+        if not _is_guid(room_key_id):
+            if room_key_id is not None:
+                log.warning(
+                    "Импорт JSON 1С: %s: RoomKeyID не в формате GUID, записана пустая ссылка; "
+                    "ЛС=%r",
+                    path, number,
+                )
+            room_key_id = _EMPTY_1C_GUID
         seen_account_ids.add(account_id)
-        item = {"number": number, "one_c_id": account_id, "points": []}
+        item = {
+            "number": number,
+            "one_c_id": account_id,
+            "room_key_id": room_key_id,
+            "points": [],
+        }
         account_ids = {"ЛС": number, "PersonalAccountID": account_id}
         points = _json_list(
             record.get("MeteringPoints"), f"{path}.MeteringPoints",
@@ -2323,9 +2504,10 @@ def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
         for account in prepared:
             conn.execute(
                 # ФИО и адрес не приходят из 1С: существующие значения не трогаем.
-                "INSERT INTO licschet(number,one_c_id) VALUES(?,?) "
-                "ON CONFLICT(number) DO UPDATE SET one_c_id=excluded.one_c_id",
-                (account["number"], account["one_c_id"]),
+                "INSERT INTO licschet(number,one_c_id,room_key_id) VALUES(?,?,?) "
+                "ON CONFLICT(number) DO UPDATE SET one_c_id=excluded.one_c_id, "
+                "room_key_id=excluded.room_key_id",
+                (account["number"], account["one_c_id"], account["room_key_id"]),
             )
             account_row = conn.execute(
                 "SELECT id FROM licschet WHERE number=?", (account["number"],)

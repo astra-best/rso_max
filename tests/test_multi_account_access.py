@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from unittest.mock import Mock
@@ -9,6 +10,21 @@ import database as db
 import web
 from rso_bot.flows import accounts, auth
 from rso_bot.states import S
+
+# Импорт JSON 1С принимает только GUID.
+IMPORTED_METER_ID = "30000000-0000-4000-8000-000000000002"
+
+
+def _one_zone_meter() -> dict:
+    return {
+        "meter_one_c_id": "METER-2", "resource_type": "Вода",
+        "meter_number": "M-2", "meter_type": "Однотарифный",
+        "zones": [{
+            "scale_one_c_id": "SCALE-1", "scale_name": "Основная",
+            "zone_one_c_id": "ZONE-1", "zone_name": "Сутки",
+            "label": "Основная, Сутки",
+        }],
+    }
 
 
 def _init(tmp_path, monkeypatch):
@@ -211,14 +227,25 @@ def test_multiple_accounts_reading_selection_persists_selected_ls(
     for number in ("LS-1", "LS-2"):
         db.create_lschet(number)
         db.upsert_bot_user(42, number, "User", authorized_1c=True)
-    db.upsert_1c_meters(
-        "LS-2",
-        [{
-            "meter_number": "M-2",
-            "resource_type": "Вода",
-            "meter_type": "Однотарифный",
+    db.import_from_1c_json(json.dumps([{
+        "PersonalAccountID": "10000000-0000-4000-8000-000000000002",
+        "RoomKeyID": "22222222-2222-2222-2222-222222222222",
+        "PersonalAccount": "LS-2",
+        "MeteringPoints": [{
+            "MeteringPointID": "20000000-0000-4000-8000-000000000002",
+            "Resource": "Вода",
+            "Meters": [{
+                "MeterID": IMPORTED_METER_ID,
+                "MeterNumber": "M-2",
+                "DifferentiationType": "Однотарифный",
+                "Scales": [{
+                    "ScaleID": "40000000-0000-4000-8000-000000000001",
+                    "Scale": "Основная",
+                    "TariffZones": [{"TariffZoneID": "50000000-0000-4000-8000-000000000001", "TariffZone": "Сутки"}],
+                }],
+            }],
         }],
-    )
+    }]))
     monkeypatch.setattr(bot, "ENABLE_1C_INTEGRATION", True)
     monkeypatch.setattr(bot, "send_buttons", Mock(return_value=True))
     monkeypatch.setattr(bot, "send_message", Mock(return_value=True))
@@ -229,16 +256,18 @@ def test_multiple_accounts_reading_selection_persists_selected_ls(
     bot._cb_account_select(42, state, "LS-2")
     assert state["ls"] == state["flow_ls"] == "LS-2"
     bot._cb_select_meter(42, state, "0")
-    bot._on_value1(42, state, "12.5")
+    bot._on_value(42, state, "12.5")
     bot._cb_meter_confirm(42, state)
 
     conn = db.get_conn()
     row = conn.execute(
-        "SELECT ls,value1 FROM pokazaniya WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT p.ls, p.meter_one_c_id, v.value FROM pokazaniya p "
+        "JOIN pokazaniya_values v ON v.pokazaniya_id=p.id "
+        "WHERE p.chat_id=? ORDER BY p.id DESC LIMIT 1",
         (42,),
     ).fetchone()
     conn.close()
-    assert dict(row) == {"ls": "LS-2", "value1": "12.5"}
+    assert dict(row) == {"ls": "LS-2", "meter_one_c_id": IMPORTED_METER_ID, "value": "12.5"}
 
 
 def test_unlink_after_reading_selection_blocks_stale_confirm(tmp_path, monkeypatch):
@@ -252,18 +281,14 @@ def test_unlink_after_reading_selection_blocks_stale_confirm(tmp_path, monkeypat
         "state": S.CONFIRM_POKAZANIYA,
         "flow_ls": "LS-2",
         "ls": "LS-2",
-        "meters": [{
-            "resource_type": "Вода", "meter_number": "M-2",
-            "meter_type": "Однотарифный",
-        }],
+        "meters": [_one_zone_meter()],
         "meter_idx": 0,
-        "new_value1": "10",
-        "new_value2": None,
+        "meter_values": ["10"],
     })
     db.unlink_bot_user_account(42, "LS-2")
     add_reading = Mock()
     menu = Mock()
-    monkeypatch.setattr(bot.db, "add_pokazaniya", add_reading)
+    monkeypatch.setattr(bot.db, "add_pokazaniya_values", add_reading)
     monkeypatch.setattr(bot, "send_main_menu", menu)
 
     bot._cb_meter_confirm(42, state)
@@ -415,13 +440,9 @@ def test_revoked_reading_callback_never_falls_back_to_remaining_account(
         "state": S.CONFIRM_POKAZANIYA,
         "flow_ls": "LS-2",
         "ls": "LS-2",
-        "meters": [{
-            "resource_type": "Вода", "meter_number": "M-2",
-            "meter_type": "Однотарифный",
-        }],
+        "meters": [_one_zone_meter()],
         "meter_idx": 0,
-        "new_value1": "15",
-        "new_value2": None,
+        "meter_values": ["15"],
     })
     db.unlink_bot_user_account(42, "LS-2")
     monkeypatch.setattr(bot, "_ack_callback", Mock())

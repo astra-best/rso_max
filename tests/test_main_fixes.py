@@ -260,11 +260,12 @@ def test_upload_reports_skipped_elements_from_real_import(clean_db):
         "/login",
         data={"username": "skip-admin", "password": "initial-password"},
     )
+    ROOM_KEY = "11111111-1111-1111-1111-111111111111"
     payload = json.dumps([
-        {"PersonalAccountID": "A-1", "PersonalAccount": "100-1", "MeteringPoints": []},
-        {"PersonalAccountID": "A-2", "PersonalAccount": "100-2", "MeteringPoints": []},
-        {"PersonalAccountID": "A-3", "PersonalAccount": "100-2", "MeteringPoints": []},
-        {"PersonalAccount": "100-4", "MeteringPoints": []},
+        {"PersonalAccountID": "10000000-0000-4000-8000-000000000001", "PersonalAccount": "100-1", "RoomKeyID": ROOM_KEY, "MeteringPoints": []},
+        {"PersonalAccountID": "10000000-0000-4000-8000-000000000002", "PersonalAccount": "100-2", "RoomKeyID": ROOM_KEY, "MeteringPoints": []},
+        {"PersonalAccountID": "10000000-0000-4000-8000-000000000003", "PersonalAccount": "100-2", "RoomKeyID": ROOM_KEY, "MeteringPoints": []},
+        {"PersonalAccount": "100-4", "RoomKeyID": ROOM_KEY, "MeteringPoints": []},
     ]).encode()
 
     response = client.post(

@@ -19,6 +19,8 @@ import sync_1c
 from api import notifier
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
+# Импорт JSON 1С принимает только GUID.
+METER_2T_ID = "30000000-0000-4000-8000-000000000002"
 
 
 class LocalIntegrationE2ETests(unittest.TestCase):
@@ -120,43 +122,11 @@ class LocalIntegrationE2ETests(unittest.TestCase):
     def _add_reading(self) -> None:
         db.add_pokazaniya(70001, "TEST-LS-001", "Вода", "TEST-METER-1", "12.5")
 
-    def _add_reading_through_bot(self) -> None:
-        """Exercise the real callback/message flow, including saved-LS authorization."""
-        chat_id = 70001
-        ls = "TEST-LS-001"
-        db.create_lschet(ls, "Тестовый пользователь", "Тестовый адрес")
-        db.upsert_bot_user(chat_id, ls, "", authorized_1c=True)
-        db.upsert_1c_meters(
-            ls,
-            [
-                {
-                    "meter_number": "TEST-METER-1",
-                    "resource_type": "Вода",
-                    "meter_type": "Однотарифный",
-                }
-            ],
-        )
-
-        def callback(payload: str) -> dict:
-            return {
-                "callback": {"callback_id": f"callback-{payload}", "payload": payload},
-                "message": {"recipient": {"chat_id": chat_id}},
-            }
-
-        with (
-            patch.object(bot, "ENABLE_1C_INTEGRATION", True),
-            patch.object(bot, "_ack_callback"),
-            patch.object(bot, "_send_raw", return_value=True),
-        ):
-            bot.handle_callback(callback("pokazaniya"))
-            bot.handle_callback(callback("meter:0"))
-            bot.handle_message(
-                {"recipient": {"chat_id": chat_id}, "body": {"text": "12.5"}}
-            )
-            bot.handle_callback(callback("meter_confirm"))
-
     def test_success_sends_batch_persists_status_and_notifies_max(self) -> None:
-        self._add_reading_through_bot()
+        # Бот пишет показания по шкалам/зонам (pokazaniya_values), а текущий
+        # формат обмена с 1С передаёт только value1/value2 — до переработки
+        # синхронизации очередь проверяется на строке старого формата.
+        self._add_reading()
         queued_row = db.get_pokazaniya()[0]
 
         def accepted(request, body):
@@ -208,27 +178,32 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         self.assertEqual(self.max_requests[0]["authorization"], "audit-max-secret")
         self.assertIn("приняты", self.max_requests[0]["body"]["text"])
 
-    def test_local_auth_two_tariff_reading_and_sync_chain(self) -> None:
+    def test_local_auth_two_tariff_reading_is_queued_with_zone_values(self) -> None:
         chat_id = 70002
         ls = "TEST-LS-002"
         db.create_lschet(ls, "Тестовый пользователь", "Тестовый адрес")
-        db.upsert_1c_meters(
-            ls,
-            [
-                {
-                    "meter_number": "ELECTRICITY-2T",
-                    "resource_type": "Электроэнергия",
-                    "meter_type": "Двухтарифный",
-                }
-            ],
-        )
-
-        def one_c(request, body):
-            return httpx.Response(
-                200,
-                json=self._status_result(body, "accepted"),
-                request=request,
-            )
+        db.import_from_1c_json(json.dumps([{
+            "PersonalAccountID": "10000000-0000-4000-8000-000000000002",
+            "RoomKeyID": "22222222-2222-2222-2222-222222222222",
+            "PersonalAccount": ls,
+            "MeteringPoints": [{
+                "MeteringPointID": "20000000-0000-4000-8000-000000000002",
+                "Resource": "Электроэнергия",
+                "Meters": [{
+                    "MeterID": METER_2T_ID,
+                    "MeterNumber": "ELECTRICITY-2T",
+                    "DifferentiationType": "Двухтарифный",
+                    "Scales": [{
+                        "ScaleID": "40000000-0000-4000-8000-000000000001",
+                        "Scale": "Основная",
+                        "TariffZones": [
+                            {"TariffZoneID": "50000000-0000-4000-8000-00000000000d", "TariffZone": "День"},
+                            {"TariffZoneID": "50000000-0000-4000-8000-00000000000e", "TariffZone": "Ночь"},
+                        ],
+                    }],
+                }],
+            }],
+        }]))
 
         def callback(payload: str) -> dict:
             return {
@@ -237,13 +212,11 @@ class LocalIntegrationE2ETests(unittest.TestCase):
             }
 
         with (
-            self._transport_context(one_c),
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
             patch.object(bot.client_api, "request_1c_auth_code") as request_code_api,
             patch.object(bot.client_api, "verify_1c_auth_code") as verify_code_api,
             patch.object(bot, "_ack_callback"),
-            patch.object(bot, "_send_raw", return_value=True),
-            patch.object(sync_1c, "_generate_batch_id", return_value="batch-full-e2e"),
+            patch.object(bot, "_send_raw", return_value=True) as send_raw,
         ):
             bot._start_1c_auth(chat_id)
             bot.handle_message(
@@ -258,25 +231,28 @@ class LocalIntegrationE2ETests(unittest.TestCase):
                 {"recipient": {"chat_id": chat_id}, "body": {"text": "48.25"}}
             )
             bot.handle_callback(callback("meter_confirm"))
-            outcome = sync_1c.sync_1c_job(self.now)
 
-        self.assertEqual(outcome, "success")
         request_code_api.assert_not_called()
         verify_code_api.assert_not_called()
-        self.assertEqual(
-            [request["url"].rsplit("/", 2)[-2:] for request in self.one_c_requests],
-            [["readings", "sync"]],
-        )
         user = db.get_bot_user(chat_id)
         self.assertEqual((user["ls"], user["authorized_1c"]), (ls, 1))
         reading = db.get_pokazaniya()[0]
         self.assertEqual(
-            (reading["meter_number"], reading["value1"], reading["value2"]),
-            ("ELECTRICITY-2T", "120.5", "48.25"),
+            (reading["meter_number"], reading["meter_one_c_id"],
+             reading["value1"], reading["value2"]),
+            ("ELECTRICITY-2T", METER_2T_ID, None, None),
         )
-        self.assertEqual((reading["sent_to_1c"], reading["status_1c"]), (1, "accepted"))
-        self.assertIsNone(db.get_1c_sync_state()["pending_batch_id"])
-        self.assertIn("приняты", self.max_requests[0]["body"]["text"])
+        # Новая строка стоит в очереди 1С; её отправка — задача переработки синхронизации.
+        self.assertEqual((reading["sent_to_1c"], reading["status_1c"]), (0, None))
+        self.assertEqual(
+            db.get_pokazaniya_with_prev()[0]["values_text"],
+            "Основная, День: 120.5; Основная, Ночь: 48.25",
+        )
+        sent_texts = [
+            call.args[1].get("text", "") for call in send_raw.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        ]
+        self.assertTrue(any("ожидают обработки в 1С" in text for text in sent_texts))
 
     def test_rejected_status_is_persisted_and_notified(self) -> None:
         self._add_reading()

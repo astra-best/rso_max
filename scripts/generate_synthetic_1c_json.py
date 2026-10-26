@@ -6,6 +6,12 @@ import json
 from pathlib import Path
 
 MAX_ACCOUNTS = 1000
+DUPLICATE_METER_ID = "00000003-0000-4000-8000-999999999999"
+
+
+def synthetic_guid(kind: int, index: int) -> str:
+    """Deterministic GUID: importer accepts only GUID IDs; kind separates entities."""
+    return f"{kind:08d}-0000-4000-8000-{index:012d}"
 
 
 def build_payload(count: int, *, duplicate_meter_id: bool = False) -> list[dict]:
@@ -13,12 +19,16 @@ def build_payload(count: int, *, duplicate_meter_id: bool = False) -> list[dict]
         raise ValueError(f"count must be between 0 and {MAX_ACCOUNTS}")
     records = []
     for index in range(count):
-        meter_id = "DUPLICATE-METER" if duplicate_meter_id and index < 2 else f"METER-{index:04d}"
+        meter_id = (
+            DUPLICATE_METER_ID if duplicate_meter_id and index < 2
+            else synthetic_guid(3, index)
+        )
         records.append({
-            "PersonalAccountID": f"ACCOUNT-{index:04d}",
+            "PersonalAccountID": synthetic_guid(1, index),
+            "RoomKeyID": synthetic_guid(0, index),
             "PersonalAccount": f"SYNTH-{index:04d}",
             "MeteringPoints": [{
-                "MeteringPointID": f"POINT-{index:04d}",
+                "MeteringPointID": synthetic_guid(2, index),
                 "MeteringPoint": "Synthetic point",
                 "ResourceID": "RESOURCE-1",
                 "Resource": "Electricity",
@@ -28,10 +38,10 @@ def build_payload(count: int, *, duplicate_meter_id: bool = False) -> list[dict]
                     "DifferentiationTypeID": "TYPE-1T",
                     "DifferentiationType": "Single tariff",
                     "Scales": [{
-                        "ScaleID": f"SCALE-{index:04d}",
+                        "ScaleID": synthetic_guid(4, index),
                         "Scale": "Main",
                         "TariffZones": [{
-                            "TariffZoneID": f"ZONE-{index:04d}",
+                            "TariffZoneID": synthetic_guid(5, index),
                             "TariffZone": "T1",
                         }],
                     }],

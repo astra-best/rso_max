@@ -4,14 +4,20 @@ Update parsing and routing stay in :mod:`bot`.  This module owns the meter
 selection, value entry, validation, confirmation and persistence transitions.
 Every collaborator is supplied explicitly so importing the flow never starts
 the bot or creates a circular dependency.
+
+Meters come from the 1C import.  Each meter carries an ordered list of
+``zones`` (one entry per scale/tariff-zone pair, already labelled by the
+database layer).  Entered values are kept in ``state["meter_values"]`` in the
+same order, so the index of the pair being asked is ``len(meter_values)``.
 """
 
 from __future__ import annotations
 
 import logging
-import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 State = dict[str, Any]
@@ -24,7 +30,6 @@ class ReadingDependencies:
     """Database, session, transport and continuation dependencies."""
 
     get_meters: Callable[[str], Sequence[Record]]
-    get_last_reading: Callable[[str, str], Record | None]
     add_reading: Callable[..., Any]
     get_state: Callable[[int], State]
     touch: Callable[[State], State]
@@ -33,8 +38,7 @@ class ReadingDependencies:
     get_saved_ls: Callable[[int], str | None]
     request_ls: Callable[[int, str], None]
     # Calls through entry-point wrappers preserve runtime monkeypatch seams.
-    parse_input: Callable[[int, str], float | None]
-    get_current_value: Callable[[str, Record, str, str], float]
+    parse_input: Callable[[int, str], str | None]
     show_meter_select: Callable[[int, str], None]
     ask_meter_value: Callable[[int], None]
     confirm_meter_reading: Callable[[int], None]
@@ -45,45 +49,55 @@ class ReadingDependencies:
     logger: logging.Logger
     integration_enabled: bool
     meter_select_state: str
-    waiting_value1_state: str
-    waiting_value2_state: str
+    waiting_value_state: str
     confirm_state: str
 
 
-def parse_reading(chat_id: int, text: str, deps: ReadingDependencies) -> float | None:
-    """Parse a finite, non-negative meter reading."""
-    try:
-        value = float(text.replace(",", "."))
-    except ValueError:
+READING_MAX_INTEGER_DIGITS = 15
+READING_MAX_FRACTION_DIGITS = 6
+_READING_RE = re.compile(r"([+-]?)(\d+)(?:[.,](\d+))?", re.ASCII)
+
+
+def parse_reading(chat_id: int, text: str, deps: ReadingDependencies) -> str | None:
+    """Parse a non-negative decimal reading and return its normalised text.
+
+    Only digits with one optional ``.``/``,`` separator are accepted, so
+    exponents, ``inf`` and ``nan`` never pass.  ``Decimal`` keeps long values
+    exact: ``"00123,50"`` becomes ``"123.5"``.
+    """
+    match = _READING_RE.fullmatch(text.strip())
+    if match is None:
         deps.send_message(chat_id, "Введите числовое значение.")
         return None
-    if value < 0 or not math.isfinite(value):
+    sign, integer, fraction = match.groups()
+    if sign == "-":
         deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
         return None
-    return value
+    if fraction and len(fraction) > READING_MAX_FRACTION_DIGITS:
+        deps.send_message(
+            chat_id,
+            f"Допускается не более {READING_MAX_FRACTION_DIGITS} знаков после запятой.",
+        )
+        return None
+    if len(integer.lstrip("0")) > READING_MAX_INTEGER_DIGITS:
+        deps.send_message(
+            chat_id,
+            f"Допускается не более {READING_MAX_INTEGER_DIGITS} цифр до запятой.",
+        )
+        return None
+    value = Decimal(f"{integer}.{fraction or '0'}").normalize()
+    return format(value, "f")
 
 
-def _record_value(record: Record, key: str, default: Any = None) -> Any:
-    """Read mappings and sqlite3.Row records without relying on ``get``."""
-    try:
-        return record[key]
-    except (IndexError, KeyError, TypeError):
-        return default
+def meter_title(meter: Record) -> str:
+    """Return "Ресурс №номер (тип из 1С)"; the brackets are omitted if empty."""
+    title = f"{meter['resource_type']} №{meter['meter_number']}"
+    meter_type = (meter.get("meter_type") or "").strip()
+    return f"{title} ({meter_type})" if meter_type else title
 
 
-def current_reading(
-    account: str,
-    meter: Record,
-    column: str,
-    initial_key: str,
-    deps: ReadingDependencies,
-) -> float:
-    """Return the latest non-empty reading or the meter's initial value."""
-    last = deps.get_last_reading(account, str(meter["meter_number"]))
-    latest = _record_value(last, column) if last is not None else None
-    if latest:
-        return float(latest)
-    return float(_record_value(meter, initial_key, "0") or "0")
+def _entered_values(state: State) -> list[str]:
+    return list(state.get("meter_values") or [])
 
 
 def start(chat_id: int, deps: ReadingDependencies) -> None:
@@ -97,13 +111,16 @@ def start(chat_id: int, deps: ReadingDependencies) -> None:
 
 def show_meter_select(chat_id: int, account: str, deps: ReadingDependencies) -> None:
     """Load account meters and present the meter selection keyboard."""
-    meters = deps.get_meters(account)
-    if not meters:
+    # A meter without scale/zone pairs has nothing to enter, so it is not
+    # offered at all; the database layer already omits such meters.
+    meter_list = [
+        dict(meter) for meter in deps.get_meters(account) if meter.get("zones")
+    ]
+    if not meter_list:
         deps.send_message(chat_id, "По вашему счёту счётчики не найдены.")
         deps.send_main_menu(chat_id)
         return
 
-    meter_list = [dict(meter) for meter in meters]
     state = deps.get_state(chat_id)
     state["state"] = deps.meter_select_state
     state["ls"] = account
@@ -111,54 +128,27 @@ def show_meter_select(chat_id: int, account: str, deps: ReadingDependencies) -> 
     state["meters"] = meter_list
     deps.touch(state)
 
-    rows = []
-    for index, meter in enumerate(meter_list):
-        suffix = " (2Т)" if meter["meter_type"] == "Двухтарифный" else ""
-        rows.append(
-            [
-                deps.make_callback(
-                    f"{meter['resource_type']} №{meter['meter_number']}{suffix}",
-                    f"meter:{index}",
-                )
-            ]
-        )
+    rows = [
+        [deps.make_callback(meter_title(meter), f"meter:{index}")]
+        for index, meter in enumerate(meter_list)
+    ]
     rows.append([deps.make_callback("🏠 Главное меню", "main_menu")])
     deps.send_buttons(chat_id, "Выберите счётчик:", rows)
 
 
 def ask_meter_value(chat_id: int, deps: ReadingDependencies) -> None:
-    """Prompt for T1/single-tariff value or T2 according to session state."""
+    """Prompt for the next scale/zone pair of the selected meter."""
     state = deps.get_state(chat_id)
     meter = state["meters"][state["meter_idx"]]
-    waiting_v2 = state.get("state") == deps.waiting_value2_state
+    zones = meter["zones"]
+    index = len(_entered_values(state))
+    if index >= len(zones):
+        deps.confirm_meter_reading(chat_id)
+        return
 
-    resource = meter["resource_type"]
-    number = meter["meter_number"]
-    is_two_tariff = meter["meter_type"] == "Двухтарифный"
-
-    if deps.integration_enabled:
-        current_info = ""
-    else:
-        last = deps.get_last_reading(state["ls"], number)
-        if last:
-            if is_two_tariff and last["value2"]:
-                current_info = f"Текущие: Т1={last['value1']}, Т2={last['value2']}"
-            else:
-                current_info = f"Текущее показание: {last['value1']}"
-            current_info += f" (от {(last['created_at'] or '')[:10]})"
-        else:
-            initial = _record_value(
-                meter, "initial2" if waiting_v2 else "initial1", "0"
-            )
-            current_info = f"Начальное: {initial}"
-
-    info_line = f"\n{current_info}" if current_info else ""
-    if waiting_v2:
-        prompt = f"{resource} №{number}{info_line}\nВведите Т2 (ночь):"
-    elif is_two_tariff:
-        prompt = f"{resource} №{number} (двухтарифный){info_line}\nВведите Т1 (день):"
-    else:
-        prompt = f"{resource} №{number}{info_line}\nВведите показание:"
+    prompt = f"{zones[index]['label']}:"
+    if index == 0:
+        prompt = f"{meter_title(meter)}\n{prompt}"
     deps.send_message(chat_id, prompt)
 
 
@@ -166,22 +156,16 @@ def confirm_meter_reading(chat_id: int, deps: ReadingDependencies) -> None:
     """Show the confirmation keyboard for the values in session state."""
     state = deps.get_state(chat_id)
     meter = state["meters"][state["meter_idx"]]
-    value1 = state.get("new_value1")
-    value2 = state.get("new_value2")
-
-    if meter["meter_type"] == "Двухтарифный":
-        summary = (
-            f"{meter['resource_type']} №{meter['meter_number']}: "
-            f"Т1={value1}, Т2={value2}"
-        )
-    else:
-        summary = f"{meter['resource_type']} №{meter['meter_number']}: {value1}"
+    lines = [meter_title(meter)] + [
+        f"{zone['label']}: {value}"
+        for zone, value in zip(meter["zones"], _entered_values(state))
+    ]
 
     state["state"] = deps.confirm_state
     deps.touch(state)
     deps.send_buttons(
         chat_id,
-        f"Проверьте показания:\n{summary}",
+        "Проверьте показания:\n" + "\n".join(lines),
         [
             [deps.make_callback("✅ Подтвердить", "meter_confirm")],
             [deps.make_callback("✏️ Скорректировать", "meter_retry")],
@@ -195,7 +179,7 @@ def select_meter(
     argument: str,
     deps: ReadingDependencies,
 ) -> None:
-    """Select a meter and reset value entry to T1."""
+    """Select a meter and reset value entry to its first scale/zone pair."""
     meter_index = int(argument)
     meters = state.get("meters")
     if not isinstance(meters, Sequence) or not 0 <= meter_index < len(meters):
@@ -212,14 +196,31 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
         return
 
     meter = state["meters"][state["meter_idx"]]
+    zones = meter["zones"]
+    entered = _entered_values(state)
+    if len(entered) != len(zones):
+        # Never persist a partial set of values: start this meter over.
+        retry(chat_id, state, deps)
+        return
+
+    values = [
+        {
+            "scale_one_c_id": zone["scale_one_c_id"],
+            "scale_name": zone.get("scale_name"),
+            "zone_one_c_id": zone["zone_one_c_id"],
+            "zone_name": zone.get("zone_name"),
+            "value": value,
+        }
+        for zone, value in zip(zones, entered)
+    ]
     try:
         deps.add_reading(
             chat_id,
             state["ls"],
             meter["resource_type"],
             meter["meter_number"],
-            state.get("new_value1"),
-            state.get("new_value2"),
+            meter["meter_one_c_id"],
+            values,
         )
     except Exception:  # noqa: BLE001 - persistence failures must keep the flow retryable
         # The exception raised by the persistence layer can contain account and
@@ -265,7 +266,7 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
 
 
 def retry(chat_id: int, state: State, deps: ReadingDependencies) -> None:
-    """Reset the current meter's values and ask for T1 again."""
+    """Reset the current meter's values and ask for the first pair again."""
     if state.get("state") != deps.confirm_state:
         return
     deps.reset_meter_input(state)
@@ -273,65 +274,23 @@ def retry(chat_id: int, state: State, deps: ReadingDependencies) -> None:
     deps.ask_meter_value(chat_id)
 
 
-def on_value1(
+def on_value(
     chat_id: int,
     state: State,
     text: str,
     deps: ReadingDependencies,
 ) -> None:
-    """Accept T1 or a single-tariff value and advance the flow."""
+    """Accept the value for the current scale/zone pair and advance the flow."""
     meter = state["meters"][state["meter_idx"]]
     value = deps.parse_input(chat_id, text)
     if value is None:
         return
-    if value < 0 or not math.isfinite(value):
-        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
-        return
 
-    current = deps.get_current_value(state.get("ls", ""), meter, "value1", "initial1")
-    if not deps.integration_enabled and value < current:
-        deps.send_message(
-            chat_id,
-            f"Показание {value} не может быть меньше текущего {current}.\n"
-            "Введите корректное значение:",
-        )
-        return
-
-    state["new_value1"] = str(value)
-    if meter["meter_type"] == "Двухтарифный":
-        state["state"] = deps.waiting_value2_state
-        deps.touch(state)
+    entered = _entered_values(state)
+    entered.append(value)
+    state["meter_values"] = entered
+    deps.touch(state)
+    if len(entered) < len(meter["zones"]):
         deps.ask_meter_value(chat_id)
     else:
-        state["new_value2"] = None
-        deps.touch(state)
         deps.confirm_meter_reading(chat_id)
-
-
-def on_value2(
-    chat_id: int,
-    state: State,
-    text: str,
-    deps: ReadingDependencies,
-) -> None:
-    """Accept T2 and advance the flow to confirmation."""
-    meter = state["meters"][state["meter_idx"]]
-    value = deps.parse_input(chat_id, text)
-    if value is None:
-        return
-    if value < 0 or not math.isfinite(value):
-        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
-        return
-
-    current = deps.get_current_value(state.get("ls", ""), meter, "value2", "initial2")
-    if not deps.integration_enabled and value < current:
-        deps.send_message(
-            chat_id,
-            f"Показание Т2 {value} не может быть меньше текущего {current}.\n"
-            "Введите корректное значение:",
-        )
-        return
-
-    state["new_value2"] = str(value)
-    deps.touch(state)
-    deps.confirm_meter_reading(chat_id)

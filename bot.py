@@ -14,8 +14,8 @@ bot.py — MAX-бот РСО Портал, Горизонт 1.
     справочники и показания читаются напрямую из БД (database).
 
 Инварианты:
-  - Какое поле показаний ожидается, определяется ТОЛЬКО состоянием
-    (WAITING_VALUE1 / WAITING_VALUE2), отдельных флагов нет.
+  - Какая пара «шкала, зона» ожидается при вводе показаний, определяется
+    ТОЛЬКО числом уже введённых значений (meter_values), отдельных флагов нет.
   - Ключи незавершённых флоу перечислены в _FLOW_KEYS и сбрасываются
     централизованно через _clear_flow().
   - Все сообщения клиенту идут через send_message / send_buttons,
@@ -406,7 +406,7 @@ def _clear_flow(st: dict) -> None:
 
 
 def _reset_meter_input(st: dict) -> None:
-    """Сбрасывает введённые значения показаний, ставит ожидание Т1."""
+    """Сбрасывает введённые значения показаний, ставит ожидание первой пары."""
     _get_session_manager().reset_meter_input(st)
 
 
@@ -439,16 +439,9 @@ def _show_accounts(chat_id: int) -> None:
 
 # ── Ввод и валидация показаний ────────────────────────────────────────────────
 
-def _parse_reading(chat_id: int, text: str) -> float | None:
+def _parse_reading(chat_id: int, text: str) -> str | None:
     """Compatibility wrapper for parsing an entered meter reading."""
     return readings.parse_reading(chat_id, text, _reading_dependencies())
-
-
-def _current_reading(ls: str, meter: dict, col: str, initial_key: str) -> float:
-    """Compatibility wrapper for resolving a meter's current reading."""
-    return readings.current_reading(
-        ls, meter, col, initial_key, _reading_dependencies()
-    )
 
 
 # ── Флоу подачи обращения (раздел 6.4, шаги 1–4) ────────────────────────────
@@ -965,9 +958,8 @@ def _flush_operator_outbox(only_id: int | None = None) -> list[dict]:
 def _reading_dependencies() -> readings.ReadingDependencies:
     """Build reading dependencies from runtime patch points in this entry point."""
     return readings.ReadingDependencies(
-        get_meters=db.get_schetchiki,
-        get_last_reading=db.get_last_pokazaniya,
-        add_reading=db.add_pokazaniya,
+        get_meters=db.get_1c_meters_with_zones,
+        add_reading=db.add_pokazaniya_values,
         get_state=_get_state,
         touch=_touch,
         reset_meter_input=_reset_meter_input,
@@ -975,7 +967,6 @@ def _reading_dependencies() -> readings.ReadingDependencies:
         get_saved_ls=_get_saved_ls,
         request_ls=_request_ls,
         parse_input=_parse_reading,
-        get_current_value=_current_reading,
         show_meter_select=_show_meter_select,
         ask_meter_value=_ask_meter_value,
         confirm_meter_reading=_confirm_meter_reading,
@@ -986,8 +977,7 @@ def _reading_dependencies() -> readings.ReadingDependencies:
         logger=log,
         integration_enabled=ENABLE_1C_INTEGRATION,
         meter_select_state=S.METER_SELECT,
-        waiting_value1_state=S.WAITING_VALUE1,
-        waiting_value2_state=S.WAITING_VALUE2,
+        waiting_value_state=S.WAITING_VALUE,
         confirm_state=S.CONFIRM_POKAZANIYA,
     )
 
@@ -1477,8 +1467,7 @@ _CALLBACK_PREFIX_EXEMPT = {"operator_rate", "faq_terminal_menu", "account_select
 
 _STATE_ACCOUNT_CONTINUATIONS = {
     S.METER_SELECT: "pokazaniya",
-    S.WAITING_VALUE1: "pokazaniya",
-    S.WAITING_VALUE2: "pokazaniya",
+    S.WAITING_VALUE: "pokazaniya",
     S.CONFIRM_POKAZANIYA: "pokazaniya",
     S.APPOINTMENT_BRANCH: "appointment",
     S.APPOINTMENT_DATE: "appointment",
@@ -1757,14 +1746,9 @@ def _on_appointment_theme(chat_id: int, st: dict, text: str) -> None:
     appointments.on_theme(chat_id, st, text, _appointment_dependencies())
 
 
-def _on_value1(chat_id: int, st: dict, text: str) -> None:
-    """Compatibility wrapper for T1 or single-tariff input."""
-    readings.on_value1(chat_id, st, text, _reading_dependencies())
-
-
-def _on_value2(chat_id: int, st: dict, text: str) -> None:
-    """Compatibility wrapper for T2 input."""
-    readings.on_value2(chat_id, st, text, _reading_dependencies())
+def _on_value(chat_id: int, st: dict, text: str) -> None:
+    """Compatibility wrapper for the current scale/zone value input."""
+    readings.on_value(chat_id, st, text, _reading_dependencies())
 
 
 # Состояние сессии → обработчик текстового ввода
@@ -1774,8 +1758,7 @@ _MESSAGE_HANDLERS: dict[str, callable] = {
     S.AWAIT_LS_1C:       _on_await_ls_1c,
     S.REOPEN_COMMENT:    _on_reopen_comment,
     S.APPOINTMENT_THEME: _on_appointment_theme,
-    S.WAITING_VALUE1:    _on_value1,
-    S.WAITING_VALUE2:    _on_value2,
+    S.WAITING_VALUE:     _on_value,
     S.AI_QUESTION:       _on_ai_question,
     S.OPERATOR_CHAT:     _on_operator_text,
 }
@@ -1785,8 +1768,8 @@ _STATE_MODULES = {
     S.ACCOUNT_SELECT: "accounts",
     S.APPEAL_CATEGORY: "appeal", S.APPEAL_BODY: "appeal",
     S.REOPEN_COMMENT: "appeal_status", S.SCRIPT_LIST: "faq", S.SCRIPT_NODE: "faq",
-    S.AI_QUESTION: "ai", S.METER_SELECT: "readings", S.WAITING_VALUE1: "readings",
-    S.WAITING_VALUE2: "readings", S.CONFIRM_POKAZANIYA: "readings",
+    S.AI_QUESTION: "ai", S.METER_SELECT: "readings", S.WAITING_VALUE: "readings",
+    S.CONFIRM_POKAZANIYA: "readings",
     S.APPOINTMENT_BRANCH: "appointment", S.APPOINTMENT_DATE: "appointment",
     S.APPOINTMENT_TIME: "appointment", S.APPOINTMENT_THEME: "appointment",
     S.APPOINTMENT_CONFIRM: "appointment",

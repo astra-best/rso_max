@@ -147,33 +147,42 @@ class Bot1CFlowTests(unittest.TestCase):
         self.assertEqual(st["state"], bot.S.AWAIT_LS_1C)
         self.assertEqual(send.call_count, 2)
 
+    @staticmethod
+    def _meter() -> dict:
+        return {
+            "meter_one_c_id": "METER-1",
+            "meter_number": "M-1",
+            "resource_type": "Электроэнергия",
+            "meter_type": "Однотарифный",
+            "zones": [
+                {
+                    "scale_one_c_id": "S-1",
+                    "scale_name": "Основная",
+                    "zone_one_c_id": "Z-1",
+                    "zone_name": "Сутки",
+                    "label": "Основная, Сутки",
+                }
+            ],
+        }
+
     def test_integration_mode_does_not_reject_lower_reading_locally(self) -> None:
         st = bot._get_state(42)
         st.update(
             {
-                "state": bot.S.WAITING_VALUE1,
+                "state": bot.S.WAITING_VALUE,
                 "ls": "100001",
-                "meters": [
-                    {
-                        "meter_number": "M-1",
-                        "resource_type": "Электроэнергия",
-                        "meter_type": "Однотарифный",
-                        "initial1": "100",
-                        "initial2": "0",
-                    }
-                ],
+                "meters": [self._meter()],
                 "meter_idx": 0,
             }
         )
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
-            patch.object(bot, "_current_reading", return_value=100.0),
             patch.object(bot, "_confirm_meter_reading") as confirm,
         ):
-            bot._on_value1(42, st, "50")
+            bot._on_value(42, st, "50")
 
         confirm.assert_called_once_with(42)
-        self.assertEqual(st["new_value1"], "50.0")
+        self.assertEqual(st["meter_values"], ["50"])
 
     def test_confirmation_in_integration_mode_says_queued(self) -> None:
         st = bot._get_state(42)
@@ -181,21 +190,14 @@ class Bot1CFlowTests(unittest.TestCase):
             {
                 "state": bot.S.CONFIRM_POKAZANIYA,
                 "ls": "100001",
-                "meters": [
-                    {
-                        "meter_number": "M-1",
-                        "resource_type": "Электроэнергия",
-                        "meter_type": "Однотарифный",
-                    }
-                ],
+                "meters": [self._meter()],
                 "meter_idx": 0,
-                "new_value1": "50.0",
-                "new_value2": None,
+                "meter_values": ["50"],
             }
         )
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
-            patch.object(bot.db, "add_pokazaniya"),
+            patch.object(bot.db, "add_pokazaniya_values") as add_values,
             patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
             patch.object(bot, "send_message") as send,
             patch.object(bot, "_show_meter_select"),
@@ -203,9 +205,9 @@ class Bot1CFlowTests(unittest.TestCase):
         ):
             bot._cb_meter_confirm(42, st)
 
+        add_values.assert_called_once()
         self.assertIn("ожидают обработки", send.call_args.args[1])
         self.assertIn("сохранены в очередь", "\n".join(logs.output))
-
 
 if __name__ == "__main__":
     unittest.main()

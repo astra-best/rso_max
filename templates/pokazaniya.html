@@ -108,13 +108,19 @@
                     </td>
                     <td>{{ r['meter_number'] or '—' }}</td>
                     <td>
-                        {% if r['value2'] %}
+                        {% if r['values_text'] %}
+                            <div class="two-values">
+                                {% for part in r['value_lines'] %}
+                                <div><span class="value-cell">{{ part }}</span></div>
+                                {% endfor %}
+                            </div>
+                        {% elif r['value2'] %}
                             <div class="two-values">
                                 <div><span class="lbl">Т1:</span><span class="value-cell">{{ r['value1'] }}</span></div>
                                 <div><span class="lbl">Т2:</span><span class="value-cell">{{ r['value2'] }}</span></div>
                             </div>
                         {% else %}
-                            <span class="value-cell">{{ r['value1'] }}</span>
+                            <span class="value-cell">{{ r['value1'] if r['value1'] is not none else '—' }}</span>
                         {% endif %}
                     </td>
                     {% if integration_1c_enabled %}
@@ -143,7 +149,9 @@
                         {% endif %}
                     </td>
                     <td>
-                        {% if r['diff1'] is not none %}
+                        {% if r['meter_one_c_id'] %}
+                            <span class="diff-none">—</span>
+                        {% elif r['diff1'] is not none %}
                             {% if r['value2'] and r['diff2'] is not none %}
                                 <div class="two-values">
                                     <div><span class="lbl">Т1:</span>
