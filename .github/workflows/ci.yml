@@ -70,6 +70,7 @@ jobs:
           DB_PATH="$RUNNER_TEMP/rso-ci.sqlite" LOG_FILE="$RUNNER_TEMP/rso-ci.log"
           python -m pytest -q -p no:cacheprovider tests/test_gunicorn_config.py
           tests/test_module_guards.py
+          tests/test_1c_json_import.py
 
       - name: Verify legacy database migration preserves data
         run: |
