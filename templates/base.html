@@ -28,6 +28,21 @@
         .nav-item:hover { background: var(--surface2); color: var(--text); }
         .nav-item.active { background: rgba(0,200,255,0.1); color: var(--accent); }
         .nav-badge { margin-left: auto; background: var(--error); color: #fff; font-size: 9px; padding: 2px 6px; border-radius: 10px; min-width: 18px; text-align: center; }
+        /* ── Выпадающие группы навигации ── */
+        .nav-group { margin-bottom: 2px; }
+        .nav-group-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border: none; border-radius: 8px; background: none; color: var(--muted); font: inherit; font-size: 12px; text-align: left; cursor: pointer; transition: background 0.15s, color 0.15s; }
+        .nav-group-toggle:hover { background: var(--surface2); color: var(--text); }
+        .nav-group-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+        .nav-group.has-active > .nav-group-toggle { color: var(--text); }
+        .nav-caret { font-size: 10px; transition: transform 0.2s; transform: rotate(-90deg); }
+        .nav-group.open .nav-caret { transform: rotate(0deg); }
+        .nav-group-items { display: grid; grid-template-rows: 0fr; }
+        .nav-ready .nav-group-items { transition: grid-template-rows 0.2s ease; }
+        .nav-group.open .nav-group-items { grid-template-rows: 1fr; }
+        .nav-group-inner { overflow: hidden; min-height: 0; padding-left: 12px; margin-left: 14px; border-left: 1px solid var(--border); }
+        .nav-group:not(.open) .nav-group-inner { visibility: hidden; }
+        .nav-ready .nav-group-inner { transition: visibility 0.2s; }
+        .nav-group-inner .nav-item:first-child { margin-top: 2px; }
         .sidebar-user { padding: 16px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
         .user-avatar { width: 30px; height: 30px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #000; font-weight: 700; flex-shrink: 0; }
         .user-name { font-size: 11px; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -184,82 +199,121 @@
            class="nav-item {% if request.endpoint == 'index' %}active{% endif %}">
             🏠 Дашборд
         </a>
-        <a href="{{ url_for('appeals_list') }}"
-           class="nav-item {% if request.endpoint in ('appeals_list','appeal_detail') %}active{% endif %}">
-            📋 Обращения
-            {# counts передаётся только с дашборда — на других страницах скрыт #}
-            {% if counts is defined and counts.new > 0 %}
-                <span class="nav-badge">{{ counts.new }}</span>
+        <div class="nav-group{% if (request.endpoint in ('appeals_list','appeal_detail')) or (request.endpoint == 'pokazaniya') or (request.endpoint in ('house_chats_list','house_chat_detail','house_chats_broadcast_page','house_chats_broadcast')) or (request.endpoint == 'appointments_list') or (request.endpoint and request.endpoint.startswith('operator_')) %} open has-active{% endif %}" data-group="clients">
+            <button type="button" class="nav-group-toggle" aria-expanded="{% if (request.endpoint in ('appeals_list','appeal_detail')) or (request.endpoint == 'pokazaniya') or (request.endpoint in ('house_chats_list','house_chat_detail','house_chats_broadcast_page','house_chats_broadcast')) or (request.endpoint == 'appointments_list') or (request.endpoint and request.endpoint.startswith('operator_')) %}true{% else %}false{% endif %}">
+                <span>📋 Работа с клиентами</span><span class="nav-caret">▾</span>
+            </button>
+            <div class="nav-group-items"><div class="nav-group-inner">
+            <a href="{{ url_for('appeals_list') }}"
+               class="nav-item {% if request.endpoint in ('appeals_list','appeal_detail') %}active{% endif %}">
+                📋 Обращения
+                {# counts передаётся только с дашборда — на других страницах скрыт #}
+                {% if counts is defined and counts.new > 0 %}
+                    <span class="nav-badge">{{ counts.new }}</span>
+                {% endif %}
+            </a>
+            <a href="{{ url_for('pokazaniya') }}"
+               class="nav-item {% if request.endpoint == 'pokazaniya' %}active{% endif %}">
+                📊 Показания
+            </a>
+            <a href="{{ url_for('house_chats_list') }}"
+               class="nav-item {% if request.endpoint in ('house_chats_list','house_chat_detail','house_chats_broadcast_page','house_chats_broadcast') %}active{% endif %}">
+                🏘 Домовые чаты
+            </a>
+            <a href="{{ url_for('appointments_list') }}"
+               class="nav-item {% if request.endpoint == 'appointments_list' %}active{% endif %}">
+                🗓️ Записи на приём
+            </a>
+{% if user.role == 'operator' %}
+            <a href="{{ url_for('operator_chat_page') }}"
+               class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_') %}active{% endif %}">
+                💬 Диалоги с клиентами
+            </a>
             {% endif %}
-        </a>
-        <a href="{{ url_for('pokazaniya') }}"
-           class="nav-item {% if request.endpoint == 'pokazaniya' %}active{% endif %}">
-            📊 Показания
-        </a>
-        <a href="{{ url_for('house_chats_list') }}"
-           class="nav-item {% if request.endpoint in ('house_chats_list','house_chat_detail','house_chats_broadcast_page','house_chats_broadcast') %}active{% endif %}">
-            🏘 Домовые чаты
-        </a>
-        <a href="{{ url_for('scenarios_list') }}"
-           class="nav-item {% if request.endpoint in ('scenarios_list','scenario_new_form','scenario_new','scenario_edit_form','scenario_edit') %}active{% endif %}">
-            ⚙️ Сценарии
-        </a>
-        <a href="{{ url_for('scripts_list') }}"
-           class="nav-item {% if request.endpoint in ('scripts_list','script_create','script_editor','script_update') %}active{% endif %}">
-            📋 FAQ-скрипты
-        </a>
-        <a href="{{ url_for('appointments_list') }}"
-           class="nav-item {% if request.endpoint == 'appointments_list' %}active{% endif %}">
-            🗓️ Записи на приём
-        </a>
-        {% if user.role == 'operator' %}
-        <a href="{{ url_for('operator_chat_page') }}"
-           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_') %}active{% endif %}">
-            💬 Диалоги с клиентами
-        </a>
-        {% endif %}
+            </div></div>
+        </div>
+        <div class="nav-group{% if (request.endpoint in ('scenarios_list','scenario_new_form','scenario_new','scenario_edit_form','scenario_edit')) or (request.endpoint in ('scripts_list','script_create','script_editor','script_update')) %} open has-active{% endif %}" data-group="bot">
+            <button type="button" class="nav-group-toggle" aria-expanded="{% if (request.endpoint in ('scenarios_list','scenario_new_form','scenario_new','scenario_edit_form','scenario_edit')) or (request.endpoint in ('scripts_list','script_create','script_editor','script_update')) %}true{% else %}false{% endif %}">
+                <span>⚙️ Настройка бота</span><span class="nav-caret">▾</span>
+            </button>
+            <div class="nav-group-items"><div class="nav-group-inner">
+            <a href="{{ url_for('scenarios_list') }}"
+               class="nav-item {% if request.endpoint in ('scenarios_list','scenario_new_form','scenario_new','scenario_edit_form','scenario_edit') %}active{% endif %}">
+                ⚙️ Сценарии
+            </a>
+            <a href="{{ url_for('scripts_list') }}"
+               class="nav-item {% if request.endpoint in ('scripts_list','script_create','script_editor','script_update') %}active{% endif %}">
+                📋 FAQ-скрипты
+            </a>
+            </div></div>
+        </div>
         {% if user.role == 'admin' %}
         <div class="nav-label">Администратор</div>
         <a href="{{ url_for('analytics_dashboard') }}"
            class="nav-item {% if request.endpoint == 'analytics_dashboard' %}active{% endif %}">
             📈 Аналитика
         </a>
-        <a href="{{ url_for('branches_page') }}"
-           class="nav-item {% if request.endpoint in ('branches_page','branch_detail','branch_create','branch_update') %}active{% endif %}">
-            🏢 Филиалы
-        </a>
-        <a href="{{ url_for('broadcast_page') }}"
-           class="nav-item {% if request.endpoint in ('broadcast_page','broadcast') %}active{% endif %}">
-            📢 Рассылка (бот)
-        </a>
-        <a href="{{ url_for('upload_page') }}"
-           class="nav-item {% if request.endpoint == 'upload_page' %}active{% endif %}">
-            📂 Загрузка данных
-        </a>
-        <a href="{{ url_for('accounts_page') }}"
-           class="nav-item {% if request.endpoint in ('accounts_page','account_create') %}active{% endif %}">
-            🧾 Лицевые счета
-        </a>
-        <a href="{{ url_for('users_page') }}"
-           class="nav-item {% if request.endpoint in ('users_page','user_create','user_delete') %}active{% endif %}">
-            👥 Пользователи
-        </a>
-        <a href="{{ url_for('ai_settings_page') }}"
-           class="nav-item {% if request.endpoint == 'ai_settings_page' %}active{% endif %}">
-            🤖 ИИ-помощник
-        </a>
-        <a href="{{ url_for('operator_chat_settings_page') }}"
-           class="nav-item {% if request.endpoint == 'operator_chat_settings_page' %}active{% endif %}">
-            🎧 Операторы и меню
-        </a>
-        <a href="{{ url_for('operator_chat_history_page') }}"
-           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_chat_history') %}active{% endif %}">
-            💬 История диалогов
-        </a>
-        <a href="{{ url_for('operator_reports_page') }}"
-           class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_report') %}active{% endif %}">
-            🚫 Жалобы на клиентов
-        </a>
+        <div class="nav-group{% if (request.endpoint in ('branches_page','branch_detail','branch_create','branch_update')) or (request.endpoint == 'upload_page') or (request.endpoint in ('accounts_page','account_create','account_unlink')) or (request.endpoint in ('residents_page','resident_detail','resident_change_ls','resident_reset_auth')) or (request.endpoint in ('users_page','user_create','user_delete')) %} open has-active{% endif %}" data-group="data">
+            <button type="button" class="nav-group-toggle" aria-expanded="{% if (request.endpoint in ('branches_page','branch_detail','branch_create','branch_update')) or (request.endpoint == 'upload_page') or (request.endpoint in ('accounts_page','account_create','account_unlink')) or (request.endpoint in ('residents_page','resident_detail','resident_change_ls','resident_reset_auth')) or (request.endpoint in ('users_page','user_create','user_delete')) %}true{% else %}false{% endif %}">
+                <span>🗂 Данные и доступ</span><span class="nav-caret">▾</span>
+            </button>
+            <div class="nav-group-items"><div class="nav-group-inner">
+            <a href="{{ url_for('branches_page') }}"
+               class="nav-item {% if request.endpoint in ('branches_page','branch_detail','branch_create','branch_update') %}active{% endif %}">
+                🏢 Филиалы
+            </a>
+            <a href="{{ url_for('upload_page') }}"
+               class="nav-item {% if request.endpoint == 'upload_page' %}active{% endif %}">
+                📂 Загрузка данных
+            </a>
+            <a href="{{ url_for('accounts_page') }}"
+               class="nav-item {% if request.endpoint in ('accounts_page','account_create','account_unlink') %}active{% endif %}">
+                🧾 Лицевые счета
+            </a>
+            <a href="{{ url_for('residents_page') }}"
+               class="nav-item {% if request.endpoint in ('residents_page','resident_detail','resident_change_ls','resident_reset_auth') %}active{% endif %}">
+                🧑‍🤝‍🧑 Жители бота
+            </a>
+            <a href="{{ url_for('users_page') }}"
+               class="nav-item {% if request.endpoint in ('users_page','user_create','user_delete') %}active{% endif %}">
+                👥 Пользователи
+            </a>
+            </div></div>
+        </div>
+        <div class="nav-group{% if (request.endpoint in ('broadcast_page','broadcast')) or (request.endpoint == 'ai_settings_page') or (request.endpoint == 'operator_chat_settings_page') %} open has-active{% endif %}" data-group="comms">
+            <button type="button" class="nav-group-toggle" aria-expanded="{% if (request.endpoint in ('broadcast_page','broadcast')) or (request.endpoint == 'ai_settings_page') or (request.endpoint == 'operator_chat_settings_page') %}true{% else %}false{% endif %}">
+                <span>📢 Коммуникации</span><span class="nav-caret">▾</span>
+            </button>
+            <div class="nav-group-items"><div class="nav-group-inner">
+            <a href="{{ url_for('broadcast_page') }}"
+               class="nav-item {% if request.endpoint in ('broadcast_page','broadcast') %}active{% endif %}">
+                📢 Рассылка (бот)
+            </a>
+            <a href="{{ url_for('ai_settings_page') }}"
+               class="nav-item {% if request.endpoint == 'ai_settings_page' %}active{% endif %}">
+                🤖 ИИ-помощник
+            </a>
+            <a href="{{ url_for('operator_chat_settings_page') }}"
+               class="nav-item {% if request.endpoint == 'operator_chat_settings_page' %}active{% endif %}">
+                🎧 Операторы и меню
+            </a>
+            </div></div>
+        </div>
+        <div class="nav-group{% if (request.endpoint and request.endpoint.startswith('operator_chat_history')) or (request.endpoint and request.endpoint.startswith('operator_report')) %} open has-active{% endif %}" data-group="control">
+            <button type="button" class="nav-group-toggle" aria-expanded="{% if (request.endpoint and request.endpoint.startswith('operator_chat_history')) or (request.endpoint and request.endpoint.startswith('operator_report')) %}true{% else %}false{% endif %}">
+                <span>💬 Контроль</span><span class="nav-caret">▾</span>
+            </button>
+            <div class="nav-group-items"><div class="nav-group-inner">
+            <a href="{{ url_for('operator_chat_history_page') }}"
+               class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_chat_history') %}active{% endif %}">
+                💬 История диалогов
+            </a>
+            <a href="{{ url_for('operator_reports_page') }}"
+               class="nav-item {% if request.endpoint and request.endpoint.startswith('operator_report') %}active{% endif %}">
+                🚫 Жалобы на клиентов
+            </a>
+            </div></div>
+        </div>
         {% endif %}
         <div class="nav-label">История</div>
         <a href="{{ url_for('legacy_list') }}"
@@ -267,6 +321,32 @@
             🗃 Архив
         </a>
     </nav>
+    <script id="nav-groups-script">
+    (function () {
+        var KEY = 'rso.nav.open';
+        var saved = {};
+        try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) {}
+        function setOpen(g, open) {
+            g.classList.toggle('open', open);
+            g.querySelector('.nav-group-toggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+        document.querySelectorAll('.sidebar .nav-group').forEach(function (g) {
+            var id = g.dataset.group;
+            var hasActive = !!g.querySelector('.nav-item.active');
+            g.classList.toggle('has-active', hasActive);
+            setOpen(g, hasActive || saved[id] === true);
+            g.querySelector('.nav-group-toggle').addEventListener('click', function () {
+                var open = !g.classList.contains('open');
+                setOpen(g, open);
+                saved[id] = open;
+                try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) {}
+            });
+        });
+        requestAnimationFrame(function () {
+            document.querySelector('.sidebar-nav').classList.add('nav-ready');
+        });
+    })();
+    </script>
     <div class="sidebar-user">
         <div class="user-avatar">{{ user.name[0] | upper }}</div>
         <div class="user-name">{{ user.name }}</div>

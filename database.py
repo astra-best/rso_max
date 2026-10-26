@@ -252,6 +252,32 @@ def init_db() -> None:
         (msk_now(),),
     )
 
+    # Журнал изменений привязок чата к ЛС: сценарии «Сменился лицевой счёт»
+    # и «Изменилась почта/пароль». Записи переживают удаление привязок, чтобы
+    # администратор видел, кто, когда и почему менял доступ жителя.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_user_account_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER NOT NULL,
+            event_type    TEXT NOT NULL CHECK(event_type IN
+                ('ls_replaced','ls_unlinked','auth_reset','self_unlink')),
+            reason        TEXT NOT NULL
+                CHECK(reason IN ('ls_changed','email_changed','password_changed',
+                                 'self_service')),
+            old_ls        TEXT,
+            new_ls        TEXT,
+            comment       TEXT,
+            actor_user_id INTEGER,
+            actor_name    TEXT,
+            notified      INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_bot_user_account_events_chat "
+        "ON bot_user_account_events(chat_id, id)"
+    )
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS pokazaniya (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1857,6 +1883,367 @@ def unlink_bot_user_account(chat_id: int, ls: str) -> bool:
         )
         conn.commit()
         return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ── Сценарии «Сменился ЛС» и «Изменилась почта/пароль» ───────────────────────
+
+ACCOUNT_EVENT_REASONS = {
+    "ls_changed": "Сменился лицевой счёт",
+    "email_changed": "Изменилась почта",
+    "password_changed": "Изменился пароль",
+    "self_service": "Действие жителя",
+}
+_ADMIN_RESET_REASONS = ("ls_changed", "email_changed", "password_changed")
+ACCOUNT_EVENT_TYPES = {
+    "ls_replaced": "ЛС заменён администратором",
+    "ls_unlinked": "ЛС отвязан администратором",
+    "auth_reset": "Авторизация сброшена",
+    "self_unlink": "Житель отвязал ЛС в боте",
+}
+_ACCOUNT_EVENT_COMMENT_MAX = 500
+_RESIDENT_SEARCH_MAX = 100
+
+_NOTICE_MENU = [[{"type": "callback", "text": "🏠 Главное меню", "payload": "main_menu"}]]
+_NOTICE_REPLACED = (
+    "ℹ️ Лицевой счёт {old_ls}, привязанный к этому чату, заменён на {new_ls}.\n"
+    "Если вы не обращались с такой просьбой, свяжитесь с контактным центром."
+)
+_NOTICE_UNLINKED = (
+    "ℹ️ Лицевой счёт {old_ls} отвязан от этого чата: лицевой счёт изменился.\n"
+    "Добавить новый номер можно в разделе «Мои лицевые счета» или через «Авторизоваться»."
+)
+_NOTICE_RESET = {
+    "ls_changed": (
+        "ℹ️ Привязки лицевых счетов к этому чату сняты: лицевой счёт изменился.\n"
+        "Чтобы продолжить, авторизуйтесь заново с новым номером."
+    ),
+    "email_changed": (
+        "🔐 Привязки лицевых счетов к этому чату сняты, потому что изменилась "
+        "контактная почта.\nДля продолжения авторизуйтесь заново."
+    ),
+    "password_changed": (
+        "🔐 Привязки лицевых счетов к этому чату сняты, потому что изменился "
+        "пароль от личного кабинета.\nДля продолжения авторизуйтесь заново."
+    ),
+}
+
+
+def _normalize_account_event_comment(comment: str | None) -> str | None:
+    normalized = unicodedata.normalize("NFC", (comment or "").strip())
+    if not normalized:
+        return None
+    if len(normalized) > _ACCOUNT_EVENT_COMMENT_MAX:
+        raise ValueError(
+            f"Комментарий не должен превышать {_ACCOUNT_EVENT_COMMENT_MAX} символов"
+        )
+    # Control/surrogate characters only: format characters (ZWJ etc.) are
+    # legitimate parts of emoji and must not be rejected.
+    if any(unicodedata.category(char) in {"Cc", "Cs"} for char in normalized):
+        raise ValueError("Комментарий содержит недопустимые символы")
+    return normalized
+
+
+def _residents_filter(query: str | None) -> tuple[str, tuple[str, ...]]:
+    normalized = (query or "").strip()[:_RESIDENT_SEARCH_MAX]
+    if not normalized:
+        return "", ()
+    escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    clause = (
+        " WHERE CAST(b.chat_id AS TEXT) LIKE ? ESCAPE '\\' OR EXISTS ("
+        "SELECT 1 FROM bot_user_accounts a JOIN licschet l ON l.number=a.ls "
+        "WHERE a.chat_id=b.chat_id AND (a.ls LIKE ? ESCAPE '\\' "
+        "OR l.fio LIKE ? ESCAPE '\\' OR l.address LIKE ? ESCAPE '\\'))"
+    )
+    return clause, (pattern,) * 4
+
+
+def count_residents(query: str | None = None) -> int:
+    """Count MAX users matching chat id or any bound account's directory data."""
+    clause, params = _residents_filter(query)
+    conn = get_conn()
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM bot_users b" + clause, params
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def list_residents(
+    query: str | None = None, *, limit: int = 50, offset: int = 0,
+) -> list[dict]:
+    """Return one page of MAX users with all of their durable account bindings."""
+    if limit < 1 or limit > 100:
+        raise ValueError("Размер страницы должен быть от 1 до 100")
+    if offset < 0:
+        raise ValueError("Смещение не может быть отрицательным")
+    clause, params = _residents_filter(query)
+    conn = get_conn()
+    try:
+        users = [dict(row) for row in conn.execute(
+            "SELECT b.chat_id, b.last_seen FROM bot_users b" + clause
+            + " ORDER BY b.last_seen IS NULL, b.last_seen DESC, b.chat_id "
+            "LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()]
+        if not users:
+            return users
+        ids = [user["chat_id"] for user in users]
+        placeholders = ",".join("?" for _ in ids)
+        bindings: dict[int, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT a.chat_id, a.ls, l.fio, l.address FROM bot_user_accounts a "
+            f"JOIN licschet l ON l.number=a.ls WHERE a.chat_id IN ({placeholders}) "
+            "ORDER BY a.chat_id, a.ls",
+            ids,
+        ).fetchall():
+            bindings.setdefault(row["chat_id"], []).append(dict(row))
+        for user in users:
+            user["accounts"] = bindings.get(user["chat_id"], [])
+        return users
+    finally:
+        conn.close()
+
+
+def list_bot_user_account_events(chat_id: int, limit: int = 50) -> list[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT * FROM bot_user_account_events WHERE chat_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (chat_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _insert_account_event(
+    conn: sqlite3.Connection, *, chat_id: int, event_type: str, reason: str,
+    old_ls: str | None, new_ls: str | None, comment: str | None,
+    actor_user_id: int | None, actor_name: str | None, notified: bool,
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO bot_user_account_events "
+        "(chat_id, event_type, reason, old_ls, new_ls, comment, actor_user_id, "
+        "actor_name, notified, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            chat_id, event_type, reason, old_ls, new_ls, comment, actor_user_id,
+            actor_name, int(notified), msk_now(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _enqueue_account_notice(
+    conn: sqlite3.Connection, *, event_id: int, chat_id: int, text: str,
+) -> None:
+    """Queue a bot message through the durable outbox drained by bot.py."""
+    conn.execute(
+        "INSERT OR IGNORE INTO operator_outbox "
+        "(event_key, dialog_id, chat_id, message_id, kind, body, buttons_json, "
+        "status, created_at) VALUES (?, NULL, ?, NULL, 'buttons', ?, ?, 'pending', ?)",
+        (
+            f"account_event:{event_id}", chat_id, text,
+            json.dumps(_NOTICE_MENU, ensure_ascii=False),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def _bound_accounts_locked(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    conn.execute("BEGIN IMMEDIATE")
+    if conn.execute(
+        "SELECT 1 FROM bot_users WHERE chat_id=?", (chat_id,)
+    ).fetchone() is None:
+        raise ValueError("Житель не найден")
+    return [
+        str(row["ls"]) for row in conn.execute(
+            "SELECT ls FROM bot_user_accounts WHERE chat_id=? ORDER BY ls", (chat_id,)
+        ).fetchall()
+    ]
+
+
+def _sync_last_used_ls(conn: sqlite3.Connection, chat_id: int) -> None:
+    """Keep the compatibility column consistent with the durable relation."""
+    current = conn.execute(
+        "SELECT b.ls FROM bot_users b JOIN bot_user_accounts a "
+        "ON a.chat_id=b.chat_id AND a.ls=b.ls WHERE b.chat_id=?",
+        (chat_id,),
+    ).fetchone()
+    if current is not None:
+        return
+    replacement = conn.execute(
+        "SELECT ls FROM bot_user_accounts WHERE chat_id=? ORDER BY created_at, ls LIMIT 1",
+        (chat_id,),
+    ).fetchone()
+    conn.execute(
+        "UPDATE bot_users SET ls=?, fio=NULL, authorized_1c=? WHERE chat_id=?",
+        (replacement["ls"] if replacement else None, 1 if replacement else 0, chat_id),
+    )
+
+
+def admin_replace_bot_user_account(
+    chat_id: int, old_ls: str, new_ls: str, *, actor_user_id: int | None,
+    actor_name: str | None, comment: str | None = None, notify: bool = True,
+) -> dict:
+    """«Сменился лицевой счёт»: swap one binding for a directory account.
+
+    The administrator has confirmed the resident's identity, so the new account
+    is usable immediately and the resident does not repeat the login.
+    """
+    normalized_new = normalize_lschet_number(new_ls)
+    old = (old_ls or "").strip()
+    normalized_comment = _normalize_account_event_comment(comment)
+    conn = get_conn()
+    try:
+        bound = _bound_accounts_locked(conn, chat_id)
+        if old not in bound:
+            raise ValueError("Этот лицевой счёт уже не привязан к жителю")
+        if normalized_new == old:
+            raise ValueError("Новый лицевой счёт совпадает с текущим")
+        if normalized_new in bound:
+            raise ValueError("Новый лицевой счёт уже привязан к жителю — просто отвяжите старый")
+        if conn.execute(
+            "SELECT 1 FROM licschet WHERE number=?", (normalized_new,)
+        ).fetchone() is None:
+            raise ValueError("Лицевой счёт не найден в справочнике")
+        conn.execute(
+            "DELETE FROM bot_user_accounts WHERE chat_id=? AND ls=?", (chat_id, old)
+        )
+        conn.execute(
+            "INSERT INTO bot_user_accounts(chat_id, ls, created_at) VALUES (?,?,?)",
+            (chat_id, normalized_new, msk_now()),
+        )
+        conn.execute(
+            "UPDATE bot_users SET ls=?, fio=NULL, authorized_1c=1 "
+            "WHERE chat_id=? AND (ls=? OR ls IS NULL OR ls='')",
+            (normalized_new, chat_id, old),
+        )
+        _sync_last_used_ls(conn, chat_id)
+        event_id = _insert_account_event(
+            conn, chat_id=chat_id, event_type="ls_replaced", reason="ls_changed",
+            old_ls=old, new_ls=normalized_new, comment=normalized_comment,
+            actor_user_id=actor_user_id, actor_name=actor_name, notified=notify,
+        )
+        if notify:
+            _enqueue_account_notice(
+                conn, event_id=event_id, chat_id=chat_id,
+                text=_NOTICE_REPLACED.format(old_ls=old, new_ls=normalized_new),
+            )
+        conn.commit()
+        return {"event_id": event_id, "old_ls": old, "new_ls": normalized_new}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def admin_unlink_bot_user_account(
+    chat_id: int, ls: str, *, actor_user_id: int | None, actor_name: str | None,
+    comment: str | None = None, notify: bool = True,
+) -> dict:
+    """«Сменился лицевой счёт»: drop one binding; the resident adds the new one."""
+    target = (ls or "").strip()
+    normalized_comment = _normalize_account_event_comment(comment)
+    conn = get_conn()
+    try:
+        bound = _bound_accounts_locked(conn, chat_id)
+        if target not in bound:
+            raise ValueError("Этот лицевой счёт уже не привязан к жителю")
+        conn.execute(
+            "DELETE FROM bot_user_accounts WHERE chat_id=? AND ls=?", (chat_id, target)
+        )
+        _sync_last_used_ls(conn, chat_id)
+        event_id = _insert_account_event(
+            conn, chat_id=chat_id, event_type="ls_unlinked", reason="ls_changed",
+            old_ls=target, new_ls=None, comment=normalized_comment,
+            actor_user_id=actor_user_id, actor_name=actor_name, notified=notify,
+        )
+        if notify:
+            _enqueue_account_notice(
+                conn, event_id=event_id, chat_id=chat_id,
+                text=_NOTICE_UNLINKED.format(old_ls=target),
+            )
+        conn.commit()
+        return {"event_id": event_id, "old_ls": target}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def admin_reset_bot_user_auth(
+    chat_id: int, reason: str, *, actor_user_id: int | None,
+    actor_name: str | None, comment: str | None = None, notify: bool = True,
+) -> dict:
+    """«Изменилась почта/пароль»: revoke every binding of the chat.
+
+    Appeals, readings and other history stay; every account-dependent action
+    asks the resident to authorize again.
+    """
+    if reason not in _ADMIN_RESET_REASONS:
+        raise ValueError("Укажите причину сброса авторизации")
+    normalized_comment = _normalize_account_event_comment(comment)
+    conn = get_conn()
+    try:
+        bound = _bound_accounts_locked(conn, chat_id)
+        if not bound:
+            raise ValueError("У жителя нет привязанных лицевых счетов")
+        conn.execute("DELETE FROM bot_user_accounts WHERE chat_id=?", (chat_id,))
+        conn.execute(
+            "UPDATE bot_users SET ls=NULL, fio=NULL, authorized_1c=0 WHERE chat_id=?",
+            (chat_id,),
+        )
+        event_id = _insert_account_event(
+            conn, chat_id=chat_id, event_type="auth_reset", reason=reason,
+            old_ls=", ".join(bound), new_ls=None, comment=normalized_comment,
+            actor_user_id=actor_user_id, actor_name=actor_name, notified=notify,
+        )
+        if notify:
+            _enqueue_account_notice(
+                conn, event_id=event_id, chat_id=chat_id, text=_NOTICE_RESET[reason],
+            )
+        conn.commit()
+        return {"event_id": event_id, "old_ls": bound}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def self_unlink_bot_user_account(chat_id: int, ls: str) -> bool:
+    """The resident removes one of their own bindings from the bot (logged)."""
+    target = (ls or "").strip()
+    conn = get_conn()
+    try:
+        try:
+            bound = _bound_accounts_locked(conn, chat_id)
+        except ValueError:  # unknown MAX user: nothing of theirs to unlink
+            conn.rollback()
+            return False
+        if target not in bound:
+            conn.rollback()
+            return False
+        conn.execute(
+            "DELETE FROM bot_user_accounts WHERE chat_id=? AND ls=?", (chat_id, target)
+        )
+        _sync_last_used_ls(conn, chat_id)
+        _insert_account_event(
+            conn, chat_id=chat_id, event_type="self_unlink", reason="self_service",
+            old_ls=target, new_ls=None, comment=None, actor_user_id=None,
+            actor_name=None, notified=False,
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
