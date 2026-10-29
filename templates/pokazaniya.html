@@ -25,18 +25,14 @@
     .filter-row input:focus { border-color: var(--accent); }
 
     .value-cell { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--accent); }
-    .prev-cell { font-size: 11px; color: var(--muted); }
-    .diff-pos { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--success); }
-    .diff-neg { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--error); }
-    .diff-none { font-size: 11px; color: var(--muted); }
+    .message-cell { font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word; max-width: 280px; }
 
     .badge-resource { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 600; }
     .badge-electric { background: rgba(255,183,0,0.15); color: #ffb700; }
     .badge-hot { background: rgba(255,77,109,0.15); color: #ff4d6d; }
     .badge-cold { background: rgba(0,200,255,0.15); color: #00c8ff; }
 
-    .two-values { display: flex; flex-direction: column; gap: 2px; }
-    .two-values .lbl { color: var(--muted); font-size: 10px; margin-right: 4px; }
+    .value-lines { display: flex; flex-direction: column; gap: 2px; }
     .empty { text-align: center; padding: 60px; color: var(--muted); font-size: 13px; }
 </style>
 {% endblock %}
@@ -54,39 +50,32 @@
     <button class="clear-btn" onclick="clearAll()">✕ Сбросить</button>
 </div>
 <div class="results-count" id="resultsCount"></div>
+{% if rows|length >= limit %}
+<div class="results-count">Показаны последние {{ limit }} показаний.</div>
+{% endif %}
 
 <div class="table-wrap">
     <table class="table">
         <thead>
             <tr>
                 <th class="sortable" onclick="sortTable(0)" data-type="num">№</th>
-                <th class="sortable" onclick="sortTable(1)" data-type="str">Лицевой счёт</th>
-                <th class="sortable" onclick="sortTable(2)" data-type="str">Ресурс</th>
-                <th class="sortable" onclick="sortTable(3)" data-type="str">№ счётчика</th>
-                <th class="sortable" onclick="sortTable(4)" data-type="num">Показания</th>
-                {% if integration_1c_enabled %}
-                <th class="sortable" onclick="sortTable(5)" data-type="str">Статус 1С</th>
-                <th class="sortable" onclick="sortTable(6)" data-type="date">Дата и время</th>
-                {% else %}
-                <th class="sortable" onclick="sortTable(5)" data-type="num">Предыдущие</th>
-                <th class="sortable" onclick="sortTable(6)" data-type="num">Разница</th>
-                <th class="sortable" onclick="sortTable(7)" data-type="date">Дата и время</th>
-                {% endif %}
+                <th class="sortable" onclick="sortTable(1)" data-type="date">Дата и время</th>
+                <th class="sortable" onclick="sortTable(2)" data-type="str">Лицевой счёт</th>
+                <th class="sortable" onclick="sortTable(3)" data-type="str">Ресурс</th>
+                <th class="sortable" onclick="sortTable(4)" data-type="str">№ счётчика</th>
+                <th class="sortable" onclick="sortTable(5)" data-type="str">Показания</th>
+                <th class="sortable" onclick="sortTable(6)" data-type="str">Статус 1С</th>
+                <th class="sortable" onclick="sortTable(7)" data-type="str">Сообщение 1С</th>
             </tr>
             <tr class="filter-row">
                 <th><input id="f0" placeholder="№" oninput="applyFilters()"></th>
-                <th><input id="f1" placeholder="ЛС" oninput="applyFilters()"></th>
-                <th><input id="f2" placeholder="Ресурс" oninput="applyFilters()"></th>
-                <th><input id="f3" placeholder="Счётчик" oninput="applyFilters()"></th>
-                <th><input id="f4" placeholder="Показания" oninput="applyFilters()"></th>
-                {% if integration_1c_enabled %}
-                <th><input id="f5" placeholder="Статус 1С" oninput="applyFilters()"></th>
-                <th><input id="f6" placeholder="Дата" oninput="applyFilters()"></th>
-                {% else %}
-                <th><input id="f5" placeholder="Предыдущие" oninput="applyFilters()"></th>
-                <th><input id="f6" placeholder="Разница" oninput="applyFilters()"></th>
-                <th><input id="f7" placeholder="Дата" oninput="applyFilters()"></th>
-                {% endif %}
+                <th><input id="f1" placeholder="Дата" oninput="applyFilters()"></th>
+                <th><input id="f2" placeholder="ЛС" oninput="applyFilters()"></th>
+                <th><input id="f3" placeholder="Ресурс" oninput="applyFilters()"></th>
+                <th><input id="f4" placeholder="Счётчик" oninput="applyFilters()"></th>
+                <th><input id="f5" placeholder="Показания" oninput="applyFilters()"></th>
+                <th><input id="f6" placeholder="Статус 1С" oninput="applyFilters()"></th>
+                <th><input id="f7" placeholder="Сообщение" oninput="applyFilters()"></th>
             </tr>
         </thead>
         <tbody id="tableBody">
@@ -94,84 +83,43 @@
                 {% for r in rows %}
                 <tr>
                     <td>{{ r['id'] }}</td>
+                    <td><span class="text-muted small">{{ r['created_at'] or '—' }}</span></td>
                     <td>{{ r['ls'] }}</td>
                     <td>
-                        {% if r['resource_type'] == 'Электроэнергия' %}
-                            <span class="badge-resource badge-electric">⚡ {{ r['resource_type'] }}</span>
-                        {% elif r['resource_type'] == 'Горячая вода' %}
-                            <span class="badge-resource badge-hot">🔥 {{ r['resource_type'] }}</span>
-                        {% elif r['resource_type'] == 'Холодная вода' %}
-                            <span class="badge-resource badge-cold">💧 {{ r['resource_type'] }}</span>
+                        {% if r['resource'] == 'Электроэнергия' %}
+                            <span class="badge-resource badge-electric">⚡ {{ r['resource'] }}</span>
+                        {% elif r['resource'] == 'Горячая вода' %}
+                            <span class="badge-resource badge-hot">🔥 {{ r['resource'] }}</span>
+                        {% elif r['resource'] == 'Холодная вода' %}
+                            <span class="badge-resource badge-cold">💧 {{ r['resource'] }}</span>
                         {% else %}
-                            {{ r['resource_type'] or '—' }}
+                            {{ r['resource'] or '—' }}
                         {% endif %}
                     </td>
                     <td>{{ r['meter_number'] or '—' }}</td>
                     <td>
-                        {% if r['value2'] %}
-                            <div class="two-values">
-                                <div><span class="lbl">Т1:</span><span class="value-cell">{{ r['value1'] }}</span></div>
-                                <div><span class="lbl">Т2:</span><span class="value-cell">{{ r['value2'] }}</span></div>
-                            </div>
-                        {% else %}
-                            <span class="value-cell">{{ r['value1'] }}</span>
-                        {% endif %}
-                    </td>
-                    {% if integration_1c_enabled %}
-                    <td>
-                        {% if r['status_1c'] == 'accepted' %}
-                            <span class="badge badge-success">Принято</span>
-                        {% elif r['status_1c'] == 'rejected' %}
-                            <span class="badge badge-danger">Отклонено</span>
-                        {% else %}
-                            <span class="badge badge-warning">Ожидает</span>
-                        {% endif %}
-                    </td>
-                    {% else %}
-                    <td>
-                        {% if r['prev_value1'] %}
-                            {% if r['prev_value2'] %}
-                                <div class="two-values">
-                                    <div><span class="lbl">Т1:</span><span class="prev-cell">{{ r['prev_value1'] }}</span></div>
-                                    <div><span class="lbl">Т2:</span><span class="prev-cell">{{ r['prev_value2'] }}</span></div>
-                                </div>
-                            {% else %}
-                                <span class="prev-cell">{{ r['prev_value1'] }}</span>
-                            {% endif %}
-                        {% else %}
-                            <span class="diff-none">—</span>
-                        {% endif %}
+                        <div class="value-lines">
+                            {% for line in r['value_lines'] %}
+                            <div><span class="value-cell">{{ line }}</span></div>
+                            {% endfor %}
+                        </div>
                     </td>
                     <td>
-                        {% if r['diff1'] is not none %}
-                            {% if r['value2'] and r['diff2'] is not none %}
-                                <div class="two-values">
-                                    <div><span class="lbl">Т1:</span>
-                                        <span class="{{ 'diff-pos' if r['diff1'] >= 0 else 'diff-neg' }}">
-                                            {{ '+' if r['diff1'] > 0 else '' }}{{ r['diff1'] }}
-                                        </span>
-                                    </div>
-                                    <div><span class="lbl">Т2:</span>
-                                        <span class="{{ 'diff-pos' if r['diff2'] >= 0 else 'diff-neg' }}">
-                                            {{ '+' if r['diff2'] > 0 else '' }}{{ r['diff2'] }}
-                                        </span>
-                                    </div>
-                                </div>
-                            {% else %}
-                                <span class="{{ 'diff-pos' if r['diff1'] >= 0 else 'diff-neg' }}">
-                                    {{ '+' if r['diff1'] > 0 else '' }}{{ r['diff1'] }}
-                                </span>
-                            {% endif %}
+                        {% if r['status'] == 'SUCCESS' %}
+                            <span class="badge badge-success">{{ r['status_label'] }}</span>
+                        {% elif r['status'] == 'ERROR' %}
+                            <span class="badge badge-danger">{{ r['status_label'] }}</span>
+                        {% elif r['status'] == 'PENDING' %}
+                            <span class="badge badge-warning">{{ r['status_label'] }}</span>
                         {% else %}
-                            <span class="diff-none">Первичные</span>
+                            <span class="badge badge-secondary">{{ r['status_label'] }}</span>
                         {% endif %}
                     </td>
-                    {% endif %}
-                    <td><span class="text-muted small">{{ r['created_at'][:16] if r['created_at'] else '—' }}</span></td>
+                    <td><div class="message-cell">{{ r['message'] or '' }}</div></td>
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="{{ 7 if integration_1c_enabled else 8 }}"><div class="empty">Показания пока не передавались</div></td></tr>
+                <tr><td colspan="8"><div class="empty">Показания пока не передавались</div></td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -181,7 +129,7 @@
 {% block scripts %}
 <script>
     let sortCol = -1, sortDir = 1;
-    const columnCount = {{ 7 if integration_1c_enabled else 8 }};
+    const columnCount = 8;
 
     function applyFilters() {
         const global = document.getElementById('globalSearch').value.toLowerCase();
@@ -193,7 +141,7 @@
         let visible = 0;
         rows.forEach(row => {
             const cells = row.querySelectorAll('td');
-            if (!cells.length) return;
+            if (cells.length < columnCount) return;
             const texts = Array.from(cells).map(c => c.textContent.toLowerCase().trim());
             const all = texts.join(' ');
             if (global && !all.includes(global)) { row.style.display = 'none'; return; }
@@ -203,7 +151,7 @@
             row.style.display = '';
             visible++;
         });
-        const total = document.querySelectorAll('#tableBody tr td').length ? rows.length : 0;
+        const total = Array.from(rows).filter(r => r.querySelectorAll('td').length >= columnCount).length;
         document.getElementById('resultsCount').textContent =
             visible === total ? `Показано: ${visible}` : `Показано: ${visible} из ${total}`;
     }
@@ -212,8 +160,8 @@
         if (!str || str === '—') return new Date(0);
         const [d, t] = str.trim().split(' ');
         const [y, m, dd] = d.split('-').map(Number);
-        const [hh, mm] = (t || '00:00').split(':').map(Number);
-        return new Date(y, m - 1, dd, hh, mm);
+        const [hh, mm, ss] = (t || '00:00:00').split(':').map(Number);
+        return new Date(y, m - 1, dd, hh, mm, ss || 0);
     }
 
     function sortTable(col) {

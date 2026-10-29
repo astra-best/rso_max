@@ -23,8 +23,9 @@ class S:
     OPERATOR_CHAT = "operator_chat"
 
     METER_SELECT = "meter_select"
-    WAITING_VALUE1 = "waiting_value1"
-    WAITING_VALUE2 = "waiting_value2"
+    # Ожидается значение для очередной пары «шкала, зона»; какая именно —
+    # определяется числом уже введённых значений (meter_values).
+    WAITING_VALUE = "waiting_value"
     CONFIRM_POKAZANIYA = "confirm_pokazaniya"
 
     APPOINTMENT_BRANCH = "appointment_branch"
@@ -41,8 +42,7 @@ FLOW_KEYS = (
     "reopen_appeal_id",
     "meters",
     "meter_idx",
-    "new_value1",
-    "new_value2",
+    "meter_values",
     "appt_branch_id",
     "appt_date",
     "appt_time",
@@ -60,4 +60,4 @@ FLOW_KEYS = (
     "faq_terminal",
 )
 
-METER_INPUT_KEYS = ("new_value1", "new_value2")
+METER_INPUT_KEYS = ("meter_values",)

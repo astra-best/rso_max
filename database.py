@@ -24,7 +24,10 @@ import os
 import re
 import sqlite3
 import unicodedata
+import uuid
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
@@ -39,6 +42,16 @@ from config import (
     LOG_MAX_BYTES,
     TICKET_PREFIX,
     TIMEZONE_OFFSET,
+)
+from rso_bot.reading_values import (
+    SAVE_METER_CHANGED,
+    SAVE_OK,
+    SAVE_TOO_LOW,
+    format_reading,
+    json_reading,
+    max_reading,
+    reading_decimal,
+    reading_error,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -207,6 +220,70 @@ def init_db() -> None:
             address TEXT
         )
     """)
+    _ensure_column(c, "licschet", "one_c_id", "TEXT")
+    _ensure_column(c, "licschet", "room_key_id", "TEXT")
+    duplicate_external_id_groups = c.execute(
+        "SELECT COUNT(*) FROM ("
+        "SELECT one_c_id FROM licschet WHERE one_c_id IS NOT NULL AND one_c_id<>'' "
+        "GROUP BY one_c_id HAVING COUNT(*)>1)"
+    ).fetchone()[0]
+    if duplicate_external_id_groups:
+        log.error(
+            "Detected %s duplicate legacy PersonalAccountID groups; "
+            "preserving rows and skipping unique index",
+            duplicate_external_id_groups,
+        )
+    else:
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_licschet_one_c_id "
+            "ON licschet(one_c_id) WHERE one_c_id IS NOT NULL AND one_c_id<>''"
+        )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            one_c_id TEXT UNIQUE NOT NULL,
+            licschet_id INTEGER NOT NULL REFERENCES licschet(id) ON DELETE CASCADE,
+            name TEXT,
+            resource_id TEXT,
+            resource_name TEXT
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_metering_points_licschet "
+        "ON metering_points(licschet_id)"
+    )
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_meters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            one_c_id TEXT UNIQUE NOT NULL,
+            metering_point_id INTEGER NOT NULL REFERENCES metering_points(id) ON DELETE CASCADE,
+            meter_number TEXT,
+            differentiation_type_id TEXT,
+            meter_type TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_meter_scales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meter_id INTEGER NOT NULL REFERENCES metering_meters(id) ON DELETE CASCADE,
+            one_c_id TEXT NOT NULL,
+            name TEXT,
+            UNIQUE(meter_id, one_c_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS metering_tariff_zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scale_id INTEGER NOT NULL REFERENCES metering_meter_scales(id) ON DELETE CASCADE,
+            one_c_id TEXT NOT NULL,
+            name TEXT,
+            UNIQUE(scale_id, one_c_id)
+        )
+    """)
+    # Последнее показание зоны из выгрузки 1С (нормализованное число, NULL — нет).
+    _ensure_column(c, "metering_tariff_zones", "reading", "TEXT")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_metering_meters_point ON metering_meters(metering_point_id)")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS schetchiki (
@@ -278,6 +355,68 @@ def init_db() -> None:
         WHERE chat_id=0 AND created_at='2000-01-01 00:00' AND sent_to_1c=0
           AND batch_id IS NULL
     """)
+    # pokazaniya — архив старого формата (value1/value2): бот в неё больше не
+    # пишет. Промежуточная таблица pokazaniya_values не выходила за пределы
+    # ветки разработки; колонка pokazaniya.meter_one_c_id в локальных БД
+    # остаётся неиспользуемой.
+    c.execute("DROP TABLE IF EXISTS pokazaniya_values")
+
+    # Показания по приборам из выгрузки 1С. Одна строка — одна задача обмена
+    # (TaskID) с 1С. GUID и названия — снимок на момент подачи, без FK на
+    # таблицы metering_*: история не теряется при изменениях в 1С.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meter_readings (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id             TEXT NOT NULL UNIQUE,
+            created_at          TEXT NOT NULL,
+            chat_id             INTEGER,
+            ls                  TEXT NOT NULL,
+            personal_account_id TEXT NOT NULL,
+            room_key_id         TEXT NOT NULL,
+            metering_point_id   TEXT NOT NULL,
+            meter_id            TEXT NOT NULL,
+            resource            TEXT,
+            meter_number        TEXT
+        )
+    """)
+    # Поиск предыдущего показания идёт по прибору от новых к старым.
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_readings_meter "
+        "ON meter_readings(meter_id, id)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_readings_created "
+        "ON meter_readings(created_at)"
+    )
+    # UNIQUE(reading_id, scale_id, zone_id) одновременно служит индексом
+    # для поиска значения пары внутри конкретного показания.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meter_reading_values (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            reading_id INTEGER NOT NULL REFERENCES meter_readings(id) ON DELETE CASCADE,
+            scale_id   TEXT NOT NULL,
+            scale_name TEXT,
+            zone_id    TEXT NOT NULL,
+            zone_name  TEXT,
+            value      TEXT NOT NULL,
+            UNIQUE (reading_id, scale_id, zone_id)
+        )
+    """)
+    # Статус обмена с 1С. Нет строки — показание ещё не отправлено в 1С.
+    # Заполняется отправкой показаний (отдельная доработка); правило
+    # предыдущего показания уже не учитывает строки со статусом ERROR.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meter_reading_status (
+            reading_id INTEGER PRIMARY KEY REFERENCES meter_readings(id) ON DELETE CASCADE,
+            status     TEXT NOT NULL CHECK (status IN ('PENDING','SUCCESS','ERROR')),
+            message    TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_reading_status_pending "
+        "ON meter_reading_status(reading_id) WHERE status='PENDING'"
+    )
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS sync_1c_state (
@@ -1364,6 +1503,11 @@ def add_pokazaniya(
         conn.close()
 
 
+def reading_value_label(scale_name: str | None, zone_name: str | None) -> str:
+    """Подпись пары «Шкала, Зона»; пустые названия из 1С заменяются общими."""
+    return f"{scale_name or 'Шкала'}, {zone_name or 'Зона'}"
+
+
 def get_pokazaniya() -> list[sqlite3.Row]:
     conn = get_conn()
     rows = conn.execute("SELECT * FROM pokazaniya ORDER BY id DESC").fetchall()
@@ -1381,35 +1525,277 @@ def get_last_pokazaniya(ls: str, meter_number: str) -> sqlite3.Row | None:
     return row
 
 
-def get_pokazaniya_with_prev() -> list[dict]:
-    """
-    Показания с предыдущими значениями и разницей (для таблицы в портале).
-    Использует оконные функции LAG — один запрос вместо N+1.
-    """
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT *,
-               LAG(value1) OVER (PARTITION BY ls, meter_number ORDER BY id) AS prev_value1,
-               LAG(value2) OVER (PARTITION BY ls, meter_number ORDER BY id) AS prev_value2
-        FROM pokazaniya
-        ORDER BY id DESC
-    """).fetchall()
-    conn.close()
+# ── Показания по приборам 1С ──────────────────────────────────────────────────
+#
+# meter_readings — одна строка на подтверждённое показание прибора (задача
+# обмена с 1С, TaskID); meter_reading_values — значения по парам «шкала,
+# тарифная зона»; meter_reading_status — статус обработки в 1С (нет строки —
+# показание ещё не отправлено). Отправка в 1С и запись статусов — отдельная
+# доработка; пока статусы никто не пишет.
 
+_METER_READING_STATUS_LABELS = {
+    None: "Не отправлено",
+    "PENDING": "В обработке",
+    "SUCCESS": "Принято",
+    "ERROR": "Ошибка",
+}
+
+
+def _local_now_seconds() -> str:
+    """Текущее время в настроенном часовом поясе ('YYYY-MM-DD HH:MM:SS')."""
+    tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _meter_pairs_conn(conn: sqlite3.Connection, meter_pk: int) -> list[sqlite3.Row]:
+    """Пары «шкала, зона» прибора в порядке импорта вместе с показанием 1С."""
+    return conn.execute(
+        "SELECT s.one_c_id AS scale_id, s.name AS scale_name, "
+        "z.one_c_id AS zone_id, z.name AS zone_name, z.reading "
+        "FROM metering_meter_scales s "
+        "JOIN metering_tariff_zones z ON z.scale_id=s.id "
+        "WHERE s.meter_id=? ORDER BY s.id, z.id",
+        (meter_pk,),
+    ).fetchall()
+
+
+def _latest_own_value_conn(
+    conn: sqlite3.Connection, meter_id: str, scale_id: str, zone_id: str
+) -> str | None:
+    """Значение пары из последнего (по id) показания прибора, кроме отклонённых 1С.
+
+    Индекс ix_meter_readings_meter(meter_id, id) задаёт обход показаний
+    прибора от новых к старым, UNIQUE(reading_id, scale_id, zone_id) —
+    поиск значения пары в каждом из них.
+    """
+    row = conn.execute(
+        "SELECT v.value FROM meter_readings r "
+        "JOIN meter_reading_values v "
+        "ON v.reading_id=r.id AND v.scale_id=? AND v.zone_id=? "
+        "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+        "WHERE r.meter_id=? AND (st.status IS NULL OR st.status<>'ERROR') "
+        "ORDER BY r.id DESC LIMIT 1",
+        (scale_id, zone_id, meter_id),
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def _previous_values_conn(
+    conn: sqlite3.Connection, meter_id: str, pairs: Sequence[Mapping]
+) -> dict[tuple[str, str], str | None]:
+    """Предыдущее показание каждой пары: максимум из нашего и из выгрузки 1С."""
+    return {
+        (pair["scale_id"], pair["zone_id"]): max_reading(
+            pair["reading"],
+            _latest_own_value_conn(conn, meter_id, pair["scale_id"], pair["zone_id"]),
+        )
+        for pair in pairs
+    }
+
+
+def get_1c_meters_with_zones(ls: str) -> list[dict]:
+    """
+    Приборы учёта ЛС из выгрузки 1С с парами «шкала, тарифная зона» для бота.
+
+    Порядок — порядок импорта: приборы по metering_meters.id, внутри прибора
+    все зоны первой шкалы, затем следующей (metering_meter_scales.id,
+    metering_tariff_zones.id). Приборы без единой пары не возвращаются:
+    вводить по ним нечего. Счётчики из schetchiki сюда не входят.
+    У каждой пары previous — предыдущее показание (или None).
+    """
+    try:
+        number = normalize_lschet_number(ls)
+    except ValueError:
+        return []
+    conn = get_conn()
+    try:
+        meter_rows = conn.execute(
+            "SELECT m.id AS meter_pk, m.one_c_id AS meter_one_c_id, "
+            "p.resource_name AS resource_type, m.meter_number, m.meter_type "
+            "FROM licschet l "
+            "JOIN metering_points p ON p.licschet_id=l.id "
+            "JOIN metering_meters m ON m.metering_point_id=p.id "
+            "WHERE l.number=? ORDER BY m.id",
+            (number,),
+        ).fetchall()
+        meters = []
+        for row in meter_rows:
+            pairs = _meter_pairs_conn(conn, row["meter_pk"])
+            if not pairs:
+                continue
+            previous = _previous_values_conn(conn, row["meter_one_c_id"], pairs)
+            meters.append({
+                "meter_one_c_id": row["meter_one_c_id"],
+                "resource_type": row["resource_type"],
+                "meter_number": row["meter_number"],
+                "meter_type": row["meter_type"],
+                "zones": [
+                    {
+                        "scale_one_c_id": pair["scale_id"],
+                        "scale_name": pair["scale_name"],
+                        "zone_one_c_id": pair["zone_id"],
+                        "zone_name": pair["zone_name"],
+                        "label": reading_value_label(pair["scale_name"], pair["zone_name"]),
+                        "previous": previous[(pair["scale_id"], pair["zone_id"])],
+                    }
+                    for pair in pairs
+                ],
+            })
+        return meters
+    finally:
+        conn.close()
+
+
+def save_meter_reading(
+    chat_id: int,
+    ls: str,
+    meter_id: str,
+    values: Sequence[Mapping],
+) -> dict:
+    """
+    Сохраняет подтверждённое показание прибора одной транзакцией.
+
+    values — элементы с ключами scale_id, zone_id, value (нормализованная
+    строка) в порядке ввода. Под BEGIN IMMEDIATE заново проверяется, что
+    прибор по-прежнему относится к точке учёта выбранного ЛС и набор пар
+    «шкала, зона» совпадает с введённым, а затем — что ни одно значение не
+    меньше предыдущего. GUID ЛС, помещения, точки учёта и названия берутся
+    из этого чтения, а не из сессии бота.
+
+    Возвращает {"status": SAVE_OK, "task_id", "reading_id"},
+    {"status": SAVE_METER_CHANGED} или {"status": SAVE_TOO_LOW, "scale_id",
+    "zone_id", "previous_value", "previous"}; в двух последних случаях
+    ничего не записывается.
+    """
+    try:
+        number = normalize_lschet_number(ls)
+    except ValueError:
+        return {"status": SAVE_METER_CHANGED}
+    entered = []
+    for item in values:
+        value = reading_decimal(item.get("value"))
+        if value is None or reading_error(value) is not None:
+            raise ValueError("Некорректное значение показания")
+        entered.append((item["scale_id"], item["zone_id"], value))
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        meter = conn.execute(
+            "SELECT l.one_c_id AS personal_account_id, l.room_key_id, "
+            "p.one_c_id AS metering_point_id, p.resource_name, "
+            "m.id AS meter_pk, m.meter_number "
+            "FROM licschet l "
+            "JOIN metering_points p ON p.licschet_id=l.id "
+            "JOIN metering_meters m ON m.metering_point_id=p.id "
+            "WHERE l.number=? AND m.one_c_id=?",
+            (number, meter_id),
+        ).fetchone()
+        pairs = _meter_pairs_conn(conn, meter["meter_pk"]) if meter else []
+        current = {(pair["scale_id"], pair["zone_id"]): pair for pair in pairs}
+        keys = [(scale_id, zone_id) for scale_id, zone_id, _ in entered]
+        if (
+            meter is None
+            or not meter["personal_account_id"]
+            or not keys
+            or len(set(keys)) != len(keys)
+            or set(keys) != set(current)
+        ):
+            conn.rollback()
+            return {"status": SAVE_METER_CHANGED}
+
+        previous = _previous_values_conn(conn, meter_id, pairs)
+        for scale_id, zone_id, value in entered:
+            previous_value = reading_decimal(previous[(scale_id, zone_id)])
+            if previous_value is not None and value < previous_value:
+                conn.rollback()
+                return {
+                    "status": SAVE_TOO_LOW,
+                    "scale_id": scale_id,
+                    "zone_id": zone_id,
+                    "previous_value": format_reading(previous_value),
+                    "previous": previous,
+                }
+
+        task_id = str(uuid.uuid4())
+        cursor = conn.execute(
+            "INSERT INTO meter_readings (task_id, created_at, chat_id, ls, "
+            "personal_account_id, room_key_id, metering_point_id, meter_id, "
+            "resource, meter_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, _local_now_seconds(), chat_id, number,
+                meter["personal_account_id"],
+                meter["room_key_id"] or _EMPTY_1C_GUID,
+                meter["metering_point_id"], meter_id,
+                meter["resource_name"], meter["meter_number"],
+            ),
+        )
+        reading_id = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO meter_reading_values "
+            "(reading_id, scale_id, scale_name, zone_id, zone_name, value) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    reading_id, scale_id, current[(scale_id, zone_id)]["scale_name"],
+                    zone_id, current[(scale_id, zone_id)]["zone_name"],
+                    format_reading(value),
+                )
+                for scale_id, zone_id, value in entered
+            ],
+        )
+        conn.commit()
+        return {"status": SAVE_OK, "task_id": task_id, "reading_id": reading_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _values_by_reading(
+    conn: sqlite3.Connection, reading_ids: Sequence[int]
+) -> dict[int, list[sqlite3.Row]]:
+    """Значения показаний по id; диапазон вместо IN — без лимита параметров."""
+    result: dict[int, list[sqlite3.Row]] = {reading_id: [] for reading_id in reading_ids}
+    if not reading_ids:
+        return result
+    rows = conn.execute(
+        "SELECT * FROM meter_reading_values WHERE reading_id BETWEEN ? AND ? "
+        "ORDER BY reading_id, id",
+        (min(reading_ids), max(reading_ids)),
+    ).fetchall()
+    for row in rows:
+        if row["reading_id"] in result:
+            result[row["reading_id"]].append(row)
+    return result
+
+
+def list_meter_readings(limit: int = 1000) -> list[dict]:
+    """Последние показания с значениями и статусом 1С (для портала)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT r.*, st.status, st.message FROM meter_readings r "
+            "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+            "ORDER BY r.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        values = _values_by_reading(conn, [row["id"] for row in rows])
+    finally:
+        conn.close()
     result = []
-    for r in rows:
-        r = dict(r)
-        try:
-            r["diff1"] = round(float(r["value1"]) - float(r["prev_value1"]), 2) \
-                if r["prev_value1"] is not None else None
-        except (TypeError, ValueError):
-            r["diff1"] = None
-        try:
-            r["diff2"] = round(float(r["value2"]) - float(r["prev_value2"]), 2) \
-                if r["value2"] is not None and r["prev_value2"] is not None else None
-        except (TypeError, ValueError):
-            r["diff2"] = None
-        result.append(r)
+    for row in rows:
+        item = dict(row)
+        item["value_lines"] = [
+            f"{reading_value_label(value['scale_name'], value['zone_name'])}: "
+            f"{value['value']}"
+            for value in values[row["id"]]
+        ]
+        item["status_label"] = _METER_READING_STATUS_LABELS.get(
+            row["status"], row["status"]
+        )
+        result.append(item)
     return result
 
 
@@ -1910,10 +2296,488 @@ def get_ls(number: str) -> sqlite3.Row | None:
 
 
 def get_schetchiki(ls: str) -> list[sqlite3.Row]:
+    """Счётчики ЛС: приборы из выгрузки 1С, затем старые из schetchiki.
+
+    meter_type у приборов 1С — название типа дифференциации из выгрузки.
+    """
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM schetchiki WHERE ls=?", (ls,)).fetchall()
-    conn.close()
-    return rows
+    try:
+        account = conn.execute(
+            "SELECT id FROM licschet WHERE number=?", (normalize_lschet_number(ls),)
+        ).fetchone()
+        imported = []
+        if account:
+            imported = conn.execute(
+                "SELECT p.resource_name AS resource_type, m.meter_number, "
+                "m.meter_type, '0' AS initial1, '0' AS initial2 "
+                "FROM metering_points p "
+                "JOIN metering_meters m ON m.metering_point_id=p.id "
+                "WHERE p.licschet_id=? ORDER BY m.id",
+                (account["id"],),
+            ).fetchall()
+        legacy = conn.execute(
+            "SELECT * FROM schetchiki WHERE ls=? ORDER BY id", (ls,)
+        ).fetchall()
+        imported_numbers = {row["meter_number"] for row in imported}
+        return list(imported) + [
+            row for row in legacy if row["meter_number"] not in imported_numbers
+        ]
+    finally:
+        conn.close()
+
+
+_EMPTY_1C_GUID = "00000000-0000-0000-0000-000000000000"
+_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+_ONE_C_LOG_VALUE_MAX_LENGTH = 80
+
+
+def _is_guid(value) -> bool:
+    """True, если значение — строка в формате GUID (в том числе пустая ссылка 1С)."""
+    return isinstance(value, str) and _GUID_RE.fullmatch(value) is not None
+
+
+def _json_id(value, label: str) -> tuple[str | None, str | None]:
+    """Проверить ID элемента выгрузки 1С: ``(id, None)`` или ``(None, причина пропуска)``.
+
+    ID обязан быть GUID (``_is_guid``) ровно в том виде, как пришёл из 1С:
+    пробелы по краям не обрезаются. Принятый ID возвращается в нижнем
+    регистре, поэтому один GUID в разном регистре — одна и та же сущность.
+    None, пустая или пробельная строка и пустая ссылка 1С (``_EMPTY_1C_GUID``)
+    — «отсутствует <label>»; любое другое значение не в формате GUID —
+    «некорректный тип/формат ID <label>».
+    Некорректное значение не возвращается, поэтому не может попасть в лог.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, f"отсутствует {label}"
+    if not _is_guid(value):
+        return None, f"некорректный тип/формат ID {label}"
+    value = value.lower()
+    if value == _EMPTY_1C_GUID:
+        return None, f"отсутствует {label}"
+    return value, None
+
+
+def _lower_guid(value: str | None) -> str | None:
+    """Ссылочное поле выгрузки: GUID — в нижнем регистре, прочее — как пришло."""
+    return value.lower() if _is_guid(value) else value
+
+
+def _json_text_fields(source: dict, *labels: str) -> tuple[dict, str | None]:
+    """Return optional text fields or the skip reason for the first non-string one."""
+    values = {}
+    for label in labels:
+        value = source.get(label)
+        if value is not None and not isinstance(value, str):
+            return {}, f"некорректный тип поля {label}"
+        values[label] = value
+    return values, None
+
+
+def _json_zone_reading(zone: dict, path: str, number: str) -> str | None:
+    """Показание тарифной зоны из поля Reading: нормализованная строка или None.
+
+    Отсутствующее поле и null — «показания нет» без предупреждения. Любое
+    другое значение, кроме неотрицательного числа JSON в пределах ограничений
+    ввода показаний, записывается как None с предупреждением; зона при этом
+    не пропускается, а само значение в журнал не попадает.
+    """
+    raw = zone.get("Reading")
+    if raw is None:
+        return None
+    reading = json_reading(raw)
+    if reading is None:
+        log.warning(
+            "Импорт JSON 1С: %s: некорректное значение Reading, показание не записано; "
+            "ЛС=%r",
+            path, number,
+        )
+    return reading
+
+
+def _load_1c_json(payload: str | bytes) -> list:
+    """Parse the upload; only an unreadable file rejects the whole import."""
+    try:
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8-sig")
+        # Дробные числа и NaN/Infinity — Decimal: Reading хранится точно,
+        # без округления через float. Для остальных полей ожидаются строки,
+        # массивы и объекты, поэтому число любого вида отклоняется как раньше.
+        records = json.loads(
+            payload.lstrip("\ufeff"), parse_float=Decimal, parse_constant=Decimal
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Файл должен содержать JSON в кодировке UTF-8") from exc
+    if not isinstance(records, list):
+        raise ValueError("Корневое значение JSON должно быть массивом")
+    return records
+
+
+class _OneCJsonSkips:
+    """Counts skipped JSON elements and logs each one without file content."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def skip(self, path: str, reason: str, **ids) -> None:
+        self.count += 1
+        # repr() экранирует переводы строк и управляющие символы из выгрузки.
+        details = ", ".join(
+            f"{key}={str(value)[:_ONE_C_LOG_VALUE_MAX_LENGTH]!r}"
+            for key, value in ids.items() if value
+        )
+        log.warning(
+            "Импорт JSON 1С: пропущен элемент %s: %s%s",
+            path, reason, f" ({details})" if details else "",
+        )
+
+
+def _json_list(value, path: str, label: str, skips: _OneCJsonSkips, **ids) -> list:
+    """Return a nested array; a missing key means empty, a non-array is skipped."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        skips.skip(path, f"{label} должно быть массивом", **ids)
+        return []
+    return value
+
+
+# Идентичные ЛС пропускаются, возможно нужно будет изменить
+def _duplicate_1c_account_numbers(records: list) -> set[str]:
+    """Return normalized ЛС numbers occurring more than once in the file."""
+    counts: dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw_number = record.get("PersonalAccount")
+        if not isinstance(raw_number, str):
+            continue
+        try:
+            number = normalize_lschet_number(raw_number)
+        except ValueError:
+            continue
+        counts[number] = counts.get(number, 0) + 1
+    return {number for number, count in counts.items() if count > 1}
+
+
+def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict], int]:
+    """Validate parsed 1C records, skipping bad elements with their subtree.
+
+    ``account_conflicts(one_c_id, number)`` reports a PersonalAccountID that
+    the database already binds to another account number. ФИО и адрес в
+    выгрузке 1С отсутствуют и не читаются.
+    """
+    skips = _OneCJsonSkips()
+    prepared = []
+    duplicate_numbers = _duplicate_1c_account_numbers(records)
+    seen_account_ids = set()
+    seen_point_ids = set()
+    seen_meter_ids = set()
+    for index, record in enumerate(records):
+        path = f"[{index}]"
+        if not isinstance(record, dict):
+            skips.skip(path, "лицевой счёт должен быть объектом")
+            continue
+        raw_number = record.get("PersonalAccount")
+        account_id, account_id_error = _json_id(
+            record.get("PersonalAccountID"), "PersonalAccountID"
+        )
+        if raw_number is not None and not isinstance(raw_number, str):
+            skips.skip(
+                path, "некорректный тип поля PersonalAccount",
+                PersonalAccountID=account_id,
+            )
+            continue
+        if raw_number is None or not raw_number.strip():
+            skips.skip(path, "пустой номер ЛС", PersonalAccountID=account_id)
+            continue
+        try:
+            number = normalize_lschet_number(raw_number)
+        except ValueError:
+            skips.skip(
+                path, "некорректный номер ЛС",
+                ЛС=raw_number, PersonalAccountID=account_id,
+            )
+            continue
+        if number in duplicate_numbers:
+            skips.skip(
+                path, "номер ЛС повторяется в выгрузке, пропущены все вхождения",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
+        if account_id_error:
+            skips.skip(path, account_id_error, ЛС=number)
+            continue
+        if account_id in seen_account_ids:
+            skips.skip(
+                path, "повтор PersonalAccountID в выгрузке",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
+        if account_conflicts and account_conflicts(account_id, number):
+            skips.skip(
+                path, "PersonalAccountID уже закреплён за другим лицевым счётом",
+                ЛС=number, PersonalAccountID=account_id,
+            )
+            continue
+        # Ключ помещения нужен только для обмена с 1С; у нескольких ЛС он может совпадать.
+        # Сохраняется любой GUID (в нижнем регистре), включая пустую ссылку 1С;
+        # всё остальное — пустая ссылка.
+        room_key_id = record.get("RoomKeyID")
+        if _is_guid(room_key_id):
+            room_key_id = room_key_id.lower()
+        else:
+            if room_key_id is not None:
+                log.warning(
+                    "Импорт JSON 1С: %s: RoomKeyID не в формате GUID, записана пустая ссылка; "
+                    "ЛС=%r",
+                    path, number,
+                )
+            room_key_id = _EMPTY_1C_GUID
+        seen_account_ids.add(account_id)
+        item = {
+            "number": number,
+            "one_c_id": account_id,
+            "room_key_id": room_key_id,
+            "points": [],
+        }
+        account_ids = {"ЛС": number, "PersonalAccountID": account_id}
+        points = _json_list(
+            record.get("MeteringPoints"), f"{path}.MeteringPoints",
+            "MeteringPoints", skips, **account_ids,
+        )
+        for point_index, point in enumerate(points):
+            point_path = f"{path}.MeteringPoints[{point_index}]"
+            if not isinstance(point, dict):
+                skips.skip(point_path, "точка учёта должна быть объектом", **account_ids)
+                continue
+            point_id, error = _json_id(point.get("MeteringPointID"), "MeteringPointID")
+            if error:
+                skips.skip(point_path, error, **account_ids)
+                continue
+            if point_id in seen_point_ids:
+                # Точка учёта принадлежит ровно одному ЛС: первое вхождение побеждает.
+                skips.skip(
+                    point_path, "повтор MeteringPointID в выгрузке",
+                    MeteringPointID=point_id, **account_ids,
+                )
+                continue
+            point_ids = {**account_ids, "MeteringPointID": point_id}
+            point_fields, error = _json_text_fields(
+                point, "MeteringPoint", "ResourceID", "Resource"
+            )
+            if error:
+                skips.skip(point_path, error, **point_ids)
+                continue
+            seen_point_ids.add(point_id)
+            point_item = {
+                "one_c_id": point_id,
+                "name": point_fields["MeteringPoint"],
+                "resource_id": _lower_guid(point_fields["ResourceID"]),
+                "resource_name": point_fields["Resource"],
+                "meters": [],
+            }
+            meters = _json_list(
+                point.get("Meters"), f"{point_path}.Meters", "Meters", skips, **point_ids
+            )
+            for meter_index, meter in enumerate(meters):
+                meter_path = f"{point_path}.Meters[{meter_index}]"
+                if not isinstance(meter, dict):
+                    skips.skip(meter_path, "прибор учёта должен быть объектом", **point_ids)
+                    continue
+                meter_id, error = _json_id(meter.get("MeterID"), "MeterID")
+                if error:
+                    skips.skip(meter_path, error, **point_ids)
+                    continue
+                if meter_id in seen_meter_ids:
+                    skips.skip(
+                        meter_path, "повтор MeterID в выгрузке",
+                        MeterID=meter_id, **point_ids,
+                    )
+                    continue
+                meter_ids = {**point_ids, "MeterID": meter_id}
+                raw_meter_number = meter.get("MeterNumber")
+                if raw_meter_number is not None and not isinstance(raw_meter_number, str):
+                    skips.skip(meter_path, "некорректный тип поля MeterNumber", **meter_ids)
+                    continue
+                meter_number = (raw_meter_number or "").strip()
+                if not meter_number:
+                    skips.skip(meter_path, "отсутствует MeterNumber", **meter_ids)
+                    continue
+                meter_fields, error = _json_text_fields(
+                    meter, "DifferentiationTypeID", "DifferentiationType"
+                )
+                if error:
+                    skips.skip(meter_path, error, **meter_ids)
+                    continue
+                seen_meter_ids.add(meter_id)
+                scales = _json_list(
+                    meter.get("Scales"), f"{meter_path}.Scales", "Scales", skips, **meter_ids
+                )
+                scale_items = []
+                seen_scale_ids = set()
+                for scale_index, scale in enumerate(scales):
+                    scale_path = f"{meter_path}.Scales[{scale_index}]"
+                    if not isinstance(scale, dict):
+                        skips.skip(scale_path, "шкала должна быть объектом", **meter_ids)
+                        continue
+                    scale_id, error = _json_id(scale.get("ScaleID"), "ScaleID")
+                    if error:
+                        skips.skip(scale_path, error, **meter_ids)
+                        continue
+                    if scale_id in seen_scale_ids:
+                        skips.skip(
+                            scale_path, "повтор ScaleID у прибора",
+                            ScaleID=scale_id, **meter_ids,
+                        )
+                        continue
+                    scale_ids = {**meter_ids, "ScaleID": scale_id}
+                    scale_fields, error = _json_text_fields(scale, "Scale")
+                    if error:
+                        skips.skip(scale_path, error, **scale_ids)
+                        continue
+                    seen_scale_ids.add(scale_id)
+                    zones = _json_list(
+                        scale.get("TariffZones"), f"{scale_path}.TariffZones",
+                        "TariffZones", skips, **scale_ids,
+                    )
+                    zone_items = []
+                    seen_zone_ids = set()
+                    for zone_index, zone in enumerate(zones):
+                        zone_path = f"{scale_path}.TariffZones[{zone_index}]"
+                        if not isinstance(zone, dict):
+                            skips.skip(zone_path, "тарифная зона должна быть объектом", **scale_ids)
+                            continue
+                        zone_id, error = _json_id(zone.get("TariffZoneID"), "TariffZoneID")
+                        if error:
+                            skips.skip(zone_path, error, **scale_ids)
+                            continue
+                        if zone_id in seen_zone_ids:
+                            skips.skip(
+                                zone_path, "повтор TariffZoneID в шкале",
+                                TariffZoneID=zone_id, **scale_ids,
+                            )
+                            continue
+                        zone_fields, error = _json_text_fields(zone, "TariffZone")
+                        if error:
+                            skips.skip(zone_path, error, TariffZoneID=zone_id, **scale_ids)
+                            continue
+                        seen_zone_ids.add(zone_id)
+                        zone_items.append({
+                            "one_c_id": zone_id,
+                            "name": zone_fields["TariffZone"],
+                            "reading": _json_zone_reading(zone, zone_path, number),
+                        })
+                    scale_items.append({
+                        "one_c_id": scale_id,
+                        "name": scale_fields["Scale"],
+                        "zones": zone_items,
+                    })
+                point_item["meters"].append({
+                    "one_c_id": meter_id,
+                    "meter_number": meter_number,
+                    "differentiation_type_id": _lower_guid(
+                        meter_fields["DifferentiationTypeID"]
+                    ),
+                    "meter_type": meter_fields["DifferentiationType"],
+                    "scales": scale_items,
+                })
+            item["points"].append(point_item)
+        prepared.append(item)
+    return prepared, skips.count
+
+
+def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
+    """Atomically upsert nested 1C data, skipping and logging invalid elements.
+
+    Only an unreadable file (not UTF-8, invalid JSON, non-array root) is
+    rejected as a whole; any unexpected error rolls the transaction back.
+    """
+    records = _load_1c_json(payload)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        def account_conflicts(one_c_id: str, number: str) -> bool:
+            return conn.execute(
+                "SELECT 1 FROM licschet WHERE one_c_id=? AND number<>? LIMIT 1",
+                (one_c_id, number),
+            ).fetchone() is not None
+
+        prepared, skipped = _prepare_1c_json(records, account_conflicts)
+        summary = {
+            "accounts_imported": len(prepared),
+            "points_imported": 0,
+            "meters_imported": 0,
+            "scales_imported": 0,
+            "zones_imported": 0,
+            "skipped": skipped,
+        }
+        for account in prepared:
+            conn.execute(
+                # ФИО и адрес не приходят из 1С: существующие значения не трогаем.
+                "INSERT INTO licschet(number,one_c_id,room_key_id) VALUES(?,?,?) "
+                "ON CONFLICT(number) DO UPDATE SET one_c_id=excluded.one_c_id, "
+                "room_key_id=excluded.room_key_id",
+                (account["number"], account["one_c_id"], account["room_key_id"]),
+            )
+            account_row = conn.execute(
+                "SELECT id FROM licschet WHERE number=?", (account["number"],)
+            ).fetchone()
+            for point in account["points"]:
+                # 1С может перенести точку учёта на другой ЛС при повторной выгрузке.
+                conn.execute(
+                    "INSERT INTO metering_points(one_c_id,licschet_id,name,resource_id,resource_name) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
+                    "licschet_id=excluded.licschet_id,name=excluded.name,"
+                    "resource_id=excluded.resource_id,resource_name=excluded.resource_name",
+                    (point["one_c_id"], account_row["id"], point["name"],
+                     point["resource_id"], point["resource_name"]),
+                )
+                point_row = conn.execute(
+                    "SELECT id FROM metering_points WHERE one_c_id=?", (point["one_c_id"],)
+                ).fetchone()
+                summary["points_imported"] += 1
+                for meter in point["meters"]:
+                    conn.execute(
+                        "INSERT INTO metering_meters(one_c_id,metering_point_id,meter_number,differentiation_type_id,meter_type) "
+                        "VALUES(?,?,?,?,?) ON CONFLICT(one_c_id) DO UPDATE SET "
+                        "metering_point_id=excluded.metering_point_id,meter_number=excluded.meter_number,"
+                        "differentiation_type_id=excluded.differentiation_type_id,meter_type=excluded.meter_type",
+                        (meter["one_c_id"], point_row["id"], meter["meter_number"], meter["differentiation_type_id"], meter["meter_type"]),
+                    )
+                    meter_row = conn.execute(
+                        "SELECT id FROM metering_meters WHERE one_c_id=?", (meter["one_c_id"],)
+                    ).fetchone()
+                    summary["meters_imported"] += 1
+                    for scale in meter["scales"]:
+                        conn.execute(
+                            "INSERT INTO metering_meter_scales(meter_id,one_c_id,name) VALUES(?,?,?) "
+                            "ON CONFLICT(meter_id,one_c_id) DO UPDATE SET name=excluded.name",
+                            (meter_row["id"], scale["one_c_id"], scale["name"]),
+                        )
+                        scale_row = conn.execute(
+                            "SELECT id FROM metering_meter_scales WHERE meter_id=? AND one_c_id=?",
+                            (meter_row["id"], scale["one_c_id"]),
+                        ).fetchone()
+                        summary["scales_imported"] += 1
+                        for zone in scale["zones"]:
+                            conn.execute(
+                                "INSERT INTO metering_tariff_zones(scale_id,one_c_id,name,reading) "
+                                "VALUES(?,?,?,?) ON CONFLICT(scale_id,one_c_id) DO UPDATE SET "
+                                "name=excluded.name,reading=excluded.reading",
+                                (scale_row["id"], zone["one_c_id"], zone["name"], zone["reading"]),
+                            )
+                            summary["zones_imported"] += 1
+        conn.commit()
+        if skipped:
+            log.warning("Импорт JSON 1С: всего пропущено элементов %d", skipped)
+        log.info("Импорт JSON 1С завершён: %s", summary)
+        return summary
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _validate_1c_meter(meter: dict) -> None:
@@ -2485,7 +3349,7 @@ def get_counts() -> dict:
         "pending_confirmation": _count("appeals", "status='pending_confirmation'"),
         "resolved":             _count("appeals", "status='resolved'"),
         "closed":               _count("appeals", "status='closed'"),
-        "pokazaniya":           _count("pokazaniya", "1=1"),
+        "pokazaniya":           _count("meter_readings", "1=1"),
     }
     conn.close()
     return result
