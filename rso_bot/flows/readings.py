@@ -9,6 +9,9 @@ Meters come from the 1C import.  Each meter carries an ordered list of
 ``zones`` (one entry per scale/tariff-zone pair, already labelled by the
 database layer).  Entered values are kept in ``state["meter_values"]`` in the
 same order, so the index of the pair being asked is ``len(meter_values)``.
+Each pair may carry ``previous``: the larger of the last non-rejected value
+saved by the bot and the reading imported from 1C.  A value below it is
+refused; the database re-checks it together with meter ownership on save.
 """
 
 from __future__ import annotations
@@ -20,6 +23,17 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from rso_bot.reading_values import (
+    READING_MAX_FRACTION_DIGITS,
+    READING_MAX_INTEGER_DIGITS,
+    SAVE_METER_CHANGED,
+    SAVE_OK,
+    SAVE_TOO_LOW,
+    format_reading,
+    reading_decimal,
+    reading_error,
+)
+
 State = dict[str, Any]
 Button = dict[str, Any]
 Record = Mapping[str, Any]
@@ -30,7 +44,8 @@ class ReadingDependencies:
     """Database, session, transport and continuation dependencies."""
 
     get_meters: Callable[[str], Sequence[Record]]
-    add_reading: Callable[..., Any]
+    # save_reading(chat_id, ls, meter_id, values) -> {"status": SAVE_*, ...}
+    save_reading: Callable[..., Mapping[str, Any]]
     get_state: Callable[[int], State]
     touch: Callable[[State], State]
     reset_meter_input: Callable[[State], None]
@@ -53,9 +68,12 @@ class ReadingDependencies:
     confirm_state: str
 
 
-READING_MAX_INTEGER_DIGITS = 15
-READING_MAX_FRACTION_DIGITS = 6
 _READING_RE = re.compile(r"([+-]?)(\d+)(?:[.,](\d+))?", re.ASCII)
+_READING_ERRORS = {
+    "negative": "Введите неотрицательное числовое значение.",
+    "fraction": f"Допускается не более {READING_MAX_FRACTION_DIGITS} знаков после запятой.",
+    "integer": f"Допускается не более {READING_MAX_INTEGER_DIGITS} цифр до запятой.",
+}
 
 
 def parse_reading(chat_id: int, text: str, deps: ReadingDependencies) -> str | None:
@@ -63,30 +81,28 @@ def parse_reading(chat_id: int, text: str, deps: ReadingDependencies) -> str | N
 
     Only digits with one optional ``.``/``,`` separator are accepted, so
     exponents, ``inf`` and ``nan`` never pass.  ``Decimal`` keeps long values
-    exact: ``"00123,50"`` becomes ``"123.5"``.
+    exact: ``"00123,50"`` becomes ``"123.5"``.  Digit limits are shared with
+    the ``Reading`` field of the 1C import (:mod:`rso_bot.reading_values`).
     """
     match = _READING_RE.fullmatch(text.strip())
     if match is None:
         deps.send_message(chat_id, "Введите числовое значение.")
         return None
     sign, integer, fraction = match.groups()
-    if sign == "-":
-        deps.send_message(chat_id, "Введите неотрицательное числовое значение.")
+    value = Decimal(f"{sign}{integer}.{fraction}" if fraction else f"{sign}{integer}")
+    error = reading_error(value)  # "-0" keeps its sign and is rejected as negative
+    if error is not None:
+        deps.send_message(chat_id, _READING_ERRORS.get(error, "Введите числовое значение."))
         return None
-    if fraction and len(fraction) > READING_MAX_FRACTION_DIGITS:
-        deps.send_message(
-            chat_id,
-            f"Допускается не более {READING_MAX_FRACTION_DIGITS} знаков после запятой.",
-        )
+    return format_reading(value)
+
+
+def _previous_hint(zone: Record) -> str | None:
+    """Normalised previous reading of a pair, or None when it is absent or zero."""
+    previous = reading_decimal(zone.get("previous"))
+    if previous is None or previous <= 0:
         return None
-    if len(integer.lstrip("0")) > READING_MAX_INTEGER_DIGITS:
-        deps.send_message(
-            chat_id,
-            f"Допускается не более {READING_MAX_INTEGER_DIGITS} цифр до запятой.",
-        )
-        return None
-    value = Decimal(f"{integer}.{fraction or '0'}").normalize()
-    return format(value, "f")
+    return format_reading(previous)
 
 
 def meter_title(meter: Record) -> str:
@@ -98,6 +114,14 @@ def meter_title(meter: Record) -> str:
 
 def _entered_values(state: State) -> list[str]:
     return list(state.get("meter_values") or [])
+
+
+def _apply_previous(meter: dict, previous: Mapping[tuple[str, str], str | None]) -> None:
+    """Replace session ``previous`` values with the ones re-read on save."""
+    for zone in meter["zones"]:
+        key = (zone["scale_one_c_id"], zone["zone_one_c_id"])
+        if key in previous:
+            zone["previous"] = previous[key]
 
 
 def start(chat_id: int, deps: ReadingDependencies) -> None:
@@ -149,6 +173,9 @@ def ask_meter_value(chat_id: int, deps: ReadingDependencies) -> None:
     prompt = f"{zones[index]['label']}:"
     if index == 0:
         prompt = f"{meter_title(meter)}\n{prompt}"
+    hint = _previous_hint(zones[index])
+    if hint is not None:
+        prompt = f"{prompt}\nПредыдущее показание: {hint}"
     deps.send_message(chat_id, prompt)
 
 
@@ -205,20 +232,16 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
 
     values = [
         {
-            "scale_one_c_id": zone["scale_one_c_id"],
-            "scale_name": zone.get("scale_name"),
-            "zone_one_c_id": zone["zone_one_c_id"],
-            "zone_name": zone.get("zone_name"),
+            "scale_id": zone["scale_one_c_id"],
+            "zone_id": zone["zone_one_c_id"],
             "value": value,
         }
         for zone, value in zip(zones, entered)
     ]
     try:
-        deps.add_reading(
+        result = deps.save_reading(
             chat_id,
             state["ls"],
-            meter["resource_type"],
-            meter["meter_number"],
             meter["meter_one_c_id"],
             values,
         )
@@ -232,6 +255,49 @@ def confirm(chat_id: int, state: State, deps: ReadingDependencies) -> None:
             "Не удалось сохранить показания. Попробуйте подтвердить ещё раз позже.",
         )
         return
+
+    status = result.get("status")
+    if status == SAVE_METER_CHANGED:
+        # The meter moved to another account or its scales/zones changed after
+        # it was selected: nothing was saved, so reload the meter list.
+        account = state["ls"]
+        deps.clear_flow(state)
+        deps.touch(state)
+        deps.send_message(
+            chat_id, "Данные по счётчику обновились, введите показания заново."
+        )
+        deps.show_meter_select(chat_id, account)
+        return
+    if status == SAVE_TOO_LOW:
+        # A reading saved concurrently raised the previous value. Remember the
+        # fresh previous values and restart input for this meter.
+        _apply_previous(meter, result.get("previous") or {})
+        label = next(
+            (
+                zone["label"] for zone in zones
+                if (zone["scale_one_c_id"], zone["zone_one_c_id"])
+                == (result.get("scale_id"), result.get("zone_id"))
+            ),
+            None,
+        )
+        subject = f"Показание «{label}»" if label else "Показание"
+        deps.send_message(
+            chat_id,
+            f"{subject} не может быть меньше предыдущего "
+            f"({result.get('previous_value')}). Введите показания заново.",
+        )
+        deps.reset_meter_input(state)
+        deps.touch(state)
+        deps.ask_meter_value(chat_id)
+        return
+    if status != SAVE_OK:
+        deps.logger.error("Неизвестный результат сохранения показаний")
+        deps.send_message(
+            chat_id,
+            "Не удалось сохранить показания. Попробуйте подтвердить ещё раз позже.",
+        )
+        return
+
     if deps.integration_enabled:
         deps.logger.info(
             "Показания сохранены в очередь 1С: ЛС=%s  счётчик=%s  chat_id=%s",
@@ -287,6 +353,20 @@ def on_value(
         return
 
     entered = _entered_values(state)
+    if len(entered) >= len(meter["zones"]):
+        deps.confirm_meter_reading(chat_id)
+        return
+    zone = meter["zones"][len(entered)]
+    previous = reading_decimal(zone.get("previous"))
+    if previous is not None and Decimal(value) < previous:
+        # Equal values are allowed; the state stays on the same pair.
+        deps.send_message(
+            chat_id,
+            f"Показание не может быть меньше предыдущего ({format_reading(previous)}). "
+            "Введите значение ещё раз:",
+        )
+        return
+
     entered.append(value)
     state["meter_values"] = entered
     deps.touch(state)

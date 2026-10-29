@@ -197,7 +197,7 @@ class Bot1CFlowTests(unittest.TestCase):
         )
         with (
             patch.object(bot, "ENABLE_1C_INTEGRATION", True),
-            patch.object(bot.db, "add_pokazaniya_values") as add_values,
+            patch.object(bot.db, "save_meter_reading", return_value={"status": "saved"}) as add_values,
             patch.object(bot, "_bound_account_numbers", return_value={"100001"}),
             patch.object(bot, "send_message") as send,
             patch.object(bot, "_show_meter_select"),

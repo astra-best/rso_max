@@ -60,7 +60,6 @@ from config import (
     API,
     APP_ENV,
     DB_PATH,
-    ENABLE_1C_INTEGRATION,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
@@ -750,15 +749,20 @@ def legacy_list():
 
 # ── Показания ─────────────────────────────────────────────────────────────────
 
+PORTAL_READINGS_LIMIT = 1000
+
+
 @app.route("/pokazaniya")
 @login_required
 def pokazaniya():
-    rows = db.get_pokazaniya_with_prev()
+    # Только показания по приборам 1С (meter_readings); архив старого формата
+    # в таблице pokazaniya на странице не выводится.
+    rows = db.list_meter_readings(PORTAL_READINGS_LIMIT)
     return render_template(
         "pokazaniya.html",
         rows=rows,
+        limit=PORTAL_READINGS_LIMIT,
         user=session["user"],
-        integration_1c_enabled=ENABLE_1C_INTEGRATION,
     )
 
 

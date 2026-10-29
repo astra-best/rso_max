@@ -261,13 +261,13 @@ def test_multiple_accounts_reading_selection_persists_selected_ls(
 
     conn = db.get_conn()
     row = conn.execute(
-        "SELECT p.ls, p.meter_one_c_id, v.value FROM pokazaniya p "
-        "JOIN pokazaniya_values v ON v.pokazaniya_id=p.id "
-        "WHERE p.chat_id=? ORDER BY p.id DESC LIMIT 1",
+        "SELECT r.ls, r.meter_id, v.value FROM meter_readings r "
+        "JOIN meter_reading_values v ON v.reading_id=r.id "
+        "WHERE r.chat_id=? ORDER BY r.id DESC LIMIT 1",
         (42,),
     ).fetchone()
     conn.close()
-    assert dict(row) == {"ls": "LS-2", "meter_one_c_id": IMPORTED_METER_ID, "value": "12.5"}
+    assert dict(row) == {"ls": "LS-2", "meter_id": IMPORTED_METER_ID, "value": "12.5"}
 
 
 def test_unlink_after_reading_selection_blocks_stale_confirm(tmp_path, monkeypatch):
@@ -288,7 +288,7 @@ def test_unlink_after_reading_selection_blocks_stale_confirm(tmp_path, monkeypat
     db.unlink_bot_user_account(42, "LS-2")
     add_reading = Mock()
     menu = Mock()
-    monkeypatch.setattr(bot.db, "add_pokazaniya_values", add_reading)
+    monkeypatch.setattr(bot.db, "save_meter_reading", add_reading)
     monkeypatch.setattr(bot, "send_main_menu", menu)
 
     bot._cb_meter_confirm(42, state)

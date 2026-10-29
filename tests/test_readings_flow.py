@@ -17,24 +17,33 @@ THREE_ZONES = (("Основная", ("Пик", "Полупик", "Ночь")),)
 TWO_SCALES = (("Актив", ("День", "Ночь")), ("Реактив", ("День", "Ночь")))
 
 
-def meter(scales=ONE_ZONE, *, meter_type: str | None = "Однотарифный") -> dict:
-    """Meter in the shape returned by ``db.get_1c_meters_with_zones``."""
+def meter(
+    scales=ONE_ZONE, *, meter_type: str | None = "Однотарифный", previous=()
+) -> dict:
+    """Meter in the shape returned by ``db.get_1c_meters_with_zones``.
+
+    ``previous`` lists previous readings of the pairs in order (missing — None).
+    """
+    zones = [
+        {
+            "scale_one_c_id": f"S{scale_index}",
+            "scale_name": scale,
+            "zone_one_c_id": f"Z{scale_index}{zone_index}",
+            "zone_name": zone,
+            "label": f"{scale}, {zone}",
+        }
+        for scale_index, (scale, zone_names) in enumerate(scales)
+        for zone_index, zone in enumerate(zone_names)
+    ]
+    previous = list(previous)
+    for index, zone in enumerate(zones):
+        zone["previous"] = previous[index] if index < len(previous) else None
     return {
         "meter_one_c_id": "METER-GUID",
         "resource_type": "Электроэнергия",
         "meter_number": "E-1",
         "meter_type": meter_type,
-        "zones": [
-            {
-                "scale_one_c_id": f"S{scale_index}",
-                "scale_name": scale,
-                "zone_one_c_id": f"Z{scale_index}{zone_index}",
-                "zone_name": zone,
-                "label": f"{scale}, {zone}",
-            }
-            for scale_index, (scale, zones) in enumerate(scales)
-            for zone_index, zone in enumerate(zones)
-        ],
+        "zones": zones,
     }
 
 
@@ -46,7 +55,7 @@ def make_deps(**overrides) -> readings.ReadingDependencies:
 
     defaults = {
         "get_meters": MagicMock(return_value=[]),
-        "add_reading": MagicMock(),
+        "save_reading": MagicMock(return_value={"status": readings.SAVE_OK}),
         "get_state": get_state,
         "touch": MagicMock(side_effect=lambda state: state),
         "reset_meter_input": MagicMock(),
@@ -287,7 +296,7 @@ def test_invalid_values_never_mutate_or_confirm(raw: str) -> None:
 
     assert state == before
     deps.send_buttons.assert_not_called()
-    deps.add_reading.assert_not_called()
+    deps.save_reading.assert_not_called()
     assert len(deps.send_message.call_args_list) == 1
 
 
@@ -377,21 +386,15 @@ def test_confirm_persists_header_and_ordered_values_and_reopens_meter_list() -> 
     deps = make_deps()
     state = confirm_state()
     readings.confirm(7, state, deps)
-    deps.add_reading.assert_called_once_with(
+    deps.save_reading.assert_called_once_with(
         7,
         "LS",
-        "Электроэнергия",
-        "E-1",
         "METER-GUID",
         [
-            {"scale_one_c_id": "S0", "scale_name": "Актив", "zone_one_c_id": "Z00",
-             "zone_name": "День", "value": "1.0"},
-            {"scale_one_c_id": "S0", "scale_name": "Актив", "zone_one_c_id": "Z01",
-             "zone_name": "Ночь", "value": "2.0"},
-            {"scale_one_c_id": "S1", "scale_name": "Реактив", "zone_one_c_id": "Z10",
-             "zone_name": "День", "value": "3.0"},
-            {"scale_one_c_id": "S1", "scale_name": "Реактив", "zone_one_c_id": "Z11",
-             "zone_name": "Ночь", "value": "4.0"},
+            {"scale_id": "S0", "zone_id": "Z00", "value": "1.0"},
+            {"scale_id": "S0", "zone_id": "Z01", "value": "2.0"},
+            {"scale_id": "S1", "zone_id": "Z10", "value": "3.0"},
+            {"scale_id": "S1", "zone_id": "Z11", "value": "4.0"},
         ],
     )
     deps.clear_flow.assert_called_once_with(state)
@@ -414,14 +417,16 @@ def test_confirm_with_incomplete_values_writes_nothing_and_restarts() -> None:
     deps = make_deps()
     state = confirm_state(values=("1.0", "2.0"))
     readings.confirm(7, state, deps)
-    deps.add_reading.assert_not_called()
+    deps.save_reading.assert_not_called()
     deps.reset_meter_input.assert_called_once_with(state)
     deps.ask_meter_value.assert_called_once_with(7)
 
 
 def test_confirm_database_error_preserves_state_and_allows_retry() -> None:
-    add_reading = MagicMock(side_effect=[RuntimeError("database unavailable"), None])
-    deps = make_deps(add_reading=add_reading)
+    save_reading = MagicMock(
+        side_effect=[RuntimeError("database unavailable"), {"status": readings.SAVE_OK}]
+    )
+    deps = make_deps(save_reading=save_reading)
     state = confirm_state()
     before = dict(state, meter_values=list(state["meter_values"]))
     readings.confirm(7, state, deps)
@@ -432,7 +437,7 @@ def test_confirm_database_error_preserves_state_and_allows_retry() -> None:
 
     deps.send_message.reset_mock()
     readings.confirm(7, state, deps)
-    assert add_reading.call_count == 2
+    assert save_reading.call_count == 2
     deps.clear_flow.assert_called_once_with(state)
     deps.show_meter_select.assert_called_once_with(7, "LS")
     assert "приняты!" in deps.send_message.call_args.args[1]
@@ -449,7 +454,7 @@ def test_confirm_database_error_does_not_log_reading_details(
     )
     logger = logging.getLogger("test.readings.private-error")
     deps = make_deps(
-        add_reading=MagicMock(side_effect=RuntimeError(exception_text)),
+        save_reading=MagicMock(side_effect=RuntimeError(exception_text)),
         logger=logger,
     )
     state = confirm_state(TWO_ZONES, (sentinel_value1, sentinel_value2))
@@ -524,17 +529,133 @@ TZ_B = "5b000000-0000-4000-8000-000000000001"
 TZ_A = "5a000000-0000-4000-8000-000000000001"
 
 
-def test_bot_flow_on_imported_meters_writes_values_and_hides_legacy_meters(
-    tmp_path, monkeypatch
-) -> None:
-    """Real DB: 1C meters only, lower value accepted, header+values persisted."""
-    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "readings.sqlite"))
-    monkeypatch.setattr(db, "BOOTSTRAP_ADMIN_PASSWORD", "")
-    db.init_db()
-    db.import_from_1c_json(json.dumps([{
+@pytest.mark.parametrize(
+    ("previous", "hint"),
+    [
+        (None, None),
+        ("0", None),
+        ("1000", "1000"),
+        ("12.5", "12.5"),
+        ("0.000001", "0.000001"),
+    ],
+)
+def test_previous_hint_is_shown_only_when_previous_is_positive(previous, hint) -> None:
+    deps = wired_deps()
+    selected(deps, ONE_ZONE, previous=[previous])
+
+    prompt = prompts(deps)[0]
+    expected = "Электроэнергия №E-1 (Однотарифный)\nОсновная, Сутки:"
+    if hint is not None:
+        expected += f"\nПредыдущее показание: {hint}"
+    assert prompt == expected
+
+
+def test_hint_follows_each_pair_prompt() -> None:
+    deps = wired_deps()
+    state = selected(deps, TWO_ZONES, meter_type="Двухтарифный", previous=["50", None])
+    readings.on_value(7, state, "60", deps)
+
+    assert prompts(deps) == [
+        "Электроэнергия №E-1 (Двухтарифный)\nОсновная, День:\nПредыдущее показание: 50",
+        "Основная, Ночь:",
+    ]
+
+
+def test_value_below_previous_is_rejected_and_same_pair_is_asked_again() -> None:
+    deps = wired_deps()
+    state = selected(deps, TWO_ZONES, meter_type="Двухтарифный", previous=["50", "10.5"])
+    readings.on_value(7, state, "60", deps)
+    deps.send_message.reset_mock()
+
+    readings.on_value(7, state, "10,4999", deps)
+
+    assert prompts(deps) == [
+        "Показание не может быть меньше предыдущего (10.5). Введите значение ещё раз:"
+    ]
+    assert state["meter_values"] == ["60"]
+    assert state["state"] == "waiting_value"
+    deps.send_buttons.assert_not_called()
+
+    readings.on_value(7, state, "10.5", deps)  # равное значение допустимо
+    assert state["meter_values"] == ["60", "10.5"]
+    assert state["state"] == "confirm"
+
+
+def test_value_comparison_is_numeric_not_textual() -> None:
+    deps = wired_deps()
+    state = selected(deps, ONE_ZONE, previous=["9"])
+    readings.on_value(7, state, "10", deps)
+    assert state["meter_values"] == ["10"]
+
+
+def test_confirm_meter_changed_writes_nothing_and_reloads_meter_list() -> None:
+    deps = make_deps(save_reading=MagicMock(return_value={"status": readings.SAVE_METER_CHANGED}))
+    state = confirm_state()
+
+    readings.confirm(7, state, deps)
+
+    assert deps.send_message.call_args.args[1] == (
+        "Данные по счётчику обновились, введите показания заново."
+    )
+    deps.clear_flow.assert_called_once_with(state)
+    deps.show_meter_select.assert_called_once_with(7, "LS")
+
+
+def test_confirm_too_low_updates_previous_and_restarts_input() -> None:
+    previous = {("S0", "Z00"): "1.5", ("S0", "Z01"): "2", ("S1", "Z10"): None, ("S1", "Z11"): "4"}
+    deps = make_deps(save_reading=MagicMock(return_value={
+        "status": readings.SAVE_TOO_LOW, "scale_id": "S0", "zone_id": "Z00",
+        "previous_value": "1.5", "previous": previous,
+    }))
+    state = confirm_state()
+
+    readings.confirm(7, state, deps)
+
+    assert deps.send_message.call_args.args[1] == (
+        "Показание «Актив, День» не может быть меньше предыдущего (1.5). "
+        "Введите показания заново."
+    )
+    assert [zone["previous"] for zone in state["meters"][0]["zones"]] == ["1.5", "2", None, "4"]
+    deps.reset_meter_input.assert_called_once_with(state)
+    deps.ask_meter_value.assert_called_once_with(7)
+    deps.clear_flow.assert_not_called()
+    deps.show_meter_select.assert_not_called()
+
+
+def test_confirm_unknown_save_result_keeps_state() -> None:
+    deps = make_deps(save_reading=MagicMock(return_value={"status": "???"}))
+    state = confirm_state()
+    before = dict(state, meter_values=list(state["meter_values"]))
+
+    readings.confirm(7, state, deps)
+
+    assert state == before
+    assert "Попробуйте подтвердить" in deps.send_message.call_args.args[1]
+
+
+# Импорт 1С принимает только GUID; шкалы и зоны идут не в алфавитном порядке GUID.
+ACC_1 = "10000000-0000-4000-8000-000000000001"
+POINT_1 = "20000000-0000-4000-8000-000000000001"
+METER_1 = "30000000-0000-4000-8000-000000000001"
+SC_B = "4b000000-0000-4000-8000-000000000001"
+SC_A = "4a000000-0000-4000-8000-000000000001"
+TZ_B = "5b000000-0000-4000-8000-000000000001"
+TZ_A = "5a000000-0000-4000-8000-000000000001"
+
+
+def account_payload(number="LS-1", readings_by_zone=None, *, scales=None) -> str:
+    readings_by_zone = readings_by_zone or {}
+
+    def zones():
+        return [
+            {"TariffZoneID": TZ_B, "TariffZone": "День", "Reading": readings_by_zone.get("day")},
+            {"TariffZoneID": TZ_A, "TariffZone": "Ночь", "Reading": readings_by_zone.get("night")},
+        ]
+
+    return json.dumps([{
         "PersonalAccountID": ACC_1,
         "RoomKeyID": "11111111-1111-1111-1111-111111111111",
-        "PersonalAccount": "LS-1",
+        "PersonalAccount": number,
         "MeteringPoints": [{
             "MeteringPointID": POINT_1,
             "MeteringPoint": "Ввод",
@@ -545,32 +666,55 @@ def test_bot_flow_on_imported_meters_writes_values_and_hides_legacy_meters(
                 "MeterNumber": "123",
                 "DifferentiationTypeID": "TYPE-2",
                 "DifferentiationType": "Двухтарифный",
-                "Scales": [
-                    {"ScaleID": SC_B, "Scale": "Актив", "TariffZones": [
-                        {"TariffZoneID": TZ_B, "TariffZone": "День"},
-                        {"TariffZoneID": TZ_A, "TariffZone": "Ночь"},
-                    ]},
-                    {"ScaleID": SC_A, "Scale": "Реактив", "TariffZones": [
-                        {"TariffZoneID": TZ_B, "TariffZone": "День"},
-                        {"TariffZoneID": TZ_A, "TariffZone": "Ночь"},
-                    ]},
+                "Scales": scales if scales is not None else [
+                    {"ScaleID": SC_B, "Scale": "Актив", "TariffZones": zones()},
+                    {"ScaleID": SC_A, "Scale": "Реактив", "TariffZones": zones()},
                 ],
             }],
         }],
-    }]))
+    }])
+
+
+@pytest.fixture
+def real_bot(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "readings.sqlite"))
+    monkeypatch.setattr(db, "BOOTSTRAP_ADMIN_PASSWORD", "")
+    db.init_db()
+    db.import_from_1c_json(account_payload())
     db.upsert_bot_user(42, "LS-1", "User", authorized_1c=True)
-    db.upsert_1c_meters(
-        "LS-1",
-        [{"meter_number": "LEGACY-1", "resource_type": "Вода", "meter_type": "Однотарифный"}],
-    )
-    # Earlier legacy reading for the same meter number: lower input is still accepted.
-    db.add_pokazaniya(42, "LS-1", "Электроэнергия", "123", "1000")
     bot.user_states.clear()
     send_buttons = Mock(return_value=True)
     send_message = Mock(return_value=True)
     monkeypatch.setattr(bot, "ENABLE_1C_INTEGRATION", False)
     monkeypatch.setattr(bot, "send_buttons", send_buttons)
     monkeypatch.setattr(bot, "send_message", send_message)
+    yield send_buttons, send_message
+    bot.user_states.clear()
+
+
+def stored_readings() -> list[tuple]:
+    connection = db.get_conn()
+    try:
+        return [
+            tuple(row) for row in connection.execute(
+                "SELECT r.ls, r.meter_id, r.metering_point_id, v.scale_id, v.scale_name, "
+                "v.zone_id, v.zone_name, v.value FROM meter_readings r "
+                "JOIN meter_reading_values v ON v.reading_id=r.id ORDER BY v.id"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def test_bot_flow_on_imported_meters_writes_values_and_hides_legacy_meters(real_bot) -> None:
+    """Real DB: 1C meters only; legacy readings neither limit input nor get new rows."""
+    send_buttons, send_message = real_bot
+    db.upsert_1c_meters(
+        "LS-1",
+        [{"meter_number": "LEGACY-1", "resource_type": "Вода", "meter_type": "Однотарифный"}],
+    )
+    # Старое показание по тому же номеру счётчика не считается предыдущим.
+    db.add_pokazaniya(42, "LS-1", "Электроэнергия", "123", "1000")
 
     bot._start_pokazaniya(42)
     labels = [row[0]["text"] for row in send_buttons.call_args.args[2]]
@@ -594,28 +738,109 @@ def test_bot_flow_on_imported_meters_writes_values_and_hides_legacy_meters(
 
     assert "приняты!" in send_message.call_args_list[-1].args[1]
     assert state["state"] == bot.S.METER_SELECT
-    connection = db.get_conn()
-    try:
-        header = connection.execute(
-            "SELECT * FROM pokazaniya ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        values = [
-            tuple(row) for row in connection.execute(
-                "SELECT scale_one_c_id, scale_name, zone_one_c_id, zone_name, value "
-                "FROM pokazaniya_values WHERE pokazaniya_id=? ORDER BY id",
-                (header["id"],),
-            )
-        ]
-    finally:
-        connection.close()
-    assert (header["ls"], header["meter_number"], header["meter_one_c_id"]) == (
-        "LS-1", "123", METER_1
-    )
-    assert (header["value1"], header["value2"]) == (None, None)
-    assert values == [
-        (SC_B, "Актив", TZ_B, "День", "5"),
-        (SC_B, "Актив", TZ_A, "Ночь", "6.25"),
-        (SC_A, "Реактив", TZ_B, "День", "7"),
-        (SC_A, "Реактив", TZ_A, "Ночь", "12345678901.5"),
+    assert stored_readings() == [
+        ("LS-1", METER_1, POINT_1, SC_B, "Актив", TZ_B, "День", "5"),
+        ("LS-1", METER_1, POINT_1, SC_B, "Актив", TZ_A, "Ночь", "6.25"),
+        ("LS-1", METER_1, POINT_1, SC_A, "Реактив", TZ_B, "День", "7"),
+        ("LS-1", METER_1, POINT_1, SC_A, "Реактив", TZ_A, "Ночь", "12345678901.5"),
     ]
-    bot.user_states.clear()
+    assert len(db.get_pokazaniya()) == 1
+
+
+def test_bot_shows_previous_from_1c_and_rejects_lower_value(real_bot) -> None:
+    _, send_message = real_bot
+    db.import_from_1c_json(account_payload(readings_by_zone={"day": 50, "night": 0}))
+
+    bot._start_pokazaniya(42)
+    state = bot._get_state(42)
+    bot._cb_select_meter(42, state, "0")
+    bot._on_value(42, state, "49")
+    bot._on_value(42, state, "50")
+    bot._on_value(42, state, "0")
+
+    assert [call.args[1] for call in send_message.call_args_list] == [
+        "Электроэнергия №123 (Двухтарифный)\nАктив, День:\nПредыдущее показание: 50",
+        "Показание не может быть меньше предыдущего (50). Введите значение ещё раз:",
+        "Актив, Ночь:",
+        "Реактив, День:\nПредыдущее показание: 50",
+    ]
+    assert state["meter_values"] == ["50", "0"]
+
+
+def test_meter_moved_between_selection_and_confirm_saves_nothing(real_bot) -> None:
+    _, send_message = real_bot
+    bot._start_pokazaniya(42)
+    state = bot._get_state(42)
+    bot._cb_select_meter(42, state, "0")
+    for text in ("1", "2", "3", "4"):
+        bot._on_value(42, state, text)
+
+    # 1С перенесла точку учёта на другой ЛС, пока пользователь подтверждал.
+    db.import_from_1c_json(json.dumps([
+        {"PersonalAccountID": ACC_1, "PersonalAccount": "LS-1", "MeteringPoints": []},
+    ]))
+    db.import_from_1c_json(account_payload("LS-2").replace(ACC_1, "10000000-0000-4000-8000-000000000002"))
+    send_message.reset_mock()
+    bot._cb_meter_confirm(42, state)
+
+    assert stored_readings() == []
+    assert send_message.call_args_list[0].args[1] == (
+        "Данные по счётчику обновились, введите показания заново."
+    )
+    # Список счётчиков перечитан: у ЛС больше нет приборов.
+    assert send_message.call_args_list[1].args[1] == "По вашему счёту счётчики не найдены."
+
+
+def test_zone_set_changed_between_selection_and_confirm_saves_nothing(real_bot) -> None:
+    _, send_message = real_bot
+    bot._start_pokazaniya(42)
+    state = bot._get_state(42)
+    bot._cb_select_meter(42, state, "0")
+    for text in ("1", "2", "3", "4"):
+        bot._on_value(42, state, text)
+
+    extra_scale = {"ScaleID": "4c000000-0000-4000-8000-000000000001", "Scale": "Доп.",
+                   "TariffZones": [{"TariffZoneID": TZ_B, "TariffZone": "День"}]}
+    payload = json.loads(account_payload())
+    payload[0]["MeteringPoints"][0]["Meters"][0]["Scales"].append(extra_scale)
+    db.import_from_1c_json(json.dumps(payload))
+    send_message.reset_mock()
+    bot._cb_meter_confirm(42, state)
+
+    assert stored_readings() == []
+    assert send_message.call_args_list[0].args[1] == (
+        "Данные по счётчику обновились, введите показания заново."
+    )
+    assert state["state"] == bot.S.METER_SELECT
+    assert len(state["meters"][0]["zones"]) == 5
+
+
+def test_concurrent_higher_reading_rejects_confirm_and_restarts_input(real_bot) -> None:
+    _, send_message = real_bot
+    bot._start_pokazaniya(42)
+    state = bot._get_state(42)
+    bot._cb_select_meter(42, state, "0")
+    for text in ("10", "10", "10", "10"):
+        bot._on_value(42, state, text)
+
+    other = db.save_meter_reading(
+        43, "LS-1", METER_1,
+        [
+            {"scale_id": scale, "zone_id": zone, "value": "20"}
+            for scale in (SC_B, SC_A) for zone in (TZ_B, TZ_A)
+        ],
+    )
+    assert other["status"] == db.SAVE_OK
+    send_message.reset_mock()
+    bot._cb_meter_confirm(42, state)
+
+    assert [row[-1] for row in stored_readings()] == ["20", "20", "20", "20"]
+    assert send_message.call_args_list[0].args[1] == (
+        "Показание «Актив, День» не может быть меньше предыдущего (20). "
+        "Введите показания заново."
+    )
+    assert send_message.call_args_list[1].args[1] == (
+        "Электроэнергия №123 (Двухтарифный)\nАктив, День:\nПредыдущее показание: 20"
+    )
+    assert state["state"] == bot.S.WAITING_VALUE
+    assert "meter_values" not in state

@@ -24,8 +24,10 @@ import os
 import re
 import sqlite3
 import unicodedata
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
@@ -40,6 +42,16 @@ from config import (
     LOG_MAX_BYTES,
     TICKET_PREFIX,
     TIMEZONE_OFFSET,
+)
+from rso_bot.reading_values import (
+    SAVE_METER_CHANGED,
+    SAVE_OK,
+    SAVE_TOO_LOW,
+    format_reading,
+    json_reading,
+    max_reading,
+    reading_decimal,
+    reading_error,
 )
 
 # ── Логгер модуля ─────────────────────────────────────────────────────────────
@@ -269,6 +281,8 @@ def init_db() -> None:
             UNIQUE(scale_id, one_c_id)
         )
     """)
+    # Последнее показание зоны из выгрузки 1С (нормализованное число, NULL — нет).
+    _ensure_column(c, "metering_tariff_zones", "reading", "TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS ix_metering_meters_point ON metering_meters(metering_point_id)")
 
     c.execute("""
@@ -341,25 +355,68 @@ def init_db() -> None:
         WHERE chat_id=0 AND created_at='2000-01-01 00:00' AND sent_to_1c=0
           AND batch_id IS NULL
     """)
-    # Показания по приборам из выгрузки 1С: GUID прибора хранится в заголовке,
-    # значения по парам «шкала, тарифная зона» — в pokazaniya_values.
-    # У старых строк (value1/value2) колонка остаётся NULL.
-    _ensure_column(c, "pokazaniya", "meter_one_c_id", "TEXT")
-    # GUID и названия шкалы/зоны — снимок на момент подачи, без FK на таблицы
-    # metering_*: история не теряется при переименовании или удалении в 1С.
-    # Порядок значений — порядок вставки (id).
+    # pokazaniya — архив старого формата (value1/value2): бот в неё больше не
+    # пишет. Промежуточная таблица pokazaniya_values не выходила за пределы
+    # ветки разработки; колонка pokazaniya.meter_one_c_id в локальных БД
+    # остаётся неиспользуемой.
+    c.execute("DROP TABLE IF EXISTS pokazaniya_values")
+
+    # Показания по приборам из выгрузки 1С. Одна строка — одна задача обмена
+    # (TaskID) с 1С. GUID и названия — снимок на момент подачи, без FK на
+    # таблицы metering_*: история не теряется при изменениях в 1С.
     c.execute("""
-        CREATE TABLE IF NOT EXISTS pokazaniya_values (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            pokazaniya_id  INTEGER NOT NULL REFERENCES pokazaniya(id) ON DELETE CASCADE,
-            scale_one_c_id TEXT NOT NULL,
-            scale_name     TEXT,
-            zone_one_c_id  TEXT NOT NULL,
-            zone_name      TEXT,
-            value          TEXT NOT NULL,
-            UNIQUE (pokazaniya_id, scale_one_c_id, zone_one_c_id)
+        CREATE TABLE IF NOT EXISTS meter_readings (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id             TEXT NOT NULL UNIQUE,
+            created_at          TEXT NOT NULL,
+            chat_id             INTEGER,
+            ls                  TEXT NOT NULL,
+            personal_account_id TEXT NOT NULL,
+            room_key_id         TEXT NOT NULL,
+            metering_point_id   TEXT NOT NULL,
+            meter_id            TEXT NOT NULL,
+            resource            TEXT,
+            meter_number        TEXT
         )
     """)
+    # Поиск предыдущего показания идёт по прибору от новых к старым.
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_readings_meter "
+        "ON meter_readings(meter_id, id)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_readings_created "
+        "ON meter_readings(created_at)"
+    )
+    # UNIQUE(reading_id, scale_id, zone_id) одновременно служит индексом
+    # для поиска значения пары внутри конкретного показания.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meter_reading_values (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            reading_id INTEGER NOT NULL REFERENCES meter_readings(id) ON DELETE CASCADE,
+            scale_id   TEXT NOT NULL,
+            scale_name TEXT,
+            zone_id    TEXT NOT NULL,
+            zone_name  TEXT,
+            value      TEXT NOT NULL,
+            UNIQUE (reading_id, scale_id, zone_id)
+        )
+    """)
+    # Статус обмена с 1С. Нет строки — показание ещё не отправлено в 1С.
+    # Заполняется отправкой показаний (отдельная доработка); правило
+    # предыдущего показания уже не учитывает строки со статусом ERROR.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meter_reading_status (
+            reading_id INTEGER PRIMARY KEY REFERENCES meter_readings(id) ON DELETE CASCADE,
+            status     TEXT NOT NULL CHECK (status IN ('PENDING','SUCCESS','ERROR')),
+            message    TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS ix_meter_reading_status_pending "
+        "ON meter_reading_status(reading_id) WHERE status='PENDING'"
+    )
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS sync_1c_state (
@@ -1446,61 +1503,6 @@ def add_pokazaniya(
         conn.close()
 
 
-def add_pokazaniya_values(
-    chat_id: int,
-    ls: str,
-    resource_type: str | None,
-    meter_number: str | None,
-    meter_one_c_id: str,
-    values: Sequence[Mapping],
-) -> int:
-    """
-    Сохраняет показания прибора из выгрузки 1С: заголовок в pokazaniya
-    (value1/value2 = NULL) и по строке на каждую пару «шкала, зона» в
-    pokazaniya_values. Всё в одной транзакции — либо всё, либо ничего.
-
-    values — элементы с ключами scale_one_c_id, scale_name, zone_one_c_id,
-    zone_name, value в порядке ввода. Возвращает id заголовка.
-    """
-    if not values:
-        raise ValueError("Нет значений показаний для сохранения")
-    conn = get_conn()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute(
-            "INSERT INTO pokazaniya "
-            "(chat_id, ls, resource_type, meter_number, value1, value2, created_at, "
-            "meter_one_c_id) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)",
-            (chat_id, ls, resource_type, meter_number, msk_now(), meter_one_c_id),
-        )
-        reading_id = cursor.lastrowid
-        conn.executemany(
-            "INSERT INTO pokazaniya_values "
-            "(pokazaniya_id, scale_one_c_id, scale_name, zone_one_c_id, zone_name, value) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    reading_id,
-                    item["scale_one_c_id"],
-                    item.get("scale_name"),
-                    item["zone_one_c_id"],
-                    item.get("zone_name"),
-                    # Без str(): пустое значение отвергается NOT NULL и
-                    # откатывает всю запись, а не сохраняется как "None".
-                    item["value"],
-                )
-                for item in values
-            ],
-        )
-        conn.commit()
-        return reading_id
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
 def reading_value_label(scale_name: str | None, zone_name: str | None) -> str:
     """Подпись пары «Шкала, Зона»; пустые названия из 1С заменяются общими."""
     return f"{scale_name or 'Шкала'}, {zone_name or 'Зона'}"
@@ -1523,63 +1525,277 @@ def get_last_pokazaniya(ls: str, meter_number: str) -> sqlite3.Row | None:
     return row
 
 
-def get_pokazaniya_with_prev() -> list[dict]:
-    """
-    Показания с предыдущими значениями и разницей (для таблицы в портале).
-    Использует оконные функции LAG — один запрос вместо N+1.
+# ── Показания по приборам 1С ──────────────────────────────────────────────────
+#
+# meter_readings — одна строка на подтверждённое показание прибора (задача
+# обмена с 1С, TaskID); meter_reading_values — значения по парам «шкала,
+# тарифная зона»; meter_reading_status — статус обработки в 1С (нет строки —
+# показание ещё не отправлено). Отправка в 1С и запись статусов — отдельная
+# доработка; пока статусы никто не пишет.
 
-    Показания нового формата (по шкалам и зонам 1С) получают values_text вида
-    «Актив, День: 123; Актив, Ночь: 45»; предыдущих значений и разницы у них
-    нет. В цепочку LAG старых показаний они не попадают, чтобы не обрывать её.
+_METER_READING_STATUS_LABELS = {
+    None: "Не отправлено",
+    "PENDING": "В обработке",
+    "SUCCESS": "Принято",
+    "ERROR": "Ошибка",
+}
+
+
+def _local_now_seconds() -> str:
+    """Текущее время в настроенном часовом поясе ('YYYY-MM-DD HH:MM:SS')."""
+    tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _meter_pairs_conn(conn: sqlite3.Connection, meter_pk: int) -> list[sqlite3.Row]:
+    """Пары «шкала, зона» прибора в порядке импорта вместе с показанием 1С."""
+    return conn.execute(
+        "SELECT s.one_c_id AS scale_id, s.name AS scale_name, "
+        "z.one_c_id AS zone_id, z.name AS zone_name, z.reading "
+        "FROM metering_meter_scales s "
+        "JOIN metering_tariff_zones z ON z.scale_id=s.id "
+        "WHERE s.meter_id=? ORDER BY s.id, z.id",
+        (meter_pk,),
+    ).fetchall()
+
+
+def _latest_own_value_conn(
+    conn: sqlite3.Connection, meter_id: str, scale_id: str, zone_id: str
+) -> str | None:
+    """Значение пары из последнего (по id) показания прибора, кроме отклонённых 1С.
+
+    Индекс ix_meter_readings_meter(meter_id, id) задаёт обход показаний
+    прибора от новых к старым, UNIQUE(reading_id, scale_id, zone_id) —
+    поиск значения пары в каждом из них.
     """
+    row = conn.execute(
+        "SELECT v.value FROM meter_readings r "
+        "JOIN meter_reading_values v "
+        "ON v.reading_id=r.id AND v.scale_id=? AND v.zone_id=? "
+        "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+        "WHERE r.meter_id=? AND (st.status IS NULL OR st.status<>'ERROR') "
+        "ORDER BY r.id DESC LIMIT 1",
+        (scale_id, zone_id, meter_id),
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def _previous_values_conn(
+    conn: sqlite3.Connection, meter_id: str, pairs: Sequence[Mapping]
+) -> dict[tuple[str, str], str | None]:
+    """Предыдущее показание каждой пары: максимум из нашего и из выгрузки 1С."""
+    return {
+        (pair["scale_id"], pair["zone_id"]): max_reading(
+            pair["reading"],
+            _latest_own_value_conn(conn, meter_id, pair["scale_id"], pair["zone_id"]),
+        )
+        for pair in pairs
+    }
+
+
+def get_1c_meters_with_zones(ls: str) -> list[dict]:
+    """
+    Приборы учёта ЛС из выгрузки 1С с парами «шкала, тарифная зона» для бота.
+
+    Порядок — порядок импорта: приборы по metering_meters.id, внутри прибора
+    все зоны первой шкалы, затем следующей (metering_meter_scales.id,
+    metering_tariff_zones.id). Приборы без единой пары не возвращаются:
+    вводить по ним нечего. Счётчики из schetchiki сюда не входят.
+    У каждой пары previous — предыдущее показание (или None).
+    """
+    try:
+        number = normalize_lschet_number(ls)
+    except ValueError:
+        return []
     conn = get_conn()
     try:
-        rows = conn.execute("""
-            SELECT *,
-                   LAG(value1) OVER w AS prev_value1,
-                   LAG(value2) OVER w AS prev_value2
-            FROM pokazaniya
-            WINDOW w AS (
-                PARTITION BY ls, meter_number, meter_one_c_id IS NULL ORDER BY id
-            )
-            ORDER BY id DESC
-        """).fetchall()
-        value_rows = conn.execute(
-            "SELECT pokazaniya_id, scale_name, zone_name, value "
-            "FROM pokazaniya_values ORDER BY pokazaniya_id, id"
+        meter_rows = conn.execute(
+            "SELECT m.id AS meter_pk, m.one_c_id AS meter_one_c_id, "
+            "p.resource_name AS resource_type, m.meter_number, m.meter_type "
+            "FROM licschet l "
+            "JOIN metering_points p ON p.licschet_id=l.id "
+            "JOIN metering_meters m ON m.metering_point_id=p.id "
+            "WHERE l.number=? ORDER BY m.id",
+            (number,),
         ).fetchall()
+        meters = []
+        for row in meter_rows:
+            pairs = _meter_pairs_conn(conn, row["meter_pk"])
+            if not pairs:
+                continue
+            previous = _previous_values_conn(conn, row["meter_one_c_id"], pairs)
+            meters.append({
+                "meter_one_c_id": row["meter_one_c_id"],
+                "resource_type": row["resource_type"],
+                "meter_number": row["meter_number"],
+                "meter_type": row["meter_type"],
+                "zones": [
+                    {
+                        "scale_one_c_id": pair["scale_id"],
+                        "scale_name": pair["scale_name"],
+                        "zone_one_c_id": pair["zone_id"],
+                        "zone_name": pair["zone_name"],
+                        "label": reading_value_label(pair["scale_name"], pair["zone_name"]),
+                        "previous": previous[(pair["scale_id"], pair["zone_id"])],
+                    }
+                    for pair in pairs
+                ],
+            })
+        return meters
     finally:
         conn.close()
 
-    values_by_reading: dict[int, list[str]] = {}
-    for value in value_rows:
-        values_by_reading.setdefault(value["pokazaniya_id"], []).append(
+
+def save_meter_reading(
+    chat_id: int,
+    ls: str,
+    meter_id: str,
+    values: Sequence[Mapping],
+) -> dict:
+    """
+    Сохраняет подтверждённое показание прибора одной транзакцией.
+
+    values — элементы с ключами scale_id, zone_id, value (нормализованная
+    строка) в порядке ввода. Под BEGIN IMMEDIATE заново проверяется, что
+    прибор по-прежнему относится к точке учёта выбранного ЛС и набор пар
+    «шкала, зона» совпадает с введённым, а затем — что ни одно значение не
+    меньше предыдущего. GUID ЛС, помещения, точки учёта и названия берутся
+    из этого чтения, а не из сессии бота.
+
+    Возвращает {"status": SAVE_OK, "task_id", "reading_id"},
+    {"status": SAVE_METER_CHANGED} или {"status": SAVE_TOO_LOW, "scale_id",
+    "zone_id", "previous_value", "previous"}; в двух последних случаях
+    ничего не записывается.
+    """
+    try:
+        number = normalize_lschet_number(ls)
+    except ValueError:
+        return {"status": SAVE_METER_CHANGED}
+    entered = []
+    for item in values:
+        value = reading_decimal(item.get("value"))
+        if value is None or reading_error(value) is not None:
+            raise ValueError("Некорректное значение показания")
+        entered.append((item["scale_id"], item["zone_id"], value))
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        meter = conn.execute(
+            "SELECT l.one_c_id AS personal_account_id, l.room_key_id, "
+            "p.one_c_id AS metering_point_id, p.resource_name, "
+            "m.id AS meter_pk, m.meter_number "
+            "FROM licschet l "
+            "JOIN metering_points p ON p.licschet_id=l.id "
+            "JOIN metering_meters m ON m.metering_point_id=p.id "
+            "WHERE l.number=? AND m.one_c_id=?",
+            (number, meter_id),
+        ).fetchone()
+        pairs = _meter_pairs_conn(conn, meter["meter_pk"]) if meter else []
+        current = {(pair["scale_id"], pair["zone_id"]): pair for pair in pairs}
+        keys = [(scale_id, zone_id) for scale_id, zone_id, _ in entered]
+        if (
+            meter is None
+            or not meter["personal_account_id"]
+            or not keys
+            or len(set(keys)) != len(keys)
+            or set(keys) != set(current)
+        ):
+            conn.rollback()
+            return {"status": SAVE_METER_CHANGED}
+
+        previous = _previous_values_conn(conn, meter_id, pairs)
+        for scale_id, zone_id, value in entered:
+            previous_value = reading_decimal(previous[(scale_id, zone_id)])
+            if previous_value is not None and value < previous_value:
+                conn.rollback()
+                return {
+                    "status": SAVE_TOO_LOW,
+                    "scale_id": scale_id,
+                    "zone_id": zone_id,
+                    "previous_value": format_reading(previous_value),
+                    "previous": previous,
+                }
+
+        task_id = str(uuid.uuid4())
+        cursor = conn.execute(
+            "INSERT INTO meter_readings (task_id, created_at, chat_id, ls, "
+            "personal_account_id, room_key_id, metering_point_id, meter_id, "
+            "resource, meter_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, _local_now_seconds(), chat_id, number,
+                meter["personal_account_id"],
+                meter["room_key_id"] or _EMPTY_1C_GUID,
+                meter["metering_point_id"], meter_id,
+                meter["resource_name"], meter["meter_number"],
+            ),
+        )
+        reading_id = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO meter_reading_values "
+            "(reading_id, scale_id, scale_name, zone_id, zone_name, value) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    reading_id, scale_id, current[(scale_id, zone_id)]["scale_name"],
+                    zone_id, current[(scale_id, zone_id)]["zone_name"],
+                    format_reading(value),
+                )
+                for scale_id, zone_id, value in entered
+            ],
+        )
+        conn.commit()
+        return {"status": SAVE_OK, "task_id": task_id, "reading_id": reading_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _values_by_reading(
+    conn: sqlite3.Connection, reading_ids: Sequence[int]
+) -> dict[int, list[sqlite3.Row]]:
+    """Значения показаний по id; диапазон вместо IN — без лимита параметров."""
+    result: dict[int, list[sqlite3.Row]] = {reading_id: [] for reading_id in reading_ids}
+    if not reading_ids:
+        return result
+    rows = conn.execute(
+        "SELECT * FROM meter_reading_values WHERE reading_id BETWEEN ? AND ? "
+        "ORDER BY reading_id, id",
+        (min(reading_ids), max(reading_ids)),
+    ).fetchall()
+    for row in rows:
+        if row["reading_id"] in result:
+            result[row["reading_id"]].append(row)
+    return result
+
+
+def list_meter_readings(limit: int = 1000) -> list[dict]:
+    """Последние показания с значениями и статусом 1С (для портала)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT r.*, st.status, st.message FROM meter_readings r "
+            "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+            "ORDER BY r.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        values = _values_by_reading(conn, [row["id"] for row in rows])
+    finally:
+        conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["value_lines"] = [
             f"{reading_value_label(value['scale_name'], value['zone_name'])}: "
             f"{value['value']}"
+            for value in values[row["id"]]
+        ]
+        item["status_label"] = _METER_READING_STATUS_LABELS.get(
+            row["status"], row["status"]
         )
-
-    result = []
-    for r in rows:
-        r = dict(r)
-        parts = values_by_reading.get(r["id"])
-        r["value_lines"] = parts or []
-        r["values_text"] = "; ".join(parts) if parts else None
-        if r["meter_one_c_id"] is not None:
-            r["prev_value1"] = r["prev_value2"] = None
-            r["diff1"] = r["diff2"] = None
-            result.append(r)
-            continue
-        try:
-            r["diff1"] = round(float(r["value1"]) - float(r["prev_value1"]), 2) \
-                if r["prev_value1"] is not None else None
-        except (TypeError, ValueError):
-            r["diff1"] = None
-        try:
-            r["diff2"] = round(float(r["value2"]) - float(r["prev_value2"]), 2) \
-                if r["value2"] is not None and r["prev_value2"] is not None else None
-        except (TypeError, ValueError):
-            r["diff2"] = None
-        result.append(r)
+        result.append(item)
     return result
 
 
@@ -2110,54 +2326,6 @@ def get_schetchiki(ls: str) -> list[sqlite3.Row]:
         conn.close()
 
 
-def get_1c_meters_with_zones(ls: str) -> list[dict]:
-    """
-    Приборы учёта ЛС из выгрузки 1С с парами «шкала, тарифная зона» для бота.
-
-    Порядок — порядок импорта: приборы по metering_meters.id, внутри прибора
-    все зоны первой шкалы, затем следующей (metering_meter_scales.id,
-    metering_tariff_zones.id). Приборы без единой пары не возвращаются:
-    вводить по ним нечего. Счётчики из schetchiki сюда не входят.
-    """
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT m.id AS meter_id, m.one_c_id AS meter_one_c_id, "
-            "p.resource_name AS resource_type, m.meter_number, m.meter_type, "
-            "s.one_c_id AS scale_one_c_id, s.name AS scale_name, "
-            "z.one_c_id AS zone_one_c_id, z.name AS zone_name "
-            "FROM licschet l "
-            "JOIN metering_points p ON p.licschet_id=l.id "
-            "JOIN metering_meters m ON m.metering_point_id=p.id "
-            "JOIN metering_meter_scales s ON s.meter_id=m.id "
-            "JOIN metering_tariff_zones z ON z.scale_id=s.id "
-            "WHERE l.number=? ORDER BY m.id, s.id, z.id",
-            (normalize_lschet_number(ls),),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    meters: dict[int, dict] = {}
-    for row in rows:
-        meter = meters.get(row["meter_id"])
-        if meter is None:
-            meter = meters[row["meter_id"]] = {
-                "meter_one_c_id": row["meter_one_c_id"],
-                "resource_type": row["resource_type"],
-                "meter_number": row["meter_number"],
-                "meter_type": row["meter_type"],
-                "zones": [],
-            }
-        meter["zones"].append({
-            "scale_one_c_id": row["scale_one_c_id"],
-            "scale_name": row["scale_name"],
-            "zone_one_c_id": row["zone_one_c_id"],
-            "zone_name": row["zone_name"],
-            "label": reading_value_label(row["scale_name"], row["zone_name"]),
-        })
-    return list(meters.values())
-
-
 _EMPTY_1C_GUID = "00000000-0000-0000-0000-000000000000"
 _GUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 _ONE_C_LOG_VALUE_MAX_LENGTH = 80
@@ -2172,18 +2340,26 @@ def _json_id(value, label: str) -> tuple[str | None, str | None]:
     """Проверить ID элемента выгрузки 1С: ``(id, None)`` или ``(None, причина пропуска)``.
 
     ID обязан быть GUID (``_is_guid``) ровно в том виде, как пришёл из 1С:
-    пробелы по краям не обрезаются. None, пустая или пробельная строка и пустая
-    ссылка 1С (``_EMPTY_1C_GUID``) — «отсутствует <label>»; любое другое
-    значение не в формате GUID — «некорректный тип/формат ID <label>».
+    пробелы по краям не обрезаются. Принятый ID возвращается в нижнем
+    регистре, поэтому один GUID в разном регистре — одна и та же сущность.
+    None, пустая или пробельная строка и пустая ссылка 1С (``_EMPTY_1C_GUID``)
+    — «отсутствует <label>»; любое другое значение не в формате GUID —
+    «некорректный тип/формат ID <label>».
     Некорректное значение не возвращается, поэтому не может попасть в лог.
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, f"отсутствует {label}"
-    if value == _EMPTY_1C_GUID:
-        return None, f"отсутствует {label}"
     if not _is_guid(value):
         return None, f"некорректный тип/формат ID {label}"
+    value = value.lower()
+    if value == _EMPTY_1C_GUID:
+        return None, f"отсутствует {label}"
     return value, None
+
+
+def _lower_guid(value: str | None) -> str | None:
+    """Ссылочное поле выгрузки: GUID — в нижнем регистре, прочее — как пришло."""
+    return value.lower() if _is_guid(value) else value
 
 
 def _json_text_fields(source: dict, *labels: str) -> tuple[dict, str | None]:
@@ -2197,12 +2373,38 @@ def _json_text_fields(source: dict, *labels: str) -> tuple[dict, str | None]:
     return values, None
 
 
+def _json_zone_reading(zone: dict, path: str, number: str) -> str | None:
+    """Показание тарифной зоны из поля Reading: нормализованная строка или None.
+
+    Отсутствующее поле и null — «показания нет» без предупреждения. Любое
+    другое значение, кроме неотрицательного числа JSON в пределах ограничений
+    ввода показаний, записывается как None с предупреждением; зона при этом
+    не пропускается, а само значение в журнал не попадает.
+    """
+    raw = zone.get("Reading")
+    if raw is None:
+        return None
+    reading = json_reading(raw)
+    if reading is None:
+        log.warning(
+            "Импорт JSON 1С: %s: некорректное значение Reading, показание не записано; "
+            "ЛС=%r",
+            path, number,
+        )
+    return reading
+
+
 def _load_1c_json(payload: str | bytes) -> list:
     """Parse the upload; only an unreadable file rejects the whole import."""
     try:
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8-sig")
-        records = json.loads(payload.lstrip("\ufeff"))
+        # Дробные числа и NaN/Infinity — Decimal: Reading хранится точно,
+        # без округления через float. Для остальных полей ожидаются строки,
+        # массивы и объекты, поэтому число любого вида отклоняется как раньше.
+        records = json.loads(
+            payload.lstrip("\ufeff"), parse_float=Decimal, parse_constant=Decimal
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Файл должен содержать JSON в кодировке UTF-8") from exc
     if not isinstance(records, list):
@@ -2318,9 +2520,12 @@ def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict],
             )
             continue
         # Ключ помещения нужен только для обмена с 1С; у нескольких ЛС он может совпадать.
-        # Сохраняется любой GUID, включая пустую ссылку 1С; всё остальное — пустая ссылка.
+        # Сохраняется любой GUID (в нижнем регистре), включая пустую ссылку 1С;
+        # всё остальное — пустая ссылка.
         room_key_id = record.get("RoomKeyID")
-        if not _is_guid(room_key_id):
+        if _is_guid(room_key_id):
+            room_key_id = room_key_id.lower()
+        else:
             if room_key_id is not None:
                 log.warning(
                     "Импорт JSON 1С: %s: RoomKeyID не в формате GUID, записана пустая ссылка; "
@@ -2367,7 +2572,7 @@ def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict],
             point_item = {
                 "one_c_id": point_id,
                 "name": point_fields["MeteringPoint"],
-                "resource_id": point_fields["ResourceID"],
+                "resource_id": _lower_guid(point_fields["ResourceID"]),
                 "resource_name": point_fields["Resource"],
                 "meters": [],
             }
@@ -2457,7 +2662,11 @@ def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict],
                             skips.skip(zone_path, error, TariffZoneID=zone_id, **scale_ids)
                             continue
                         seen_zone_ids.add(zone_id)
-                        zone_items.append({"one_c_id": zone_id, "name": zone_fields["TariffZone"]})
+                        zone_items.append({
+                            "one_c_id": zone_id,
+                            "name": zone_fields["TariffZone"],
+                            "reading": _json_zone_reading(zone, zone_path, number),
+                        })
                     scale_items.append({
                         "one_c_id": scale_id,
                         "name": scale_fields["Scale"],
@@ -2466,7 +2675,9 @@ def _prepare_1c_json(records: list, account_conflicts=None) -> tuple[list[dict],
                 point_item["meters"].append({
                     "one_c_id": meter_id,
                     "meter_number": meter_number,
-                    "differentiation_type_id": meter_fields["DifferentiationTypeID"],
+                    "differentiation_type_id": _lower_guid(
+                        meter_fields["DifferentiationTypeID"]
+                    ),
                     "meter_type": meter_fields["DifferentiationType"],
                     "scales": scale_items,
                 })
@@ -2551,9 +2762,10 @@ def import_from_1c_json(payload: str | bytes) -> dict[str, int]:
                         summary["scales_imported"] += 1
                         for zone in scale["zones"]:
                             conn.execute(
-                                "INSERT INTO metering_tariff_zones(scale_id,one_c_id,name) VALUES(?,?,?) "
-                                "ON CONFLICT(scale_id,one_c_id) DO UPDATE SET name=excluded.name",
-                                (scale_row["id"], zone["one_c_id"], zone["name"]),
+                                "INSERT INTO metering_tariff_zones(scale_id,one_c_id,name,reading) "
+                                "VALUES(?,?,?,?) ON CONFLICT(scale_id,one_c_id) DO UPDATE SET "
+                                "name=excluded.name,reading=excluded.reading",
+                                (scale_row["id"], zone["one_c_id"], zone["name"], zone["reading"]),
                             )
                             summary["zones_imported"] += 1
         conn.commit()
@@ -3137,7 +3349,7 @@ def get_counts() -> dict:
         "pending_confirmation": _count("appeals", "status='pending_confirmation'"),
         "resolved":             _count("appeals", "status='resolved'"),
         "closed":               _count("appeals", "status='closed'"),
-        "pokazaniya":           _count("pokazaniya", "1=1"),
+        "pokazaniya":           _count("meter_readings", "1=1"),
     }
     conn.close()
     return result

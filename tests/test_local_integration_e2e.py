@@ -123,7 +123,7 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         db.add_pokazaniya(70001, "TEST-LS-001", "Вода", "TEST-METER-1", "12.5")
 
     def test_success_sends_batch_persists_status_and_notifies_max(self) -> None:
-        # Бот пишет показания по шкалам/зонам (pokazaniya_values), а текущий
+        # Бот пишет показания по шкалам/зонам в meter_readings, а текущий
         # формат обмена с 1С передаёт только value1/value2 — до переработки
         # синхронизации очередь проверяется на строке старого формата.
         self._add_reading()
@@ -178,7 +178,7 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         self.assertEqual(self.max_requests[0]["authorization"], "audit-max-secret")
         self.assertIn("приняты", self.max_requests[0]["body"]["text"])
 
-    def test_local_auth_two_tariff_reading_is_queued_with_zone_values(self) -> None:
+    def test_local_auth_two_tariff_reading_is_stored_with_zone_values(self) -> None:
         chat_id = 70002
         ls = "TEST-LS-002"
         db.create_lschet(ls, "Тестовый пользователь", "Тестовый адрес")
@@ -236,18 +236,22 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         verify_code_api.assert_not_called()
         user = db.get_bot_user(chat_id)
         self.assertEqual((user["ls"], user["authorized_1c"]), (ls, 1))
-        reading = db.get_pokazaniya()[0]
+        # Бот пишет показания только в meter_readings; старый пакетный обмен
+        # (pokazaniya) их не видит, отправка — отдельная доработка.
+        self.assertEqual(db.get_pokazaniya(), [])
+        readings = db.list_meter_readings()
+        self.assertEqual(len(readings), 1)
+        reading = readings[0]
         self.assertEqual(
-            (reading["meter_number"], reading["meter_one_c_id"],
-             reading["value1"], reading["value2"]),
-            ("ELECTRICITY-2T", METER_2T_ID, None, None),
+            (reading["ls"], reading["meter_number"], reading["meter_id"],
+             reading["chat_id"], reading["status"]),
+            (ls, "ELECTRICITY-2T", METER_2T_ID, chat_id, None),
         )
-        # Новая строка стоит в очереди 1С; её отправка — задача переработки синхронизации.
-        self.assertEqual((reading["sent_to_1c"], reading["status_1c"]), (0, None))
         self.assertEqual(
-            db.get_pokazaniya_with_prev()[0]["values_text"],
-            "Основная, День: 120.5; Основная, Ночь: 48.25",
+            reading["value_lines"],
+            ["Основная, День: 120.5", "Основная, Ночь: 48.25"],
         )
+        self.assertEqual(reading["status_label"], "Не отправлено")
         sent_texts = [
             call.args[1].get("text", "") for call in send_raw.call_args_list
             if len(call.args) > 1 and isinstance(call.args[1], dict)

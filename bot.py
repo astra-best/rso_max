@@ -959,7 +959,7 @@ def _reading_dependencies() -> readings.ReadingDependencies:
     """Build reading dependencies from runtime patch points in this entry point."""
     return readings.ReadingDependencies(
         get_meters=db.get_1c_meters_with_zones,
-        add_reading=db.add_pokazaniya_values,
+        save_reading=db.save_meter_reading,
         get_state=_get_state,
         touch=_touch,
         reset_meter_input=_reset_meter_input,

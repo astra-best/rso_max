@@ -36,6 +36,23 @@ def table_count(table: str) -> int:
         connection.close()
 
 
+def imported_meters(number: str) -> list[dict]:
+    """Приборы ЛС из таблиц выгрузки 1С в порядке импорта."""
+    connection = db.get_conn()
+    try:
+        return [
+            dict(row) for row in connection.execute(
+                "SELECT m.meter_number, m.meter_type FROM licschet l "
+                "JOIN metering_points p ON p.licschet_id=l.id "
+                "JOIN metering_meters m ON m.metering_point_id=p.id "
+                "WHERE l.number=? ORDER BY m.id",
+                (number,),
+            )
+        ]
+    finally:
+        connection.close()
+
+
 @pytest.fixture
 def json_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "json-import.sqlite"))
@@ -160,17 +177,22 @@ def test_import_stores_nested_entities_and_skips_point_repeated_under_other_acco
     assert existing_account["address"] == "Existing address"
     assert existing_account["one_c_id"] == guid("ACCOUNT-1")
     assert isinstance(existing_account["id"], int)
-    assert [row["meter_number"] for row in db.get_schetchiki("100-1")] == [
-        "SN-001",
-        "LEGACY-1",
-    ]
+    assert [row["meter_number"] for row in imported_meters("100-1")] == ["SN-001"]
+    connection = db.get_conn()
+    try:
+        # Старый счётчик из schetchiki импорт не трогает.
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schetchiki WHERE ls='100-1' AND meter_number='LEGACY-1'"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
     # POINT-1 already belongs to 100-1, so its repetition under 100-2 is dropped.
     assert db.get_ls("100-2")["one_c_id"] == guid("ACCOUNT-2")
-    assert db.get_schetchiki("100-2") == []
-    assert db.get_schetchiki("100-1")[0]["meter_type"] == "Двухтарифный"
-    assert db.get_schetchiki("100-3")[0]["meter_type"] == "Однотарифный"
+    assert imported_meters("100-2") == []
+    assert imported_meters("100-1")[0]["meter_type"] == "Двухтарифный"
+    assert imported_meters("100-3")[0]["meter_type"] == "Однотарифный"
     # Тип — название дифференциации из 1С, а не вывод из числа зон.
-    assert db.get_schetchiki("100-4")[0]["meter_type"] == "Трёхтарифный"
+    assert imported_meters("100-4")[0]["meter_type"] == "Трёхтарифный"
     assert len(db.get_pokazaniya()) == readings_before
     assert summary == {
         "accounts_imported": 4,
@@ -248,7 +270,7 @@ def test_import_skips_blank_account_and_all_accounts_with_duplicate_number(json_
     finally:
         connection.close()
     # Skipped duplicates must not reserve POINT-1/METER for the valid account.
-    assert [row["meter_number"] for row in db.get_schetchiki("100-2")] == ["SN-001"]
+    assert [row["meter_number"] for row in imported_meters("100-2")] == ["SN-001"]
     assert summary["accounts_imported"] == 1
     assert summary["points_imported"] == 1
     assert summary["meters_imported"] == 1
@@ -310,8 +332,8 @@ def test_repeated_meter_id_skips_later_meter_and_imports_the_rest(json_db, caplo
 
     assert db.get_ls("100-1")["one_c_id"] == guid("ACCOUNT-1-UPDATED")
     assert db.get_ls("100-1")["fio"] == "Original"
-    assert [row["meter_number"] for row in db.get_schetchiki("100-2")] == ["SN-001"]
-    assert [row["meter_number"] for row in db.get_schetchiki("100-3")] == ["SN-003"]
+    assert [row["meter_number"] for row in imported_meters("100-2")] == ["SN-001"]
+    assert [row["meter_number"] for row in imported_meters("100-3")] == ["SN-003"]
     assert summary["meters_imported"] == 2
     assert summary["skipped"] == 1
     assert any(
@@ -401,7 +423,7 @@ def test_missing_guids_skip_only_the_affected_element(json_db, caplog):
     summary = db.import_from_1c_json(json.dumps(payload))
 
     assert db.get_ls("100-0") is None
-    assert sorted(row["meter_number"] for row in db.get_schetchiki("100-1")) == [
+    assert sorted(row["meter_number"] for row in imported_meters("100-1")) == [
         "SN-S",
         "SN-Z",
     ]
@@ -502,8 +524,8 @@ def test_point_moved_to_other_account_on_reupload_updates_owner(json_db):
         )
     )
 
-    assert db.get_schetchiki("100-1") == []
-    assert [row["meter_number"] for row in db.get_schetchiki("100-2")] == ["SN-001"]
+    assert imported_meters("100-1") == []
+    assert [row["meter_number"] for row in imported_meters("100-2")] == ["SN-001"]
     assert table_count("metering_points") == 1
 
 
@@ -618,7 +640,7 @@ def test_wrong_typed_text_fields_skip_only_their_element(json_db, caplog):
         "zones_imported": 3,
         "skipped": 6,
     }
-    assert sorted(row["meter_number"] for row in db.get_schetchiki("100-1")) == [
+    assert sorted(row["meter_number"] for row in imported_meters("100-1")) == [
         "SN-SCALE",
         "SN-ZONE",
     ]
@@ -682,7 +704,8 @@ def test_room_key_is_stored_shared_and_updated_on_reimport(json_db):
         json.dumps([account("100-1", guid("ACCOUNT-1"), RoomKeyID=room_b)])
     )
 
-    assert db.get_ls("100-1")["room_key_id"] == room_b
+    # GUID хранится в нижнем регистре независимо от регистра в выгрузке.
+    assert db.get_ls("100-1")["room_key_id"] == room_b.lower()
 
 
 def test_room_key_defaults_to_empty_1c_reference_unless_guid(json_db, caplog):
@@ -760,7 +783,7 @@ def test_malformed_guids_are_skipped_and_never_logged_raw(json_db, caplog):
         db.get_ls(number) is not None for number in ("100-1", "100-2", "100-3", "100-6")
     ] == [False, False, False, False]
     assert db.get_ls("100-4")["one_c_id"] == guid("ACCOUNT-4")
-    assert db.get_schetchiki("100-4") == []
+    assert imported_meters("100-4") == []
     assert summary["accounts_imported"] == 1
     assert summary["points_imported"] == 1
     assert summary["meters_imported"] == 0
@@ -881,7 +904,7 @@ def test_upper_case_guid_is_a_valid_id(json_db):
     summary = db.import_from_1c_json(json.dumps([account("100-1", upper)]))
 
     assert summary["accounts_imported"] == 1
-    assert db.get_ls("100-1")["one_c_id"] == upper
+    assert db.get_ls("100-1")["one_c_id"] == upper.lower()
 
 
 @pytest.mark.parametrize("label", list(BAD_ID_CASES))
@@ -958,7 +981,7 @@ def test_deleting_account_cascades_to_imported_metering_data(json_db):
     assert table_count("metering_meters") == 1
     assert table_count("metering_meter_scales") == 1
     assert table_count("metering_tariff_zones") == 2
-    assert [row["meter_number"] for row in db.get_schetchiki("100-2")] == ["SN-001"]
+    assert [row["meter_number"] for row in imported_meters("100-2")] == ["SN-001"]
 
 
 def test_schema_binds_point_to_single_account_without_link_table(json_db):
@@ -1038,7 +1061,7 @@ def test_reimport_upserts_existing_json_entities_and_never_deletes_absent_rows(j
     db.import_from_1c_json(json.dumps([account("100-1", guid("ACCOUNT-1"))]))
 
     assert db.get_ls("100-2") is not None
-    assert [row["meter_number"] for row in db.get_schetchiki("100-1")] == ["SN-001"]
+    assert [row["meter_number"] for row in imported_meters("100-1")] == ["SN-001"]
 
 
 def test_init_db_migration_preserves_legacy_meters_and_readings(tmp_path, monkeypatch):
@@ -1074,7 +1097,6 @@ def test_init_db_migration_preserves_legacy_meters_and_readings(tmp_path, monkey
     db.init_db()
 
     assert db.get_ls("100-1")["id"] == 17
-    assert db.get_schetchiki("100-1")[0]["meter_number"] == "OLD-METER"
     assert db.get_last_pokazaniya("100-1", "OLD-METER")["value1"] == "15"
     connection = db.get_conn()
     try:
@@ -1087,21 +1109,40 @@ def test_init_db_migration_preserves_legacy_meters_and_readings(tmp_path, monkey
         assert (reading["value1"], reading["value2"], reading["created_at"]) == (
             "15", None, "2026-01-01 10:00"
         )
-        assert reading["meter_one_c_id"] is None
-        value_columns = [
-            row[1] for row in connection.execute("PRAGMA table_info(pokazaniya_values)")
-        ]
-        assert value_columns == [
-            "id", "pokazaniya_id", "scale_one_c_id", "scale_name",
-            "zone_one_c_id", "zone_name", "value",
-        ]
-        assert connection.execute("SELECT COUNT(*) FROM pokazaniya_values").fetchone()[0] == 0
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"meter_readings", "meter_reading_values", "meter_reading_status"} <= tables
+        assert "pokazaniya_values" not in tables
+        zone_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(metering_tariff_zones)")
+        }
+        assert "reading" in zone_columns
     finally:
         connection.close()
-    legacy_row = db.get_pokazaniya_with_prev()[0]
-    assert (legacy_row["id"], legacy_row["value1"], legacy_row["values_text"]) == (
-        31, "15", None
-    )
+
+
+def test_init_db_drops_branch_local_pokazaniya_values_table(json_db):
+    connection = db.get_conn()
+    try:
+        connection.execute(
+            "CREATE TABLE pokazaniya_values (id INTEGER PRIMARY KEY, value TEXT)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    db.init_db()
+
+    connection = db.get_conn()
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='pokazaniya_values'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
 
 
 # GUID шкал и зон убывают по алфавиту, а импортируются в порядке выгрузки.
@@ -1181,76 +1222,6 @@ def test_bot_meters_follow_import_order_and_skip_meters_without_zones(json_db):
     assert db.get_1c_meters_with_zones("100-404") == []
 
 
-def _values(*pairs) -> list[dict]:
-    return [
-        {
-            "scale_one_c_id": scale_id,
-            "scale_name": "Актив",
-            "zone_one_c_id": zone_id,
-            "zone_name": zone_name,
-            "value": value,
-        }
-        for scale_id, zone_id, zone_name, value in pairs
-    ]
-
-
-def test_add_pokazaniya_values_writes_header_and_ordered_values(json_db, monkeypatch):
-    monkeypatch.setattr(db, "msk_now", lambda: "2026-10-26 12:00")
-
-    reading_id = db.add_pokazaniya_values(
-        7, "100-1", "Электроэнергия", "123", "METER-2S",
-        _values(("S", "Z-NIGHT", "Ночь", "45.0"), ("S", "Z-DAY", "День", "123.0")),
-    )
-
-    connection = db.get_conn()
-    try:
-        header = dict(connection.execute(
-            "SELECT chat_id, ls, resource_type, meter_number, value1, value2, "
-            "created_at, meter_one_c_id, sent_to_1c, batch_id FROM pokazaniya WHERE id=?",
-            (reading_id,),
-        ).fetchone())
-        values = [
-            tuple(row) for row in connection.execute(
-                "SELECT scale_one_c_id, scale_name, zone_one_c_id, zone_name, value "
-                "FROM pokazaniya_values WHERE pokazaniya_id=? ORDER BY id",
-                (reading_id,),
-            )
-        ]
-    finally:
-        connection.close()
-    assert header == {
-        "chat_id": 7, "ls": "100-1", "resource_type": "Электроэнергия",
-        "meter_number": "123", "value1": None, "value2": None,
-        "created_at": "2026-10-26 12:00", "meter_one_c_id": "METER-2S",
-        "sent_to_1c": 0, "batch_id": None,
-    }
-    assert values == [
-        ("S", "Актив", "Z-NIGHT", "Ночь", "45.0"),
-        ("S", "Актив", "Z-DAY", "День", "123.0"),
-    ]
-    portal_row = db.get_pokazaniya_with_prev()[0]
-    assert portal_row["values_text"] == "Актив, Ночь: 45.0; Актив, День: 123.0"
-    assert portal_row["prev_value1"] is None and portal_row["diff1"] is None
-
-
-@pytest.mark.parametrize(
-    "values",
-    [
-        # Повтор пары нарушает UNIQUE на второй строке значений.
-        _values(("S", guid("Z"), "День", "1.0"), ("S", guid("Z"), "День", "2.0")),
-        # Ошибка формирования второй строки (нет значения).
-        _values(("S", "Z1", "День", "1.0"), ("S", "Z2", "Ночь", None)),
-        [],
-    ],
-)
-def test_add_pokazaniya_values_is_all_or_nothing(json_db, values):
-    with pytest.raises(Exception):  # noqa: B017 - любой сбой должен откатить запись
-        db.add_pokazaniya_values(7, "100-1", "Электроэнергия", "123", "M", values)
-
-    assert table_count("pokazaniya") == 0
-    assert table_count("pokazaniya_values") == 0
-
-
 def test_init_db_keeps_duplicate_legacy_external_ids_and_import_checks_conflicts(
     tmp_path, monkeypatch
 ):
@@ -1326,9 +1297,519 @@ def test_synthetic_duplicate_mode_skips_repeated_meter(json_db, caplog):
     assert summary["meters_imported"] == 1
     assert summary["skipped"] == 1
     assert table_count("metering_meters") == 1
-    assert [row["meter_number"] for row in db.get_schetchiki("SYNTH-0000")] == ["SERIAL-0000"]
-    assert db.get_schetchiki("SYNTH-0001") == []
+    assert [row["meter_number"] for row in imported_meters("SYNTH-0000")] == ["SERIAL-0000"]
+    assert imported_meters("SYNTH-0001") == []
     assert any(
         "[1].MeteringPoints[0].Meters[0]" in message and DUPLICATE_METER_ID in message
         for message in import_warnings(caplog)
     )
+
+
+# ── Регистр GUID ──────────────────────────────────────────────────────────────
+
+
+def stored_ids(table: str) -> list[str]:
+    connection = db.get_conn()
+    try:
+        return [
+            row[0] for row in connection.execute(
+                f"SELECT one_c_id FROM {table} ORDER BY id"  # nosec B608
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def test_all_imported_guids_are_stored_lower_case(json_db):
+    upper_meter = meter(guid("METER-UP").upper())
+    upper_meter["Scales"][0]["ScaleID"] = guid("SCALE-UP").upper()
+    upper_meter["Scales"][0]["TariffZones"][0]["TariffZoneID"] = guid("ZONE-UP").upper()
+    db.import_from_1c_json(json.dumps([
+        account(
+            "100-1", guid("ACCOUNT-UP").upper(),
+            RoomKeyID=guid("ROOM-UP").upper(),
+            points=[point(guid("POINT-UP").upper(), meters=[upper_meter])],
+        )
+    ]))
+
+    row = db.get_ls("100-1")
+    assert (row["one_c_id"], row["room_key_id"]) == (guid("ACCOUNT-UP"), guid("ROOM-UP"))
+    assert stored_ids("metering_points") == [guid("POINT-UP")]
+    assert stored_ids("metering_meters") == [guid("METER-UP")]
+    assert stored_ids("metering_meter_scales") == [guid("SCALE-UP")]
+    assert stored_ids("metering_tariff_zones")[0] == guid("ZONE-UP")
+
+
+def test_same_guid_in_different_case_is_one_entity_within_a_file(json_db, caplog):
+    summary = db.import_from_1c_json(json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[
+            point(guid("POINT-1"), meters=[meter(guid("METER-1"), meter_number="A")]),
+            point(guid("POINT-2"), meters=[meter(guid("METER-1").upper(), meter_number="B")]),
+            point(guid("POINT-1").upper()),
+        ]),
+        account("100-2", guid("ACCOUNT-1").upper()),
+    ]))
+
+    assert db.get_ls("100-2") is None
+    assert [row["meter_number"] for row in imported_meters("100-1")] == ["A"]
+    assert table_count("metering_points") == 2
+    assert summary["skipped"] == 3
+    warnings = "\n".join(import_warnings(caplog))
+    assert "повтор MeterID" in warnings
+    assert "повтор MeteringPointID" in warnings
+    assert "повтор PersonalAccountID" in warnings
+
+
+def upper_ids(value):
+    """Копия выгрузки, где все поля *ID записаны в верхнем регистре."""
+    if isinstance(value, list):
+        return [upper_ids(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: item.upper() if key.endswith("ID") and isinstance(item, str) else upper_ids(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def test_reimport_in_other_case_updates_the_same_rows(json_db):
+    payload = [account("100-1", guid("ACCOUNT-1"), points=[point(meters=[meter()])])]
+    db.import_from_1c_json(json.dumps(payload))
+
+    summary = db.import_from_1c_json(json.dumps(upper_ids(payload)))
+
+    assert summary["skipped"] == 0
+    assert table_count("licschet") == 1
+    assert table_count("metering_points") == 1
+    assert table_count("metering_meters") == 1
+    assert table_count("metering_meter_scales") == 1
+    assert table_count("metering_tariff_zones") == 2
+    assert stored_ids("metering_meters") == [guid("METER-1")]
+
+
+def reference_ids() -> tuple[list, list]:
+    connection = db.get_conn()
+    try:
+        return (
+            [row[0] for row in connection.execute("SELECT resource_id FROM metering_points ORDER BY id")],
+            [
+                row[0] for row in connection.execute(
+                    "SELECT differentiation_type_id FROM metering_meters ORDER BY id"
+                )
+            ],
+        )
+    finally:
+        connection.close()
+
+
+def test_resource_and_differentiation_type_guids_are_stored_lower_case(json_db):
+    guid_point = point(guid("POINT-1"), meters=[meter(guid("METER-1"))])
+    guid_point["ResourceID"] = guid("RESOURCE-G").upper()
+    guid_point["Meters"][0]["DifferentiationTypeID"] = guid("TYPE-G").upper()
+    # Значения не в формате GUID сохраняются как пришли (прежнее поведение).
+    other_point = point(guid("POINT-2"), meters=[meter(guid("METER-2"), meter_number="B")])
+    other_point["ResourceID"] = "Resource-Code"
+    other_point["Meters"][0]["DifferentiationTypeID"] = None
+
+    summary = db.import_from_1c_json(json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[guid_point, other_point])
+    ]))
+
+    assert summary["skipped"] == 0
+    assert reference_ids() == (
+        [guid("RESOURCE-G"), "Resource-Code"],
+        [guid("TYPE-G"), None],
+    )
+
+    # Повторная выгрузка в нижнем регистре не меняет сохранённые ссылки.
+    guid_point["ResourceID"] = guid("RESOURCE-G")
+    guid_point["Meters"][0]["DifferentiationTypeID"] = guid("TYPE-G")
+    db.import_from_1c_json(json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[guid_point, other_point])
+    ]))
+    assert reference_ids()[0][0] == guid("RESOURCE-G")
+    assert reference_ids()[1][0] == guid("TYPE-G")
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("MeterNumber", "некорректный тип поля MeterNumber"),
+        ("MeterID", "некорректный тип/формат ID MeterID"),
+        ("DifferentiationType", "некорректный тип поля DifferentiationType"),
+    ],
+)
+def test_fractional_number_in_non_reading_field_is_still_rejected(json_db, caplog, field, reason):
+    # parse_float=Decimal не должен сделать дробное число допустимым ни в
+    # одном поле, кроме Reading: элемент пропускается с той же причиной.
+    item = meter(tariff_zones=1)
+    item[field] = "__FRACTION__"
+    payload = json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[point(meters=[item])])
+    ]).replace('"__FRACTION__"', "1.5")
+
+    summary = db.import_from_1c_json(payload)
+
+    assert summary["skipped"] == 1
+    assert table_count("metering_meters") == 0
+    assert any(reason in message for message in import_warnings(caplog))
+
+
+def test_fractional_account_number_and_room_key_keep_previous_handling(json_db, caplog):
+    payload = json.dumps([
+        account("__NUMBER__", guid("ACCOUNT-1")),
+        account("100-2", guid("ACCOUNT-2"), RoomKeyID="__ROOM__"),
+    ]).replace('"__NUMBER__"', "100.5").replace('"__ROOM__"', "2.5")
+
+    summary = db.import_from_1c_json(payload)
+
+    assert summary["skipped"] == 1
+    assert "некорректный тип поля PersonalAccount" in "\n".join(import_warnings(caplog))
+    assert db.get_ls("100-2")["room_key_id"] == EMPTY_1C_GUID
+
+
+# ── Reading в тарифной зоне ───────────────────────────────────────────────────
+
+
+def zone_readings() -> dict[str, str | None]:
+    connection = db.get_conn()
+    try:
+        return {
+            row["name"]: row["reading"]
+            for row in connection.execute("SELECT name, reading FROM metering_tariff_zones")
+        }
+    finally:
+        connection.close()
+
+
+def meter_with_reading(raw, *, present: bool = True) -> dict:
+    item = meter(tariff_zones=1)
+    if present:
+        item["Scales"][0]["TariffZones"][0]["Reading"] = raw
+    return item
+
+
+@pytest.mark.parametrize(
+    ("raw", "present", "expected", "warned"),
+    [
+        (None, False, None, False),
+        (None, True, None, False),
+        (13800, True, "13800", False),
+        (0, True, "0", False),
+        (12.5, True, "12.5", False),
+        (1.123456, True, "1.123456", False),
+        (100.0, True, "100", False),
+        (123456789012345, True, "123456789012345", False),
+        (True, True, None, True),
+        (False, True, None, True),
+        ("777666", True, None, True),
+        (-5, True, None, True),
+        (-0.5, True, None, True),
+        (9876543210987654, True, None, True),
+        (1.1234567, True, None, True),
+        (1e20, True, None, True),
+        ([1], True, None, True),
+        ({"v": 1}, True, None, True),
+    ],
+)
+def test_zone_reading_is_parsed_without_skipping_or_logging_raw_value(
+    json_db, caplog, raw, present, expected, warned
+):
+    summary = db.import_from_1c_json(json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[point(meters=[meter_with_reading(raw, present=present)])])
+    ]))
+
+    assert summary["zones_imported"] == 1
+    assert summary["skipped"] == 0
+    assert zone_readings() == {"Тариф 1": expected}
+    reading_warnings = [m for m in import_warnings(caplog) if "Reading" in m]
+    assert bool(reading_warnings) is warned
+    if warned:
+        message = reading_warnings[0]
+        assert ".TariffZones[0]" in message and "100-1" in message
+        if raw not in (True, False):
+            assert json.dumps(raw).strip('"') not in message
+
+
+def test_nan_and_infinity_reading_are_rejected(json_db, caplog):
+    payload = json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[point(meters=[meter_with_reading(0)])])
+    ]).replace('"Reading": 0', '"Reading": NaN')
+
+    db.import_from_1c_json(payload)
+    assert zone_readings() == {"Тариф 1": None}
+    db.import_from_1c_json(payload.replace("NaN", "Infinity"))
+    assert zone_readings() == {"Тариф 1": None}
+
+
+@pytest.mark.parametrize(
+    ("json_text", "expected"),
+    [
+        # 21 значащая цифра: через float сохранилось бы 123456789012345.12.
+        ("123456789012345.123456", "123456789012345.123456"),
+        ("999999999999999.999999", "999999999999999.999999"),
+        ("0.000001", "0.000001"),
+        ("12.50", "12.5"),
+        ("1E+3", "1000"),
+        ("1.5e2", "150"),
+        # Незначащие нули не считаются знаками после запятой.
+        ("1.5000000", "1.5"),
+        ("50.0000000", "50"),
+        ("1.0000005", None),
+        ("1234567890123456.5", None),
+        ("-0.0", None),
+        ("1e-7", None),
+    ],
+)
+def test_zone_reading_json_number_is_stored_exactly(json_db, json_text, expected):
+    payload = json.dumps([
+        account("100-1", guid("ACCOUNT-1"), points=[point(meters=[meter_with_reading("__R__")])])
+    ]).replace('"__R__"', json_text)
+
+    summary = db.import_from_1c_json(payload)
+
+    assert summary["skipped"] == 0
+    assert zone_readings() == {"Тариф 1": expected}
+
+
+def test_json_reading_accepts_only_int_and_decimal():
+    from decimal import Decimal
+
+    from rso_bot.reading_values import json_reading
+
+    assert json_reading(13800) == "13800"
+    assert json_reading(Decimal("123456789012345.123456")) == "123456789012345.123456"
+    assert json_reading(Decimal("NaN")) is None
+    assert json_reading(Decimal("Infinity")) is None
+    for raw in (True, False, "12", 12.5, None, [1]):
+        assert json_reading(raw) is None
+
+
+def test_zone_reading_is_updated_on_reimport(json_db):
+    def payload(raw):
+        return json.dumps([
+            account("100-1", guid("ACCOUNT-1"), points=[point(meters=[meter_with_reading(raw)])])
+        ])
+
+    db.import_from_1c_json(payload(50))
+    assert zone_readings() == {"Тариф 1": "50"}
+    db.import_from_1c_json(payload(75.25))
+    assert zone_readings() == {"Тариф 1": "75.25"}
+    db.import_from_1c_json(payload(None))
+    assert zone_readings() == {"Тариф 1": None}
+
+
+@pytest.mark.skipif(not EXAMPLE_EXPORT.exists(), reason="docs/JsonПример.txt is absent")
+def test_example_export_stores_reading_of_every_imported_zone(json_db, caplog):
+    db.import_from_1c_json(EXAMPLE_EXPORT.read_bytes())
+
+    connection = db.get_conn()
+    try:
+        readings = [row[0] for row in connection.execute("SELECT reading FROM metering_tariff_zones")]
+    finally:
+        connection.close()
+    assert len(readings) == 34
+    assert all(value is not None and value.isdigit() for value in readings)
+    assert not [m for m in import_warnings(caplog) if "Reading" in m]
+
+
+# ── Сохранение показаний (meter_readings) ─────────────────────────────────────
+
+
+def readings_meter(zone_readings_raw=(50, 10)) -> dict:
+    item = meter(tariff_zones=len(zone_readings_raw))
+    for zone, raw in zip(item["Scales"][0]["TariffZones"], zone_readings_raw):
+        zone["Reading"] = raw
+    return item
+
+
+def import_reading_account(number="100-1", zone_readings_raw=(50, 10), **fields):
+    db.import_from_1c_json(json.dumps([
+        account(
+            number, guid(f"ACCOUNT-{number}"),
+            points=[point(meters=[readings_meter(zone_readings_raw)])],
+            **fields,
+        )
+    ]))
+
+
+def entered(*values) -> list[dict]:
+    return [
+        {"scale_id": guid("SCALE-1"), "zone_id": guid(f"ZONE-{index}"), "value": value}
+        for index, value in enumerate(values, start=1)
+    ]
+
+
+def reading_rows() -> tuple[list[dict], list[dict]]:
+    connection = db.get_conn()
+    try:
+        headers = [dict(row) for row in connection.execute("SELECT * FROM meter_readings ORDER BY id")]
+        values = [
+            dict(row) for row in connection.execute(
+                "SELECT reading_id, scale_id, scale_name, zone_id, zone_name, value "
+                "FROM meter_reading_values ORDER BY id"
+            )
+        ]
+        return headers, values
+    finally:
+        connection.close()
+
+
+def set_status(reading_id: int, status: str) -> None:
+    connection = db.get_conn()
+    try:
+        connection.execute(
+            "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
+            "VALUES(?, ?, '2026-10-27 10:00:00')",
+            (reading_id, status),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def previous_values(number="100-1") -> list[str | None]:
+    return [zone["previous"] for zone in db.get_1c_meters_with_zones(number)[0]["zones"]]
+
+
+def test_save_meter_reading_copies_fresh_reference_data(json_db):
+    import_reading_account(RoomKeyID=guid("ROOM-1").upper())
+
+    result = db.save_meter_reading(7, "100-1", guid("METER-1"), list(reversed(entered("60", "12.5"))))
+
+    assert result["status"] == db.SAVE_OK
+    headers, values = reading_rows()
+    assert len(headers) == 1
+    header = headers[0]
+    assert str(uuid.UUID(header["task_id"], version=4)) == header["task_id"] == result["task_id"]
+    assert (
+        header["chat_id"], header["ls"], header["personal_account_id"], header["room_key_id"],
+        header["metering_point_id"], header["meter_id"], header["resource"], header["meter_number"],
+    ) == (
+        7, "100-1", guid("ACCOUNT-100-1"), guid("ROOM-1"), guid("POINT-1"), guid("METER-1"),
+        "Электроэнергия", "SN-001",
+    )
+    assert len(header["created_at"]) == 19  # 'YYYY-MM-DD HH:MM:SS'
+    # Порядок значений — порядок ввода; названия — из справочника.
+    assert [(v["zone_id"], v["zone_name"], v["value"]) for v in values] == [
+        (guid("ZONE-2"), "Тариф 2", "12.5"),
+        (guid("ZONE-1"), "Тариф 1", "60"),
+    ]
+
+
+def test_save_meter_reading_rejects_meter_moved_to_other_account(json_db):
+    import_reading_account()
+    db.import_from_1c_json(json.dumps([
+        account("100-1", guid("ACCOUNT-100-1")),
+        account("100-2", guid("ACCOUNT-100-2"), points=[point(meters=[readings_meter()])]),
+    ]))
+
+    result = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("60", "12"))
+
+    assert result == {"status": db.SAVE_METER_CHANGED}
+    assert reading_rows() == ([], [])
+
+
+def test_save_meter_reading_rejects_changed_scale_zone_set(json_db):
+    import_reading_account(zone_readings_raw=(50, 10))
+    import_reading_account(zone_readings_raw=(50, 10, 5))  # 1С добавила третью зону
+
+    assert db.save_meter_reading(7, "100-1", guid("METER-1"), entered("60", "12"))["status"] == (
+        db.SAVE_METER_CHANGED
+    )
+    duplicated = entered("60", "12", "6")
+    duplicated[2]["zone_id"] = guid("ZONE-1")
+    assert db.save_meter_reading(7, "100-1", guid("METER-1"), duplicated)["status"] == (
+        db.SAVE_METER_CHANGED
+    )
+    assert db.save_meter_reading(7, "100-404", guid("METER-1"), entered("60", "12", "6"))[
+        "status"
+    ] == db.SAVE_METER_CHANGED
+    assert reading_rows() == ([], [])
+
+
+def test_save_meter_reading_rejects_value_below_1c_reading_and_accepts_equal(json_db):
+    import_reading_account(zone_readings_raw=(50, 10))
+
+    low = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("50", "9.99"))
+
+    assert low["status"] == db.SAVE_TOO_LOW
+    assert (low["scale_id"], low["zone_id"], low["previous_value"]) == (
+        guid("SCALE-1"), guid("ZONE-2"), "10"
+    )
+    assert reading_rows() == ([], [])
+    assert db.save_meter_reading(7, "100-1", guid("METER-1"), entered("50", "10"))["status"] == (
+        db.SAVE_OK
+    )
+
+
+def test_previous_is_max_of_own_non_error_reading_and_1c_reading(json_db):
+    import_reading_account(zone_readings_raw=(50, None))
+    assert previous_values() == ["50", None]
+
+    first = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("60", "5"))
+    assert previous_values() == ["60", "5"]
+    set_status(first["reading_id"], "PENDING")
+    assert previous_values() == ["60", "5"]
+
+    second = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("70.5", "6"))
+    set_status(second["reading_id"], "SUCCESS")
+    assert previous_values() == ["70.5", "6"]
+
+    third = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("1000", "900"))
+    set_status(third["reading_id"], "ERROR")
+    # Отклонённое 1С показание не учитывается: снова действует предыдущее.
+    assert previous_values() == ["70.5", "6"]
+
+    import_reading_account(zone_readings_raw=(80, 1))
+    assert previous_values() == ["80", "6"]
+    # Сравнение — как чисел, а не строк: "100" > "80".
+    db.save_meter_reading(7, "100-1", guid("METER-1"), entered("100", "6"))
+    assert previous_values() == ["100", "6"]
+
+
+def test_concurrent_reading_raises_previous_inside_save_transaction(json_db):
+    import_reading_account(zone_readings_raw=(50, 10))
+    selected_by_user = db.get_1c_meters_with_zones("100-1")[0]
+    assert [zone["previous"] for zone in selected_by_user["zones"]] == ["50", "10"]
+
+    # Пока пользователь вводил 80, другой чат сохранил 100.
+    assert db.save_meter_reading(8, "100-1", guid("METER-1"), entered("100", "10"))["status"] == (
+        db.SAVE_OK
+    )
+    result = db.save_meter_reading(7, "100-1", guid("METER-1"), entered("80", "10"))
+
+    assert result["status"] == db.SAVE_TOO_LOW
+    assert result["previous_value"] == "100"
+    assert result["previous"][(guid("SCALE-1"), guid("ZONE-1"))] == "100"
+    headers, _ = reading_rows()
+    assert [header["chat_id"] for header in headers] == [8]
+
+
+def test_save_meter_reading_rejects_invalid_value_before_writing(json_db):
+    import_reading_account()
+
+    for bad in ("-1", "abc", None, "1.1234567"):
+        with pytest.raises(ValueError):
+            db.save_meter_reading(7, "100-1", guid("METER-1"), entered(bad, "12"))
+    assert reading_rows() == ([], [])
+
+
+def test_previous_value_lookup_uses_meter_index(json_db):
+    connection = db.get_conn()
+    try:
+        plan = " ".join(
+            row["detail"] for row in connection.execute(
+                "EXPLAIN QUERY PLAN SELECT v.value FROM meter_readings r "
+                "JOIN meter_reading_values v "
+                "ON v.reading_id=r.id AND v.scale_id=? AND v.zone_id=? "
+                "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+                "WHERE r.meter_id=? AND (st.status IS NULL OR st.status<>'ERROR') "
+                "ORDER BY r.id DESC LIMIT 1",
+                ("s", "z", "m"),
+            )
+        )
+    finally:
+        connection.close()
+    assert "ix_meter_readings_meter" in plan
+    assert "SCAN" not in plan.replace("SCAN CONSTANT ROW", "")

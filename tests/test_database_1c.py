@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -10,6 +11,13 @@ from threading import Barrier
 from unittest.mock import MagicMock, patch
 
 import database as db
+
+ACCOUNT_ID = "0a000000-0000-4000-8000-000000000001"
+ROOM_ID = "0b000000-0000-4000-8000-000000000001"
+POINT_ID = "0c000000-0000-4000-8000-000000000001"
+METER_ID = "0d000000-0000-4000-8000-000000000001"
+SCALE_ID = "0e000000-0000-4000-8000-000000000001"
+ZONE_ID = "0f000000-0000-4000-8000-000000000001"
 
 
 class Database1CTests(unittest.TestCase):
@@ -317,6 +325,97 @@ class Database1CTests(unittest.TestCase):
 
         self.assertEqual(state["pending_batch_id"], "batch-1")
         self.assertEqual(state["last_attempt_at"], "2026-08-19 12:00")
+
+    # ── Новое хранилище показаний (meter_readings) ────────────────────────────
+
+    def import_meter(self, number: str = "100001") -> None:
+        db.import_from_1c_json(json.dumps([{
+            "PersonalAccountID": ACCOUNT_ID,
+            "PersonalAccount": number,
+            "RoomKeyID": ROOM_ID,
+            "MeteringPoints": [{
+                "MeteringPointID": POINT_ID,
+                "Resource": "Вода",
+                "Meters": [{
+                    "MeterID": METER_ID,
+                    "MeterNumber": "M-1",
+                    "Scales": [{
+                        "ScaleID": SCALE_ID,
+                        "Scale": "Основная",
+                        "TariffZones": [{"TariffZoneID": ZONE_ID, "TariffZone": "Сутки", "Reading": 5}],
+                    }],
+                }],
+            }],
+        }]))
+
+    def save(self, value: str, chat_id: int = 11) -> dict:
+        return db.save_meter_reading(
+            chat_id, "100001", METER_ID,
+            [{"scale_id": SCALE_ID, "zone_id": ZONE_ID, "value": value}],
+        )
+
+    def test_new_readings_never_enter_legacy_pokazaniya_or_its_queue(self) -> None:
+        db.add_pokazaniya(11, "100001", "Вода", "OLD", "10")
+        self.import_meter()
+
+        self.assertEqual(self.save("7")["status"], db.SAVE_OK)
+
+        legacy = db.get_pokazaniya()
+        self.assertEqual([(row["meter_number"], row["value1"]) for row in legacy], [("OLD", "10")])
+        # Старый пакетный обмен видит только строки pokazaniya.
+        self.assertEqual(
+            [row["meter_number"] for row in db.get_unsent_1c_readings(500)], ["OLD"]
+        )
+
+    def test_status_table_rejects_unknown_status_and_cascades_on_delete(self) -> None:
+        self.import_meter()
+        reading_id = self.save("6")["reading_id"]
+        conn = db.get_conn()
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
+                    "VALUES (?, 'DONE', 'now')", (reading_id,),
+                )
+            conn.execute(
+                "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
+                "VALUES (?, 'PENDING', 'now')", (reading_id,),
+            )
+            conn.execute("DELETE FROM meter_readings WHERE id=?", (reading_id,))
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM meter_reading_values").fetchone()[0], 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM meter_reading_status").fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+
+    def test_concurrent_saves_never_store_a_lower_later_value(self) -> None:
+        self.import_meter()
+        for _ in range(5):
+            barrier = Barrier(2)
+
+            def save(value: str, barrier=barrier) -> str:
+                barrier.wait(timeout=5)
+                return self.save(value)["status"]
+
+            base = int(db.get_1c_meters_with_zones("100001")[0]["zones"][0]["previous"])
+            high, low = str(base + 20), str(base + 10)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(save, [high, low]))
+
+            self.assertIn(db.SAVE_OK, outcomes)
+            conn = db.get_conn()
+            try:
+                values = [row[0] for row in conn.execute(
+                    "SELECT value FROM meter_reading_values ORDER BY reading_id"
+                )]
+            finally:
+                conn.close()
+            numbers = [int(value) for value in values]
+            self.assertEqual(numbers, sorted(numbers))
 
 
 if __name__ == "__main__":
