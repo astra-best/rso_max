@@ -427,6 +427,7 @@ def init_db() -> None:
         )
     """)
     c.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+    _ensure_column(c, "sync_1c_state", "status_cursor_id", "INTEGER NOT NULL DEFAULT 0")
 
     # Таблица comments остаётся как архивная (appeal_id → appeals_legacy).
     # Новые ответы операторов идут в appeal_responses.
@@ -1797,6 +1798,142 @@ def list_meter_readings(limit: int = 1000) -> list[dict]:
         )
         result.append(item)
     return result
+
+
+def get_unsent_meter_reading_tasks(limit: int) -> list[dict]:
+    """Build up to ``limit`` persisted meter-reading tasks in the 1C wire format."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT r.* FROM meter_readings r LEFT JOIN meter_reading_status st "
+            "ON st.reading_id=r.id WHERE st.reading_id IS NULL "
+            "ORDER BY r.id LIMIT ?", (max(0, min(int(limit), 100)),),
+        ).fetchall()
+        values = _values_by_reading(conn, [row["id"] for row in rows])
+    finally:
+        conn.close()
+
+    tasks = []
+    for row in rows:
+        points: dict[str, dict] = {}
+        meters: dict[tuple[str, str], dict] = {}
+        for value in values[row["id"]]:
+            point = points.setdefault(row["metering_point_id"], {
+                "MeteringPointID": row["metering_point_id"], "Meters": [],
+            })
+            meter_key = (row["metering_point_id"], row["meter_id"])
+            meter = meters.get(meter_key)
+            if meter is None:
+                meter = {"MeteringDeviceID": row["meter_id"], "Scales": []}
+                meters[meter_key] = meter
+                point["Meters"].append(meter)
+            scale = next(
+                (item for item in meter["Scales"] if item["ScaleID"] == value["scale_id"]),
+                None,
+            )
+            if scale is None:
+                scale = {"ScaleID": value["scale_id"], "TariffZones": []}
+                meter["Scales"].append(scale)
+            number = Decimal(value["value"])
+            wire_value = int(number) if number == number.to_integral_value() else number
+            scale["TariffZones"].append({
+                "TariffZoneID": value["zone_id"], "Value": wire_value,
+            })
+        created = datetime.fromisoformat(row["created_at"])
+        tasks.append({
+            "TaskID": row["task_id"],
+            "PersonalAccountID": row["personal_account_id"],
+            "RoomKeyID": row["room_key_id"],
+            "Date": created.strftime("%d.%m.%Y %H:%M:%S"),
+            "MeteringPoints": list(points.values()),
+        })
+    return tasks
+
+
+def mark_meter_readings_pending(task_ids: list[str]) -> None:
+    """Record 1C acceptance of a sent batch; retries keep existing status."""
+    if not task_ids:
+        return
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for task_id in task_ids:
+            row = conn.execute(
+                "SELECT id FROM meter_readings WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Unknown 1C task")
+            conn.execute(
+                "INSERT OR IGNORE INTO meter_reading_status(reading_id,status,message,updated_at) "
+                "VALUES (?,'PENDING','',?)", (row["id"], _local_now_seconds()),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_pending_meter_reading_task_ids(limit: int) -> list[str]:
+    conn = get_conn()
+    try:
+        bounded_limit = max(0, min(int(limit), 100))
+        if not bounded_limit:
+            return []
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO sync_1c_state (id) VALUES (1)")
+        cursor = conn.execute(
+            "SELECT status_cursor_id FROM sync_1c_state WHERE id=1"
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT r.id,r.task_id FROM meter_readings r JOIN meter_reading_status st "
+            "ON st.reading_id=r.id WHERE st.status='PENDING' AND r.id>? "
+            "ORDER BY r.id LIMIT ?", (cursor, bounded_limit),
+        ).fetchall()
+        if len(rows) < bounded_limit:
+            rows += conn.execute(
+                "SELECT r.id,r.task_id FROM meter_readings r JOIN meter_reading_status st "
+                "ON st.reading_id=r.id WHERE st.status='PENDING' AND r.id<=? "
+                "ORDER BY r.id LIMIT ?", (cursor, bounded_limit - len(rows)),
+            ).fetchall()
+        if rows:
+            conn.execute(
+                "UPDATE sync_1c_state SET status_cursor_id=? WHERE id=1", (rows[-1]["id"],)
+            )
+        conn.commit()
+        return [row["task_id"] for row in rows]
+    finally:
+        conn.close()
+
+
+def apply_meter_reading_task_statuses(statuses: list[dict]) -> None:
+    """Apply a complete status response without reviving terminal tasks."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for item in statuses:
+            task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("message", "")
+            if not isinstance(task_id, str) or not task_id or status not in {"PENDING", "SUCCESS", "ERROR"}:
+                raise ValueError("Invalid 1C task status")
+            if not isinstance(message, str) or (status != "ERROR" and message):
+                raise ValueError("Invalid 1C task status message")
+            row = conn.execute(
+                "SELECT r.id, st.status FROM meter_readings r LEFT JOIN meter_reading_status st "
+                "ON st.reading_id=r.id WHERE r.task_id=?", (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "PENDING":
+                raise ValueError("Unknown or non-pending 1C task")
+            conn.execute(
+                "UPDATE meter_reading_status SET status=?,message=?,updated_at=? WHERE reading_id=?",
+                (status, message, _local_now_seconds(), row["id"]),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 _CUSTOMER_READING_SQL = "NOT (chat_id IS 0 AND created_at IS '2000-01-01 00:00')"

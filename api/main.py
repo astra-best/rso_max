@@ -45,7 +45,7 @@ from config import (
     API_HOST,
     API_PORT,
     ENABLE_1C_INTEGRATION,
-    INTEGRATION_1C_SYNC_RETRY_HOURS,
+    INTEGRATION_1C_SYNC_INTERVAL_MINUTES,
     LOG_BACKUP_COUNT,
     LOG_FILE,
     LOG_LEVEL,
@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(
             sync_1c_job,
             trigger="interval",
-            hours=INTEGRATION_1C_SYNC_RETRY_HOURS,
+            minutes=INTEGRATION_1C_SYNC_INTERVAL_MINUTES,
             id="sync_1c",
             max_instances=1,
             coalesce=True,

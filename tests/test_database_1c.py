@@ -46,6 +46,70 @@ class Database1CTests(unittest.TestCase):
         self.assertIn("authorized_1c", bot_user_columns)
         self.assertIsNotNone(state)
 
+    def test_1c_task_queue_builds_nested_payload_and_tracks_status(self) -> None:
+        conn = db.get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO meter_readings(task_id,created_at,chat_id,ls,personal_account_id,"
+                "room_key_id,metering_point_id,meter_id,resource,meter_number) "
+                "VALUES ('task-1','2026-11-03 20:07:07',42,'100001',?,'room-1','point-1',"
+                "'meter-1','Electricity','M-1')", (ACCOUNT_ID,),
+            )
+            reading_id = conn.execute("SELECT id FROM meter_readings WHERE task_id='task-1'").fetchone()[0]
+            conn.executemany(
+                "INSERT INTO meter_reading_values(reading_id,scale_id,scale_name,zone_id,zone_name,value) "
+                "VALUES (?,?,?,?,?,?)",
+                [(reading_id, SCALE_ID, "Active", ZONE_ID, "Day", "21852"),
+                 (reading_id, SCALE_ID, "Active", "zone-2", "Night", "8492")],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        tasks = db.get_unsent_meter_reading_tasks(100)
+        self.assertEqual(tasks, [{
+            "TaskID": "task-1", "PersonalAccountID": ACCOUNT_ID,
+            "RoomKeyID": "room-1", "Date": "03.11.2026 20:07:07",
+            "MeteringPoints": [{"MeteringPointID": "point-1", "Meters": [{
+                "MeteringDeviceID": "meter-1", "Scales": [{"ScaleID": SCALE_ID,
+                    "TariffZones": [{"TariffZoneID": ZONE_ID, "Value": 21852},
+                                    {"TariffZoneID": "zone-2", "Value": 8492}]}]
+            }]}],
+        }])
+        db.mark_meter_readings_pending(["task-1"])
+        self.assertEqual(db.get_pending_meter_reading_task_ids(100), ["task-1"])
+
+        db.apply_meter_reading_task_statuses([{
+            "TaskID": "task-1", "Status": "ERROR", "message": "Rejected",
+        }])
+        row = db.list_meter_readings()[0]
+        self.assertEqual((row["status"], row["message"]), ("ERROR", "Rejected"))
+        self.assertEqual(db.get_pending_meter_reading_task_ids(100), [])
+
+    def test_pending_status_polling_rotates_past_still_pending_tasks(self) -> None:
+        conn = db.get_conn()
+        try:
+            for index in range(3):
+                conn.execute(
+                    "INSERT INTO meter_readings(task_id,created_at,ls,personal_account_id,"
+                    "room_key_id,metering_point_id,meter_id,meter_number) "
+                    "VALUES (?, '2026-11-03 20:07:07','100001',?,'room','point','meter',?)",
+                    (f"task-{index}", ACCOUNT_ID, f"M-{index}"),
+                )
+                reading_id = conn.execute(
+                    "SELECT id FROM meter_readings WHERE task_id=?", (f"task-{index}",)
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO meter_reading_status(reading_id,status,updated_at) "
+                    "VALUES (?,'PENDING','now')", (reading_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ["task-0", "task-1"])
+        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ["task-2", "task-0"])
+
     def test_1c_authorization_flag_is_persisted(self) -> None:
         db.upsert_bot_user(42, "100001", "", authorized_1c=True)
         self.assertEqual(db.get_bot_user(42)["authorized_1c"], 1)

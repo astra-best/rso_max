@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import httpx
 
@@ -42,7 +45,7 @@ class Mock1CBackend:
         self._ttl = timedelta(minutes=ttl_minutes)
         self._max_attempts = max_attempts
         self._pending: dict[tuple[str, int], dict] = {}
-        self._sync_results: dict[str, dict] = {}
+        self._task_statuses: dict[str, dict] = {}
         self._lock = threading.Lock()
 
     def request_auth_code(self, ls: str, chat_id: int) -> dict:
@@ -86,28 +89,22 @@ class Mock1CBackend:
                 ],
             }
 
-    def sync_readings(self, batch_id: str, readings: list[dict]) -> dict:
+    def send_tasks(self, tasks: list[dict]) -> dict:
         with self._lock:
-            cached = self._sync_results.get(batch_id)
-            if cached is not None:
-                return cached
-            statuses = []
-            for reading in readings:
-                statuses.append({
-                    "ls": reading["ls"],
-                    "meter_number": reading["meter_number"],
-                    "value1": reading["value1"],
-                    "value2": reading.get("value2"),
-                    "submitted_at": reading["submitted_at"],
-                    "status": "accepted",
-                })
-            result = {
-                "batch_id": batch_id,
-                "readings_status": statuses,
-                "meters_changes": [],
-            }
-            self._sync_results[batch_id] = result
-            return result
+            for task in tasks:
+                self._task_statuses.setdefault(
+                    task["TaskID"], {"TaskID": task["TaskID"], "Status": "PENDING", "message": ""}
+                )
+        return {"status": "ok", "message": ""}
+
+    def sync_task_statuses(self, task_ids: list[str]) -> dict:
+        with self._lock:
+            return {"Tasks": [
+                self._task_statuses.get(
+                    task_id, {"TaskID": task_id, "Status": "ERROR", "message": "Task not found"}
+                )
+                for task_id in task_ids
+            ]}
 
 
 _mock_backend = Mock1CBackend(
@@ -117,18 +114,46 @@ _mock_backend = Mock1CBackend(
 )
 
 
+def _encode_json(body: dict) -> bytes:
+    """Encode Decimal values as exact unquoted JSON numbers."""
+    decimals: dict[str, str] = {}
+    nonce = uuid.uuid4().hex
+
+    def replace(value):
+        if isinstance(value, Decimal):
+            marker = f"__JSON_DECIMAL_{nonce}_{len(decimals)}__"
+            decimals[marker] = format(value, "f")
+            return marker
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        return value
+
+    encoded = json.dumps(replace(body), ensure_ascii=False)
+    for marker, number in decimals.items():
+        encoded = encoded.replace(json.dumps(marker), number)
+    return encoded.encode("utf-8")
+
+
 def _post_json(path: str, body: dict, timeout: int) -> tuple[dict | None, str | None]:
     if not INTEGRATION_1C_BASE_URL or not INTEGRATION_1C_AUTH_TOKEN:
         log.error("1С-запрос %s не выполнен: отсутствует обязательная конфигурация", path)
         return None, "configuration_error"
 
     try:
-        response = httpx.post(
-            _join_url(INTEGRATION_1C_BASE_URL, path),
-            headers={"Authorization": f"Bearer {INTEGRATION_1C_AUTH_TOKEN}"},
-            json=body,
-            timeout=timeout,
-        )
+        headers = {"Authorization": f"Bearer {INTEGRATION_1C_AUTH_TOKEN}"}
+        if _contains_decimal(body):
+            headers["Content-Type"] = "application/json"
+            response = httpx.post(
+                _join_url(INTEGRATION_1C_BASE_URL, path), headers=headers,
+                content=_encode_json(body), timeout=timeout,
+            )
+        else:
+            response = httpx.post(
+                _join_url(INTEGRATION_1C_BASE_URL, path), headers=headers,
+                json=body, timeout=timeout,
+            )
     except httpx.TimeoutException:
         log.warning("1С-запрос %s: timeout", path)
         return None, "timeout"
@@ -158,6 +183,16 @@ def _post_json(path: str, body: dict, timeout: int) -> tuple[dict | None, str | 
     return data, None
 
 
+def _contains_decimal(value) -> bool:
+    if isinstance(value, Decimal):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_decimal(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_decimal(item) for item in value)
+    return False
+
+
 def request_auth_code(ls: str, chat_id: int) -> tuple[dict | None, str | None]:
     if INTEGRATION_1C_MOCK:
         return _mock_backend.request_auth_code(ls, chat_id), None
@@ -178,11 +213,16 @@ def verify_auth_code(ls: str, chat_id: int, code: str) -> tuple[dict | None, str
     )
 
 
-def sync_readings(batch_id: str, readings: list[dict]) -> tuple[dict | None, str | None]:
+def send_tasks(tasks: list[dict]) -> tuple[dict | None, str | None]:
     if INTEGRATION_1C_MOCK:
-        return _mock_backend.sync_readings(batch_id, readings), None
+        return _mock_backend.send_tasks(tasks), None
+    return _post_json("/sent", {"Tasks": tasks}, INTEGRATION_1C_SYNC_TIMEOUT_SECONDS)
+
+
+def sync_task_statuses(task_ids: list[str]) -> tuple[dict | None, str | None]:
+    if INTEGRATION_1C_MOCK:
+        return _mock_backend.sync_task_statuses(task_ids), None
     return _post_json(
-        "/readings/sync",
-        {"batch_id": batch_id, "readings": readings},
+        "/sync", {"Tasks": [{"TaskID": task_id} for task_id in task_ids]},
         INTEGRATION_1C_SYNC_TIMEOUT_SECONDS,
     )

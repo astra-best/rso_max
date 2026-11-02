@@ -13,7 +13,7 @@ MAX-бот -> внутренний FastAPI -> HTTPS-сервис 1С
 1. Бот вызывает внутренние методы FastAPI для авторизации пользователя.
 2. FastAPI вызывает опубликованные методы 1С.
 3. Фоновая задача FastAPI передаёт в 1С накопленные показания.
-4. FastAPI сохраняет ответы в SQLite и отправляет пользователю уведомление через MAX.
+4. FastAPI persists task statuses in SQLite; the portal displays the current processing status.
 
 Внутреннее и внешнее API используют разные Bearer-токены:
 
@@ -38,7 +38,8 @@ MAX-бот -> внутренний FastAPI -> HTTPS-сервис 1С
 ```text
 /auth/request-code
 /auth/verify-code
-/readings/sync
+/sent
+/sync
 ```
 
 Например, если базовый адрес заканчивается на `/hs/integration`, итоговый адрес первого метода будет заканчиваться на `/hs/integration/auth/request-code`.
@@ -194,132 +195,59 @@ POST /auth/verify-code
 
 Начальные показания в этом ответе не передаются. Python создаёт новые счётчики с техническими значениями `initial1=0` и `initial2=0`; при включённой интеграции они не используются для локальной проверки показаний.
 
-### 3.3 Синхронизация показаний
+### 3.3 Sending readings
 
 ```text
-POST /readings/sync
+POST /sent
 ```
 
-Назначение: одним запросом передать накопленные показания и получить:
-
-- финальный статус каждого показания;
-- изменения списка счётчиков с момента прошлого успешного обмена.
-
-Запрос:
+Request contains up to 100 tasks in `Tasks`. One task is one meter reading for one personal account. Bot creates `TaskID` when saving the reading and reuses it on network retry. Nesting: `MeteringPoints` -> `Meters` -> `Scales` -> `TariffZones`. `Value` is a JSON number with up to 15 integer digits and 6 fractional digits. `Date` format is `DD.MM.YYYY HH:MM:SS`, without timezone.
 
 ```json
 {
-  "batch_id": "20260820-1200-a1b2c3d4",
-  "readings": [
-    {
-      "chat_id": 123456789,
-      "ls": "100001",
-      "meter_number": "METER-001",
-      "value1": "150.0",
-      "value2": null,
-      "submitted_at": "2026-08-20 11:42"
-    },
-    {
-      "chat_id": 123456789,
-      "ls": "100001",
-      "meter_number": "METER-002",
-      "value1": "80.0",
-      "value2": "35.0",
-      "submitted_at": "2026-08-20 11:44"
-    }
-  ]
+  "Tasks": [{
+    "TaskID": "e8bb6d5e-2022-45e3-ae57-055dc46df68b",
+    "PersonalAccountID": "20c484a6-6045-11ec-83a6-d41b81e4026e",
+    "RoomKeyID": "00000000-0000-0000-0000-000000000000",
+    "Date": "30.10.2026 20:07:07",
+    "MeteringPoints": [{
+      "MeteringPointID": "20c484a7-6045-11ec-83a6-d41b81e4026e",
+      "Meters": [{
+        "MeteringDeviceID": "20c484a8-6045-11ec-83a6-d41b81e4026e",
+        "Scales": [{
+          "ScaleID": "ff0a78b9-9ae3-11ea-9612-00155d016301",
+          "TariffZones": [
+            {"TariffZoneID": "ab89b37f-94e4-11ea-960f-00155d016301", "Value": 21852},
+            {"TariffZoneID": "ab89b380-94e4-11ea-960f-00155d016301", "Value": 8492}
+          ]
+        }]
+      }]
+    }]
+  }]
 }
 ```
 
-Поля пакета:
+Whole-batch acceptance: `{"status":"ok","message":""}`. Whole-batch rejection: `{"status":"error","message":"error text"}`. On `ok`, each task is recorded as `PENDING`. Resending the same `TaskID` must be idempotent so a retry after timeout cannot create a duplicate.
 
-- `batch_id` — непрозрачный уникальный идентификатор пакета;
-- `readings` — массив от 0 до 500 показаний.
+### 3.4 Polling task statuses
 
-Поля показания:
+```text
+POST /sync
+```
 
-- `chat_id` — идентификатор пользователя MAX;
-- `ls` — уникальный лицевой счёт;
-- `meter_number` — номер счётчика;
-- `value1` — показание Т1 в строковом виде;
-- `value2` — показание Т2 в строковом виде либо `null`;
-- `submitted_at` — время ввода показания в формате `YYYY-MM-DD HH:MM`.
-
-Пустой массив `readings` допустим: такой запрос используется для получения изменений счётчиков, даже если новых показаний нет.
-
-Ответ:
+Request contains only IDs of locally `PENDING` tasks:
 
 ```json
-{
-  "batch_id": "20260820-1200-a1b2c3d4",
-  "readings_status": [
-    {
-      "ls": "100001",
-      "meter_number": "METER-001",
-      "value1": "150.0",
-      "value2": null,
-      "submitted_at": "2026-08-20 11:42",
-      "status": "accepted"
-    },
-    {
-      "ls": "100001",
-      "meter_number": "METER-002",
-      "value1": "80.0",
-      "value2": "35.0",
-      "submitted_at": "2026-08-20 11:44",
-      "status": "rejected"
-    }
-  ],
-  "meters_changes": [
-    {
-      "ls": "100001",
-      "action": "added",
-      "meter_number": "METER-003",
-      "resource_type": "Электроэнергия",
-      "meter_type": "Однотарифный"
-    },
-    {
-      "ls": "100001",
-      "action": "changed",
-      "meter_number": "METER-002",
-      "resource_type": "Электроэнергия",
-      "meter_type": "Двухтарифный"
-    },
-    {
-      "ls": "100001",
-      "action": "removed",
-      "meter_number": "METER-004"
-    }
-  ]
-}
+{"Tasks":[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b"}]}
 ```
 
-Требования к ответу:
+1C returns a status for every requested task. An unknown `TaskID` is returned as `ERROR`. Allowed statuses: `PENDING`, `SUCCESS`, `ERROR`; `message` contains error details for `ERROR` and is empty otherwise. Polling interval defaults to one hour and is configurable through `INTEGRATION_1C_SYNC_INTERVAL_MINUTES`. `SUCCESS` and `ERROR` are terminal.
 
-1. `batch_id` должен точно совпадать со значением из запроса.
-2. Для каждого элемента `readings` должен присутствовать ровно один соответствующий элемент `readings_status`.
-3. Поля `ls`, `meter_number`, `value1`, `value2` и `submitted_at` должны повторять исходное показание без изменения.
-4. `status` может быть только `accepted` или `rejected`.
-5. `meters_changes` должен присутствовать всегда; при отсутствии изменений передаётся пустой массив.
-6. `action` может быть только `added`, `changed` или `removed`.
-7. Для `added` и `changed` обязательны `resource_type` и поддерживаемый `meter_type`.
-8. Для `removed` достаточно `ls` и `meter_number`.
+```json
+{"Tasks":[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b","Status":"PENDING","message":""}]}
+```
 
-Причина отклонения показания в текущем контракте не передаётся. Пользователь получает обобщённое уведомление «показания не приняты» и вводит их заново.
-
-### 3.4 Идемпотентность синхронизации
-
-`batch_id` является ключом идемпотентности.
-
-Если 1С уже обработала пакет, а Python повторил его из-за потери ответа или сетевой ошибки, 1С должна:
-
-1. Не создавать показания повторно.
-2. Найти сохранённый результат по `batch_id`.
-3. Вернуть тот же ответ повторно.
-
-При неудаче Python сохраняет прежний `batch_id` и прежний состав пакета. Повтор выполняется через один час. Новые показания в зависший пакет не добавляются.
-
-Обычный обмен выполняется раз в 24 часа после последней успешной синхронизации. Если очередь больше 500 строк, следующие пакеты отправляются по одному каждый час до полного опустошения очереди.
+Both sending and polling are limited by `INTEGRATION_1C_BATCH_SIZE` (default 100 tasks).
 
 ### 3.5 Предыдущие показания в выгрузке лицевых счетов
 
@@ -406,7 +334,7 @@ POST /api/v1/integrations/1c/auth/verify-code
 | `503` | Не заданы обязательные настройки реального подключения к 1С |
 | `504` | Тайм-аут запроса к 1С |
 
-Внутреннего HTTP-метода для `/readings/sync` нет. Фоновая задача уже работает внутри процесса FastAPI и вызывает `client_1c.sync_readings()` напрямую.
+There is no internal HTTP route for 1C exchange. The FastAPI background job calls `client_1c.send_tasks()` and `client_1c.sync_task_statuses()` directly.
 
 Интерактивная документация внутреннего API доступна после запуска FastAPI:
 
@@ -445,7 +373,7 @@ INTEGRATION_1C_MOCK_CODE=000000
 3. Установить `INTEGRATION_1C_MOCK=false`.
 4. Перезапустить FastAPI и MAX-бот.
 5. Проверить запрос кода, проверку кода и получение счётчиков.
-6. Передать тестовое показание и проверить ответ `/readings/sync`.
+/sync`.
 7. Убедиться, что коды, токены, e-mail и полные тела запросов не попадают в журналы.
 
 Если локальные запросы бота к FastAPI перехватывает VPN или системный прокси, добавить в `.env`:

@@ -1,177 +1,84 @@
-"""Идемпотентная фоновая синхронизация очереди показаний с 1С."""
+"""Scheduled sending of meter-reading tasks and polling their 1C statuses."""
 from __future__ import annotations
 
-import asyncio
 import logging
-import uuid
-from collections import Counter
-from datetime import datetime, timedelta, timezone
 
 import client_1c
 import database as db
-from api.notifier import notify_client
-from config import (
-    ENABLE_1C_INTEGRATION,
-    INTEGRATION_1C_BATCH_SIZE,
-    INTEGRATION_1C_SYNC_PERIOD_HOURS,
-    INTEGRATION_1C_SYNC_RETRY_HOURS,
-    TIMEZONE_OFFSET,
-)
+from config import ENABLE_1C_INTEGRATION, INTEGRATION_1C_BATCH_SIZE
 
 log = logging.getLogger("rso.sync_1c")
 
 
-def _now() -> datetime:
-    return datetime.now(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-
-
-def _generate_batch_id(now: datetime) -> str:
-    return f"{now:%Y%m%d-%H%M}-{uuid.uuid4().hex[:8]}"
-
-
-def _reading_payload(row) -> dict:
-    return {
-        "chat_id": row["chat_id"],
-        "ls": row["ls"],
-        "meter_number": row["meter_number"],
-        "value1": row["value1"],
-        "value2": row["value2"],
-        "submitted_at": row["created_at"],
-    }
-
-
-def _reading_key(item: dict) -> tuple:
+def _valid_ack(result: dict | None) -> bool:
     return (
-        str(item.get("ls")),
-        str(item.get("meter_number")),
-        str(item.get("value1")),
-        None if item.get("value2") is None else str(item.get("value2")),
-        str(item.get("submitted_at")),
+        isinstance(result, dict)
+        and isinstance(result.get("status"), str)
+        and result.get("status") in {"ok", "error"}
+        and isinstance(result.get("message"), str)
+        and ((result["status"] == "ok" and result["message"] == "")
+             or (result["status"] == "error" and bool(result["message"])))
     )
 
 
-def _valid_result(result: dict | None, batch_id: str, readings: list[dict]) -> bool:
-    if (
-        not isinstance(result, dict)
-        or not isinstance(result.get("batch_id"), str)
-        or result["batch_id"] != batch_id
-    ):
-        return False
-    statuses = result.get("readings_status")
-    changes = result.get("meters_changes")
-    if not isinstance(statuses, list) or not isinstance(changes, list):
-        return False
+def _valid_status_response(result: dict | None, task_ids: list[str]) -> list[dict] | None:
+    if not isinstance(result, dict) or not isinstance(result.get("Tasks"), list):
+        return None
+    statuses = result["Tasks"]
+    seen = set()
     for item in statuses:
+        if not isinstance(item, dict):
+            return None
+        task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("message")
         if (
-            not isinstance(item, dict)
-            or not isinstance(item.get("ls"), str)
-            or not item["ls"]
-            or not isinstance(item.get("meter_number"), str)
-            or not item["meter_number"]
-            or not isinstance(item.get("value1"), str)
-            or not isinstance(item.get("value2"), (str, type(None)))
-            or not isinstance(item.get("submitted_at"), str)
-            or not item["submitted_at"]
-            or not isinstance(item.get("status"), str)
-            or item["status"] not in {"accepted", "rejected"}
+            not isinstance(task_id, str) or task_id not in task_ids or task_id in seen
+            or not isinstance(status, str)
+            or status not in {"PENDING", "SUCCESS", "ERROR"}
+            or not isinstance(message, str)
+            or (status == "ERROR" and not message)
+            or (status != "ERROR" and message)
         ):
-            return False
-    if Counter(_reading_key(item) for item in statuses) != Counter(
-        _reading_key(item) for item in readings
-    ):
-        return False
-    for change in changes:
-        if not isinstance(change, dict):
-            return False
-        action = change.get("action")
-        if not isinstance(action, str) or action not in {"added", "changed", "removed"}:
-            return False
-        if (
-            not isinstance(change.get("ls"), str)
-            or not change["ls"]
-            or not isinstance(change.get("meter_number"), str)
-            or not change["meter_number"]
-        ):
-            return False
-        if action != "removed" and (
-            not isinstance(change.get("resource_type"), str)
-            or not change["resource_type"]
-            or not isinstance(change.get("meter_type"), str)
-            or change["meter_type"] not in {"Однотарифный", "Двухтарифный"}
-        ):
-            return False
-    return True
+            return None
+        seen.add(task_id)
+    if seen != set(task_ids):
+        return None
+    return statuses
 
 
-def _notify_reading(reading: dict) -> None:
-    if reading.get("chat_id") == 0 and reading.get("created_at") == "2000-01-01 00:00":
-        return  # Historical import baselines have no customer to notify.
-    status = reading["status_1c"]
-    if status == "accepted":
-        text = (
-            f"✅ Ваши показания по счётчику {reading['resource_type']} "
-            f"№{reading['meter_number']} приняты."
-        )
-        buttons = None
-    else:
-        text = (
-            f"❌ Ваши показания по счётчику {reading['resource_type']} "
-            f"№{reading['meter_number']} не приняты."
-        )
-        buttons = [("🏠 Главное меню", "main_menu")]
-    try:
-        asyncio.run(notify_client("max", reading.get("chat_id"), text, buttons))
-    except Exception as exc:
-        log.error(
-            "Не удалось уведомить MAX о статусе показания (%s)",
-            type(exc).__name__,
-        )
-
-
-def sync_1c_job(now: datetime | None = None) -> str:
-    """Выполняет суточный обмен или почасовой повтор зависшего пакета."""
+def sync_1c_job() -> str:
+    """Send a bounded batch, then refresh statuses of pending tasks."""
     if not ENABLE_1C_INTEGRATION:
         return "disabled"
 
-    now = now or _now()
-    claim = db.claim_1c_sync_batch(
-        now, _generate_batch_id(now), INTEGRATION_1C_BATCH_SIZE,
-        INTEGRATION_1C_SYNC_RETRY_HOURS, INTEGRATION_1C_SYNC_PERIOD_HOURS,
-    )
-    if claim is None:
-        return "not_due"
-    batch_id = claim["batch_id"]
-    rows = claim["rows"]
-    first_attempt = claim["first_attempt"]
-
-    readings = [_reading_payload(row) for row in rows]
-    result, error = client_1c.sync_readings(batch_id, readings)
-    if error or not _valid_result(result, batch_id, readings):
-        if first_attempt:
-            log.error("1С недоступна при первой синхронизации: batch_id=%s", batch_id)
+    outcomes = []
+    tasks = db.get_unsent_meter_reading_tasks(INTEGRATION_1C_BATCH_SIZE)
+    if tasks:
+        response, error = client_1c.send_tasks(tasks)
+        if error or not _valid_ack(response):
+            log.warning("1C task batch send failed: error=%s", error or "invalid_response")
+            outcomes.append("send_failed")
+        elif response["status"] == "error":
+            log.error("1C rejected task batch: %s", response["message"])
+            outcomes.append("send_failed")
         else:
-            log.warning("Повтор синхронизации 1С неуспешен: batch_id=%s", batch_id)
-        return "failed"
+            db.mark_meter_readings_pending([task["TaskID"] for task in tasks])
+            outcomes.append("sent")
+            log.info("1C accepted task batch: count=%d", len(tasks))
 
-    try:
-        updated = db.apply_1c_sync_result(
-            batch_id,
-            claim["attempt_at"],
-            result["readings_status"],
-            result["meters_changes"],
-        )
-    except ValueError:
-        log.error("Ответ 1С не удалось атомарно применить: batch_id=%s", batch_id)
+    task_ids = db.get_pending_meter_reading_task_ids(INTEGRATION_1C_BATCH_SIZE)
+    if task_ids:
+        response, error = client_1c.sync_task_statuses(task_ids)
+        statuses = None if error else _valid_status_response(response, task_ids)
+        if statuses is None:
+            log.warning("1C task status sync failed: error=%s", error or "invalid_response")
+            outcomes.append("status_failed")
+        else:
+            db.apply_meter_reading_task_statuses(statuses)
+            outcomes.append("status_updated")
+            log.info("1C task statuses updated: count=%d", len(statuses))
+
+    if not outcomes:
+        return "not_due"
+    if any(item.endswith("failed") for item in outcomes):
         return "failed"
-    if updated is None:
-        log.warning("Устаревший ответ 1С не применён: batch_id=%s", batch_id)
-        return "failed"
-    for reading in updated:
-        _notify_reading(reading)
-    log.info(
-        "Синхронизация 1С завершена: batch_id=%s, показаний=%d, изменений=%d",
-        batch_id,
-        len(readings),
-        len(result["meters_changes"]),
-    )
     return "success"
