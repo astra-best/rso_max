@@ -97,14 +97,14 @@ class Mock1CBackend:
                 )
         return {"status": "ok", "message": ""}
 
-    def sync_task_statuses(self, task_ids: list[str]) -> dict:
+    def sync_task_statuses(self, task_ids: list[str]) -> list[dict]:
         with self._lock:
-            return {"Tasks": [
+            return [
                 self._task_statuses.get(
                     task_id, {"TaskID": task_id, "Status": "ERROR", "message": "Task not found"}
                 )
                 for task_id in task_ids
-            ]}
+            ]
 
 
 _mock_backend = Mock1CBackend(
@@ -114,7 +114,7 @@ _mock_backend = Mock1CBackend(
 )
 
 
-def _encode_json(body: dict) -> bytes:
+def _encode_json(body) -> bytes:
     """Encode Decimal values as exact unquoted JSON numbers."""
     decimals: dict[str, str] = {}
     nonce = uuid.uuid4().hex
@@ -136,7 +136,7 @@ def _encode_json(body: dict) -> bytes:
     return encoded.encode("utf-8")
 
 
-def _post_json(path: str, body: dict, timeout: int) -> tuple[dict | None, str | None]:
+def _post_json(path: str, body, timeout: int) -> tuple[dict | list | None, str | None]:
     if not INTEGRATION_1C_BASE_URL or not INTEGRATION_1C_AUTH_TOKEN:
         log.error("1С-запрос %s не выполнен: отсутствует обязательная конфигурация", path)
         return None, "configuration_error"
@@ -177,7 +177,7 @@ def _post_json(path: str, body: dict, timeout: int) -> tuple[dict | None, str | 
     except ValueError:
         log.error("1С-запрос %s: ответ не является JSON", path)
         return None, "invalid_response"
-    if not isinstance(data, dict):
+    if not isinstance(data, (dict, list)):
         log.error("1С-запрос %s: JSON верхнего уровня не объект", path)
         return None, "invalid_response"
     return data, None
@@ -216,13 +216,13 @@ def verify_auth_code(ls: str, chat_id: int, code: str) -> tuple[dict | None, str
 def send_tasks(tasks: list[dict]) -> tuple[dict | None, str | None]:
     if INTEGRATION_1C_MOCK:
         return _mock_backend.send_tasks(tasks), None
-    return _post_json("/sent", {"Tasks": tasks}, INTEGRATION_1C_SYNC_TIMEOUT_SECONDS)
+    return _post_json("/RegistrationMetersValue", tasks, INTEGRATION_1C_SYNC_TIMEOUT_SECONDS)
 
 
-def sync_task_statuses(task_ids: list[str]) -> tuple[dict | None, str | None]:
+def sync_task_statuses(task_ids: list[str]) -> tuple[list | None, str | None]:
     if INTEGRATION_1C_MOCK:
         return _mock_backend.sync_task_statuses(task_ids), None
     return _post_json(
-        "/sync", {"Tasks": [{"TaskID": task_id} for task_id in task_ids]},
+        "/MetersValueStatus", [{"TaskID": task_id} for task_id in task_ids],
         INTEGRATION_1C_SYNC_TIMEOUT_SECONDS,
     )

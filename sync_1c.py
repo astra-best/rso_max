@@ -21,10 +21,10 @@ def _valid_ack(result: dict | None) -> bool:
     )
 
 
-def _valid_status_response(result: dict | None, task_ids: list[str]) -> list[dict] | None:
-    if not isinstance(result, dict) or not isinstance(result.get("Tasks"), list):
+def _valid_status_response(result: list | None, task_ids: list[str]) -> list[dict] | None:
+    if not isinstance(result, list):
         return None
-    statuses = result["Tasks"]
+    statuses = result
     seen = set()
     for item in statuses:
         if not isinstance(item, dict):

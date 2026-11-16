@@ -158,6 +158,139 @@ def _ensure_column(c: sqlite3.Cursor, table: str, column: str, definition: str) 
         log.info("Миграция: добавлена колонка %s.%s", table, column)
 
 
+def _reading_task_payload(row: Mapping, values: Sequence[Mapping], task_id: str) -> dict:
+    created = datetime.fromisoformat(row["created_at"])
+    return {
+        "TaskID": task_id,
+        "PersonalAccountID": row["personal_account_id"],
+        "RoomKeyID": row["room_key_id"],
+        "Date": created.strftime("%d.%m.%Y %H:%M:%S"),
+        "Data": [
+            {
+                "MeteringPointID": row["metering_point_id"],
+                "MeteringDeviceID": row["meter_id"],
+                "ScaleID": value["scale_id"],
+                "TariffZoneID": value["zone_id"],
+                "Value": Decimal(value["value"]),
+            }
+            for value in values
+        ],
+    }
+
+
+def _json_with_decimal_numbers(value) -> str:
+    """Serialize task JSON while keeping Decimal values as exact JSON numbers."""
+    decimals: dict[str, str] = {}
+    nonce = uuid.uuid4().hex
+
+    def replace(item):
+        if isinstance(item, Decimal):
+            marker = f"__JSON_DECIMAL_{nonce}_{len(decimals)}__"
+            decimals[marker] = format(item, "f")
+            return marker
+        if isinstance(item, dict):
+            return {key: replace(nested) for key, nested in item.items()}
+        if isinstance(item, list):
+            return [replace(nested) for nested in item]
+        return item
+
+    payload = json.dumps(replace(value), ensure_ascii=False, separators=(",", ":"))
+    for marker, number in decimals.items():
+        payload = payload.replace(json.dumps(marker), number)
+    return payload
+
+
+def _migrate_meter_reading_tasks(conn: sqlite3.Connection) -> None:
+    """Convert per-reading status rows into persisted per-account task rows."""
+    c = conn.cursor()
+    tables = {row[0] for row in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "meter_readings" not in tables or "meter_reading_status" not in tables:
+        return
+    status_columns = {row[1] for row in c.execute("PRAGMA table_info(meter_reading_status)")}
+    if "task_id" in status_columns:
+        return
+
+    conn.commit()
+    c.execute("PRAGMA foreign_keys=OFF")
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        legacy_status = c.execute(
+            "SELECT r.*, s.status, s.message, s.updated_at FROM meter_readings r "
+            "JOIN meter_reading_status s ON s.reading_id=r.id ORDER BY r.id"
+        ).fetchall()
+        values_by_reading: dict[int, list[sqlite3.Row]] = {}
+        for row in legacy_status:
+            values_by_reading[row["id"]] = c.execute(
+                "SELECT scale_id, zone_id, value FROM meter_reading_values "
+                "WHERE reading_id=? ORDER BY id", (row["id"],),
+            ).fetchall()
+
+        c.execute("DROP INDEX IF EXISTS ix_meter_reading_status_pending")
+        c.execute("""CREATE TABLE meter_readings_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
+            created_at TEXT NOT NULL,
+            chat_id INTEGER,
+            ls TEXT NOT NULL,
+            personal_account_id TEXT NOT NULL,
+            room_key_id TEXT NOT NULL,
+            metering_point_id TEXT NOT NULL,
+            meter_id TEXT NOT NULL,
+            resource TEXT,
+            meter_number TEXT
+        )""")
+        c.execute(
+            "INSERT INTO meter_readings_new SELECT id, "
+            "CASE WHEN EXISTS (SELECT 1 FROM meter_reading_status s WHERE s.reading_id=meter_readings.id) "
+            "THEN task_id ELSE NULL END, created_at, chat_id, ls, personal_account_id, room_key_id, "
+            "metering_point_id, meter_id, resource, meter_number FROM meter_readings"
+        )
+        c.execute("""CREATE TABLE meter_reading_values_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reading_id INTEGER NOT NULL REFERENCES meter_readings_new(id) ON DELETE CASCADE,
+            scale_id TEXT NOT NULL, scale_name TEXT, zone_id TEXT NOT NULL, zone_name TEXT,
+            value TEXT NOT NULL, UNIQUE(reading_id, scale_id, zone_id)
+        )""")
+        c.execute("INSERT INTO meter_reading_values_new SELECT * FROM meter_reading_values")
+        c.execute("""CREATE TABLE meter_reading_status_new (
+            task_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            status TEXT CHECK (status IS NULL OR status IN ('PENDING','SUCCESS','ERROR')),
+            message TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )""")
+        for row in legacy_status:
+            payload = _reading_task_payload(row, values_by_reading[row["id"]], row["task_id"])
+            c.execute(
+                "INSERT INTO meter_reading_status_new(task_id,payload_json,status,message,updated_at) "
+                "VALUES (?,?,?,?,?)",
+                (row["task_id"], _json_with_decimal_numbers(payload), row["status"],
+                 row["message"] or "", row["updated_at"]),
+            )
+
+        c.execute("DROP TABLE meter_reading_status")
+        c.execute("DROP TABLE meter_reading_values")
+        c.execute("DROP TABLE meter_readings")
+        c.execute("ALTER TABLE meter_readings_new RENAME TO meter_readings")
+        c.execute("ALTER TABLE meter_reading_values_new RENAME TO meter_reading_values")
+        c.execute("ALTER TABLE meter_reading_status_new RENAME TO meter_reading_status")
+        c.execute("CREATE INDEX ix_meter_readings_meter ON meter_readings(meter_id,id)")
+        c.execute("CREATE INDEX ix_meter_readings_created ON meter_readings(created_at)")
+        c.execute("CREATE INDEX ix_meter_reading_status_pending "
+                  "ON meter_reading_status(status,updated_at) WHERE status='PENDING'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        c.execute("PRAGMA foreign_keys=ON")
+    violations = c.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError("Миграция показаний нарушила внешние ключи")
+
+
 def init_db() -> None:
     """
     Создаёт/обновляет схему БД. Идемпотентна — безопасно вызывать при каждом старте.
@@ -361,13 +494,12 @@ def init_db() -> None:
     # остаётся неиспользуемой.
     c.execute("DROP TABLE IF EXISTS pokazaniya_values")
 
-    # Показания по приборам из выгрузки 1С. Одна строка — одна задача обмена
-    # (TaskID) с 1С. GUID и названия — снимок на момент подачи, без FK на
-    # таблицы metering_*: история не теряется при изменениях в 1С.
+    # Показания сохраняются по приборам; общий TaskID назначается при формировании
+    # задачи отправки и может повторяться для нескольких приборов одного ЛС.
     c.execute("""
         CREATE TABLE IF NOT EXISTS meter_readings (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id             TEXT NOT NULL UNIQUE,
+            task_id             TEXT,
             created_at          TEXT NOT NULL,
             chat_id             INTEGER,
             ls                  TEXT NOT NULL,
@@ -402,20 +534,21 @@ def init_db() -> None:
             UNIQUE (reading_id, scale_id, zone_id)
         )
     """)
-    # Статус обмена с 1С. Нет строки — показание ещё не отправлено в 1С.
-    # Заполняется отправкой показаний (отдельная доработка); правило
-    # предыдущего показания уже не учитывает строки со статусом ERROR.
+    # Одна строка — одна задача ЛС. JSON фиксируется до отправки; NULL status
+    # означает, что задача ещё не подтверждена ответом 1С.
     c.execute("""
         CREATE TABLE IF NOT EXISTS meter_reading_status (
-            reading_id INTEGER PRIMARY KEY REFERENCES meter_readings(id) ON DELETE CASCADE,
-            status     TEXT NOT NULL CHECK (status IN ('PENDING','SUCCESS','ERROR')),
-            message    TEXT,
-            updated_at TEXT NOT NULL
+            task_id     TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            status      TEXT CHECK (status IS NULL OR status IN ('PENDING','SUCCESS','ERROR')),
+            message     TEXT NOT NULL DEFAULT '',
+            updated_at  TEXT NOT NULL
         )
     """)
+    _migrate_meter_reading_tasks(conn)
     c.execute(
         "CREATE INDEX IF NOT EXISTS ix_meter_reading_status_pending "
-        "ON meter_reading_status(reading_id) WHERE status='PENDING'"
+        "ON meter_reading_status(status,updated_at) WHERE status='PENDING'"
     )
 
     c.execute("""
@@ -1528,11 +1661,9 @@ def get_last_pokazaniya(ls: str, meter_number: str) -> sqlite3.Row | None:
 
 # ── Показания по приборам 1С ──────────────────────────────────────────────────
 #
-# meter_readings — одна строка на подтверждённое показание прибора (задача
-# обмена с 1С, TaskID); meter_reading_values — значения по парам «шкала,
-# тарифная зона»; meter_reading_status — статус обработки в 1С (нет строки —
-# показание ещё не отправлено). Отправка в 1С и запись статусов — отдельная
-# доработка; пока статусы никто не пишет.
+# meter_readings — одна строка на подтверждённое показание прибора;
+# meter_reading_values — значения пар «шкала, тарифная зона»;
+# meter_reading_status — сохранённый JSON одной задачи ЛС и её статус.
 
 _METER_READING_STATUS_LABELS = {
     None: "Не отправлено",
@@ -1573,7 +1704,7 @@ def _latest_own_value_conn(
         "SELECT v.value FROM meter_readings r "
         "JOIN meter_reading_values v "
         "ON v.reading_id=r.id AND v.scale_id=? AND v.zone_id=? "
-        "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+        "LEFT JOIN meter_reading_status st ON st.task_id=r.task_id "
         "WHERE r.meter_id=? AND (st.status IS NULL OR st.status<>'ERROR') "
         "ORDER BY r.id DESC LIMIT 1",
         (scale_id, zone_id, meter_id),
@@ -1663,7 +1794,7 @@ def save_meter_reading(
     меньше предыдущего. GUID ЛС, помещения, точки учёта и названия берутся
     из этого чтения, а не из сессии бота.
 
-    Возвращает {"status": SAVE_OK, "task_id", "reading_id"},
+    Возвращает {"status": SAVE_OK, "reading_id"},
     {"status": SAVE_METER_CHANGED} или {"status": SAVE_TOO_LOW, "scale_id",
     "zone_id", "previous_value", "previous"}; в двух последних случаях
     ничего не записывается.
@@ -1718,13 +1849,12 @@ def save_meter_reading(
                     "previous": previous,
                 }
 
-        task_id = str(uuid.uuid4())
         cursor = conn.execute(
-            "INSERT INTO meter_readings (task_id, created_at, chat_id, ls, "
+            "INSERT INTO meter_readings (created_at, chat_id, ls, "
             "personal_account_id, room_key_id, metering_point_id, meter_id, "
-            "resource, meter_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "resource, meter_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                task_id, _local_now_seconds(), chat_id, number,
+                _local_now_seconds(), chat_id, number,
                 meter["personal_account_id"],
                 meter["room_key_id"] or _EMPTY_1C_GUID,
                 meter["metering_point_id"], meter_id,
@@ -1746,7 +1876,7 @@ def save_meter_reading(
             ],
         )
         conn.commit()
-        return {"status": SAVE_OK, "task_id": task_id, "reading_id": reading_id}
+        return {"status": SAVE_OK, "task_id": None, "reading_id": reading_id}
     except Exception:
         conn.rollback()
         raise
@@ -1778,7 +1908,7 @@ def list_meter_readings(limit: int = 1000) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT r.*, st.status, st.message FROM meter_readings r "
-            "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+            "LEFT JOIN meter_reading_status st ON st.task_id=r.task_id "
             "ORDER BY r.id DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -1801,57 +1931,66 @@ def list_meter_readings(limit: int = 1000) -> list[dict]:
 
 
 def get_unsent_meter_reading_tasks(limit: int) -> list[dict]:
-    """Build up to ``limit`` persisted meter-reading tasks in the 1C wire format."""
+    """Return persisted unsent task payloads, creating one task per LS if needed."""
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT r.* FROM meter_readings r LEFT JOIN meter_reading_status st "
-            "ON st.reading_id=r.id WHERE st.reading_id IS NULL "
-            "ORDER BY r.id LIMIT ?", (max(0, min(int(limit), 100)),),
+        bounded_limit = max(0, min(int(limit), 100))
+        if not bounded_limit:
+            return []
+        conn.execute("BEGIN IMMEDIATE")
+        groups = conn.execute(
+            "SELECT ls, MIN(id) AS first_id FROM meter_readings WHERE task_id IS NULL "
+            "GROUP BY ls ORDER BY first_id LIMIT ?", (bounded_limit,),
         ).fetchall()
-        values = _values_by_reading(conn, [row["id"] for row in rows])
+        for group in groups:
+            rows = conn.execute(
+                "SELECT * FROM meter_readings WHERE ls=? AND task_id IS NULL ORDER BY id",
+                (group["ls"],),
+            ).fetchall()
+            values = _values_by_reading(conn, [row["id"] for row in rows])
+            task_id = str(uuid.uuid4())
+            first = rows[0]
+            created = datetime.fromisoformat(first["created_at"])
+            data = []
+            for row in rows:
+                for value in values[row["id"]]:
+                    number = Decimal(value["value"])
+                    wire_value = int(number) if number == number.to_integral_value() else number
+                    data.append({
+                        "MeteringPointID": row["metering_point_id"],
+                        "MeteringDeviceID": row["meter_id"],
+                        "ScaleID": value["scale_id"],
+                        "TariffZoneID": value["zone_id"],
+                        "Value": wire_value,
+                    })
+            payload = {
+                "TaskID": task_id,
+                "PersonalAccountID": first["personal_account_id"],
+                "RoomKeyID": first["room_key_id"],
+                "Date": created.strftime("%d.%m.%Y %H:%M:%S"),
+                "Data": data,
+            }
+            conn.execute(
+                "INSERT INTO meter_reading_status(task_id,payload_json,status,message,updated_at) "
+                "VALUES (?,?,NULL,'',?)",
+                (task_id, _json_with_decimal_numbers(payload), _local_now_seconds()),
+            )
+            conn.executemany(
+                "UPDATE meter_readings SET task_id=? WHERE id=? AND task_id IS NULL",
+                [(task_id, row["id"]) for row in rows],
+            )
+        conn.commit()
+        rows = conn.execute(
+            "SELECT payload_json FROM meter_reading_status WHERE status IS NULL "
+            "ORDER BY rowid LIMIT ?", (bounded_limit,),
+        ).fetchall()
+        return [json.loads(row["payload_json"], parse_float=Decimal) for row in rows]
     finally:
         conn.close()
 
-    tasks = []
-    for row in rows:
-        points: dict[str, dict] = {}
-        meters: dict[tuple[str, str], dict] = {}
-        for value in values[row["id"]]:
-            point = points.setdefault(row["metering_point_id"], {
-                "MeteringPointID": row["metering_point_id"], "Meters": [],
-            })
-            meter_key = (row["metering_point_id"], row["meter_id"])
-            meter = meters.get(meter_key)
-            if meter is None:
-                meter = {"MeteringDeviceID": row["meter_id"], "Scales": []}
-                meters[meter_key] = meter
-                point["Meters"].append(meter)
-            scale = next(
-                (item for item in meter["Scales"] if item["ScaleID"] == value["scale_id"]),
-                None,
-            )
-            if scale is None:
-                scale = {"ScaleID": value["scale_id"], "TariffZones": []}
-                meter["Scales"].append(scale)
-            number = Decimal(value["value"])
-            wire_value = int(number) if number == number.to_integral_value() else number
-            scale["TariffZones"].append({
-                "TariffZoneID": value["zone_id"], "Value": wire_value,
-            })
-        created = datetime.fromisoformat(row["created_at"])
-        tasks.append({
-            "TaskID": row["task_id"],
-            "PersonalAccountID": row["personal_account_id"],
-            "RoomKeyID": row["room_key_id"],
-            "Date": created.strftime("%d.%m.%Y %H:%M:%S"),
-            "MeteringPoints": list(points.values()),
-        })
-    return tasks
-
 
 def mark_meter_readings_pending(task_ids: list[str]) -> None:
-    """Record 1C acceptance of a sent batch; retries keep existing status."""
+    """Record 1C acceptance by changing the persisted task status to PENDING."""
     if not task_ids:
         return
     conn = get_conn()
@@ -1859,13 +1998,13 @@ def mark_meter_readings_pending(task_ids: list[str]) -> None:
         conn.execute("BEGIN IMMEDIATE")
         for task_id in task_ids:
             row = conn.execute(
-                "SELECT id FROM meter_readings WHERE task_id=?", (task_id,)
+                "SELECT task_id FROM meter_reading_status WHERE task_id=?", (task_id,)
             ).fetchone()
             if row is None:
                 raise ValueError("Unknown 1C task")
             conn.execute(
-                "INSERT OR IGNORE INTO meter_reading_status(reading_id,status,message,updated_at) "
-                "VALUES (?,'PENDING','',?)", (row["id"], _local_now_seconds()),
+                "UPDATE meter_reading_status SET status='PENDING',message='',updated_at=? "
+                "WHERE task_id=? AND status IS NULL", (_local_now_seconds(), task_id),
             )
         conn.commit()
     except Exception:
@@ -1887,19 +2026,20 @@ def get_pending_meter_reading_task_ids(limit: int) -> list[str]:
             "SELECT status_cursor_id FROM sync_1c_state WHERE id=1"
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT r.id,r.task_id FROM meter_readings r JOIN meter_reading_status st "
-            "ON st.reading_id=r.id WHERE st.status='PENDING' AND r.id>? "
-            "ORDER BY r.id LIMIT ?", (cursor, bounded_limit),
+            "SELECT rowid,task_id FROM meter_reading_status "
+            "WHERE status='PENDING' AND rowid>? ORDER BY rowid LIMIT ?",
+            (cursor, bounded_limit),
         ).fetchall()
         if len(rows) < bounded_limit:
             rows += conn.execute(
-                "SELECT r.id,r.task_id FROM meter_readings r JOIN meter_reading_status st "
-                "ON st.reading_id=r.id WHERE st.status='PENDING' AND r.id<=? "
-                "ORDER BY r.id LIMIT ?", (cursor, bounded_limit - len(rows)),
+                "SELECT rowid,task_id FROM meter_reading_status "
+                "WHERE status='PENDING' AND rowid<=? ORDER BY rowid LIMIT ?",
+                (cursor, bounded_limit - len(rows)),
             ).fetchall()
         if rows:
             conn.execute(
-                "UPDATE sync_1c_state SET status_cursor_id=? WHERE id=1", (rows[-1]["id"],)
+                "UPDATE sync_1c_state SET status_cursor_id=? WHERE id=1",
+                (rows[-1]["rowid"],),
             )
         conn.commit()
         return [row["task_id"] for row in rows]
@@ -1919,14 +2059,13 @@ def apply_meter_reading_task_statuses(statuses: list[dict]) -> None:
             if not isinstance(message, str) or (status != "ERROR" and message):
                 raise ValueError("Invalid 1C task status message")
             row = conn.execute(
-                "SELECT r.id, st.status FROM meter_readings r LEFT JOIN meter_reading_status st "
-                "ON st.reading_id=r.id WHERE r.task_id=?", (task_id,),
+                "SELECT status FROM meter_reading_status WHERE task_id=?", (task_id,),
             ).fetchone()
             if row is None or row["status"] != "PENDING":
                 raise ValueError("Unknown or non-pending 1C task")
             conn.execute(
-                "UPDATE meter_reading_status SET status=?,message=?,updated_at=? WHERE reading_id=?",
-                (status, message, _local_now_seconds(), row["id"]),
+                "UPDATE meter_reading_status SET status=?,message=?,updated_at=? WHERE task_id=?",
+                (status, message, _local_now_seconds(), task_id),
             )
         conn.commit()
     except Exception:

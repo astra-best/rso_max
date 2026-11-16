@@ -63,7 +63,7 @@ class Client1CTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 5)
         self.assertEqual(kwargs["json"], {"ls": "100001", "chat_id": 42})
 
-    def test_send_tasks_posts_nested_tasks_to_sent(self) -> None:
+    def test_send_tasks_posts_root_array_to_registration_method(self) -> None:
         client = self._module()
         response = unittest.mock.Mock(status_code=200)
         response.json.return_value = {"status": "ok", "message": ""}
@@ -75,17 +75,17 @@ class Client1CTests(unittest.TestCase):
             data, error = client.send_tasks(tasks)
 
         self.assertEqual((data, error), ({"status": "ok", "message": ""}, None))
-        self.assertTrue(post.call_args.args[0].endswith("/sent"))
+        self.assertTrue(post.call_args.args[0].endswith("/RegistrationMetersValue"))
         self.assertEqual(
             json.loads(post.call_args.kwargs["content"]),
-            {"Tasks": [{"TaskID": "task-1", "Value": 999999999999999.123456}]},
+            [{"TaskID": "task-1", "Value": 999999999999999.123456}],
         )
         self.assertIn(b"999999999999999.123456", post.call_args.kwargs["content"])
 
     def test_sync_task_statuses_posts_only_task_ids_to_sync(self) -> None:
         client = self._module()
         response = unittest.mock.Mock(status_code=200)
-        response.json.return_value = {"Tasks": [{"TaskID": "task-1", "Status": "PENDING", "message": ""}]}
+        response.json.return_value = [{"TaskID": "task-1", "Status": "PENDING", "message": ""}]
         task_ids = ["task-1"]
 
         with patch.object(client, "INTEGRATION_1C_MOCK", False), patch.object(
@@ -95,8 +95,8 @@ class Client1CTests(unittest.TestCase):
 
         self.assertEqual(error, None)
         self.assertEqual(data, response.json.return_value)
-        self.assertTrue(post.call_args.args[0].endswith("/sync"))
-        self.assertEqual(post.call_args.kwargs["json"], {"Tasks": [{"TaskID": "task-1"}]})
+        self.assertTrue(post.call_args.args[0].endswith("/MetersValueStatus"))
+        self.assertEqual(post.call_args.kwargs["json"], [{"TaskID": "task-1"}])
 
     def test_transport_error_does_not_return_or_log_token(self) -> None:
         client = self._module()

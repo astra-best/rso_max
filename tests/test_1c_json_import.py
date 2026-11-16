@@ -1658,14 +1658,26 @@ def reading_rows() -> tuple[list[dict], list[dict]]:
 def set_status(reading_id: int, status: str) -> None:
     connection = db.get_conn()
     try:
-        connection.execute(
-            "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
-            "VALUES(?, ?, '2026-10-27 10:00:00')",
-            (reading_id, status),
-        )
-        connection.commit()
+        task_id = connection.execute(
+            "SELECT task_id FROM meter_readings WHERE id=?", (reading_id,)
+        ).fetchone()[0]
     finally:
         connection.close()
+    if task_id is None:
+        db.get_unsent_meter_reading_tasks(100)
+        connection = db.get_conn()
+        try:
+            task_id = connection.execute(
+                "SELECT task_id FROM meter_readings WHERE id=?", (reading_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+    db.mark_meter_readings_pending([task_id])
+    if status != "PENDING":
+        db.apply_meter_reading_task_statuses([{
+            "TaskID": task_id, "Status": status,
+            "message": "Rejected" if status == "ERROR" else "",
+        }])
 
 
 def previous_values(number="100-1") -> list[str | None]:
@@ -1681,7 +1693,8 @@ def test_save_meter_reading_copies_fresh_reference_data(json_db):
     headers, values = reading_rows()
     assert len(headers) == 1
     header = headers[0]
-    assert str(uuid.UUID(header["task_id"], version=4)) == header["task_id"] == result["task_id"]
+    assert header["task_id"] is None
+    assert result["task_id"] is None
     assert (
         header["chat_id"], header["ls"], header["personal_account_id"], header["room_key_id"],
         header["metering_point_id"], header["meter_id"], header["resource"], header["meter_number"],
@@ -1803,7 +1816,7 @@ def test_previous_value_lookup_uses_meter_index(json_db):
                 "EXPLAIN QUERY PLAN SELECT v.value FROM meter_readings r "
                 "JOIN meter_reading_values v "
                 "ON v.reading_id=r.id AND v.scale_id=? AND v.zone_id=? "
-                "LEFT JOIN meter_reading_status st ON st.reading_id=r.id "
+                "LEFT JOIN meter_reading_status st ON st.task_id=r.task_id "
                 "WHERE r.meter_id=? AND (st.status IS NULL OR st.status<>'ERROR') "
                 "ORDER BY r.id DESC LIMIT 1",
                 ("s", "z", "m"),

@@ -97,22 +97,17 @@ class Portal1CTests(unittest.TestCase):
                     {"scale_id": SCALE_ID, "zone_id": NIGHT_ID, "value": night},
                 ])
                 ids.append(result["reading_id"])
-            # Статусы пишет отправка в 1С (отдельная доработка); здесь —
-            # напрямую, чтобы проверить их вывод на странице.
-            conn = db.get_conn()
-            conn.executemany(
-                "INSERT INTO meter_reading_status(reading_id, status, message, updated_at) "
-                "VALUES (?, ?, ?, '2026-10-27 12:00:00')",
-                [(ids[0], "ERROR", "Неверное показание"), (ids[1], "PENDING", None)],
-            )
-            conn.commit()
-            conn.close()
+            task = db.get_unsent_meter_reading_tasks(100)[0]
+            db.mark_meter_readings_pending([task["TaskID"]])
+            db.apply_meter_reading_task_statuses([{
+                "TaskID": task["TaskID"], "Status": "ERROR", "message": "Неверное показание",
+            }])
             rows = db.list_meter_readings()
             self.assertEqual(db.get_counts()["pokazaniya"], 3)
 
         self.assertEqual([row["id"] for row in rows], list(reversed(ids)))
         self.assertEqual(
-            [row["status_label"] for row in rows], ["Не отправлено", "В обработке", "Ошибка"]
+            [row["status_label"] for row in rows], ["Ошибка", "Ошибка", "Ошибка"]
         )
         self.assertEqual(rows[2]["message"], "Неверное показание")
         self.assertEqual(rows[0]["value_lines"], ["Основная, День: 120", "Основная, Ночь: 60"])

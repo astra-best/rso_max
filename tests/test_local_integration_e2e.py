@@ -23,9 +23,9 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         db.init_db()
         conn = db.get_conn()
         conn.execute(
-            "INSERT INTO meter_readings(task_id,created_at,chat_id,ls,personal_account_id,"
+            "INSERT INTO meter_readings(created_at,chat_id,ls,personal_account_id,"
             "room_key_id,metering_point_id,meter_id,resource,meter_number) "
-            "VALUES ('task-1','2026-11-03 20:07:07',42,'100001','account-1','room-1',"
+            "VALUES ('2026-11-03 20:07:07',42,'100001','account-1','room-1',"
             "'point-1','meter-1','Electricity','M-1')"
         )
         reading_id = conn.execute("SELECT id FROM meter_readings").fetchone()[0]
@@ -35,6 +35,7 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         )
         conn.commit()
         conn.close()
+        self.task_id = db.get_unsent_meter_reading_tasks(100)[0]["TaskID"]
         self.requests: list[dict] = []
 
     def tearDown(self) -> None:
@@ -45,12 +46,12 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
             self.requests.append({"url": str(request.url), "body": body})
-            if request.url.path.endswith("/sent"):
+            if request.url.path.endswith("/RegistrationMetersValue"):
                 return httpx.Response(200, json={"status": "ok", "message": ""}, request=request)
-            return httpx.Response(200, json={"Tasks": [
+            return httpx.Response(200, json=[
                 {"TaskID": task["TaskID"], "Status": "ERROR", "message": "Rejected"}
-                for task in body["Tasks"]
-            ]}, request=request)
+                for task in body
+            ], request=request)
 
         transport = httpx.MockTransport(handler)
 
@@ -67,12 +68,15 @@ class LocalIntegrationE2ETests(unittest.TestCase):
         ):
             self.assertEqual(sync_1c.sync_1c_job(), "success")
 
-        self.assertEqual([request["url"].rsplit("/", 1)[-1] for request in self.requests], ["sent", "sync"])
-        sent_task = self.requests[0]["body"]["Tasks"][0]
-        self.assertEqual(sent_task["TaskID"], "task-1")
+        self.assertEqual(
+            [request["url"].rsplit("/", 1)[-1] for request in self.requests],
+            ["RegistrationMetersValue", "MetersValueStatus"],
+        )
+        sent_task = self.requests[0]["body"][0]
+        self.assertEqual(sent_task["TaskID"], self.task_id)
         self.assertEqual(sent_task["Date"], "03.11.2026 20:07:07")
-        self.assertEqual(sent_task["MeteringPoints"][0]["Meters"][0]["Scales"][0]["TariffZones"][0]["Value"], 15.5)
-        self.assertEqual(self.requests[1]["body"], {"Tasks": [{"TaskID": "task-1"}]})
+        self.assertEqual(sent_task["Data"][0]["Value"], 15.5)
+        self.assertEqual(self.requests[1]["body"], [{"TaskID": self.task_id}])
         result = db.list_meter_readings()[0]
         self.assertEqual((result["status"], result["message"]), ("ERROR", "Rejected"))
 

@@ -46,41 +46,140 @@ class Database1CTests(unittest.TestCase):
         self.assertIn("authorized_1c", bot_user_columns)
         self.assertIsNotNone(state)
 
-    def test_1c_task_queue_builds_nested_payload_and_tracks_status(self) -> None:
+    def test_legacy_meter_reading_migration_preserves_status_and_regroups_unsent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = db.DB_PATH
+            db.DB_PATH = str(Path(tmp) / "legacy.sqlite")
+            try:
+                conn = sqlite3.connect(db.DB_PATH)
+                conn.executescript("""
+                    PRAGMA foreign_keys=ON;
+                    CREATE TABLE meter_readings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+                        chat_id INTEGER, ls TEXT NOT NULL, personal_account_id TEXT NOT NULL,
+                        room_key_id TEXT NOT NULL, metering_point_id TEXT NOT NULL,
+                        meter_id TEXT NOT NULL, resource TEXT, meter_number TEXT
+                    );
+                    CREATE TABLE meter_reading_values (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        reading_id INTEGER NOT NULL REFERENCES meter_readings(id) ON DELETE CASCADE,
+                        scale_id TEXT NOT NULL, scale_name TEXT, zone_id TEXT NOT NULL,
+                        zone_name TEXT, value TEXT NOT NULL,
+                        UNIQUE(reading_id,scale_id,zone_id)
+                    );
+                    CREATE TABLE meter_reading_status (
+                        reading_id INTEGER PRIMARY KEY REFERENCES meter_readings(id) ON DELETE CASCADE,
+                        status TEXT NOT NULL CHECK(status IN ('PENDING','SUCCESS','ERROR')),
+                        message TEXT, updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO meter_readings VALUES
+                        (1,'sent-task','2026-11-03 10:00:00',7,'100001','account','room','point','meter-sent','Power','S-1'),
+                        (2,'old-unsent-1','2026-11-03 10:01:00',7,'100001','account','room','point','meter-a','Power','A'),
+                        (3,'old-unsent-2','2026-11-03 10:02:00',7,'100001','account','room','point','meter-b','Power','B');
+                    INSERT INTO meter_reading_values VALUES
+                        (1,1,'scale','Scale','zone','Day','10'),
+                        (2,2,'scale','Scale','zone','Day','20'),
+                        (3,3,'scale','Scale','zone','Day','30');
+                    INSERT INTO meter_reading_status VALUES (1,'PENDING','','2026-11-03 10:05:00');
+                """)
+                conn.commit()
+                conn.close()
+
+                db.init_db()
+
+                conn = db.get_conn()
+                try:
+                    self.assertEqual(
+                        conn.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+                    )
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM meter_reading_values").fetchone()[0], 3
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT task_id,status,message FROM meter_reading_status"
+                        ).fetchone()[:], ("sent-task", "PENDING", ""),
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM meter_readings WHERE task_id IS NULL"
+                        ).fetchone()[0], 2,
+                    )
+                finally:
+                    conn.close()
+
+                tasks = db.get_unsent_meter_reading_tasks(100)
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual([item["Value"] for item in tasks[0]["Data"]], [20, 30])
+                self.assertEqual(
+                    db.get_pending_meter_reading_task_ids(100), ["sent-task"]
+                )
+            finally:
+                db.DB_PATH = old_path
+
+    def test_1c_task_queue_groups_readings_and_tracks_flat_payload_status(self) -> None:
         conn = db.get_conn()
         try:
             conn.execute(
-                "INSERT INTO meter_readings(task_id,created_at,chat_id,ls,personal_account_id,"
+                "INSERT INTO meter_readings(created_at,chat_id,ls,personal_account_id,"
                 "room_key_id,metering_point_id,meter_id,resource,meter_number) "
-                "VALUES ('task-1','2026-11-03 20:07:07',42,'100001',?,'room-1','point-1',"
+                "VALUES ('2026-11-03 20:07:07',42,'100001',?,'room-1','point-1',"
                 "'meter-1','Electricity','M-1')", (ACCOUNT_ID,),
             )
-            reading_id = conn.execute("SELECT id FROM meter_readings WHERE task_id='task-1'").fetchone()[0]
+            reading_id = conn.execute("SELECT id FROM meter_readings").fetchone()[0]
             conn.executemany(
                 "INSERT INTO meter_reading_values(reading_id,scale_id,scale_name,zone_id,zone_name,value) "
                 "VALUES (?,?,?,?,?,?)",
                 [(reading_id, SCALE_ID, "Active", ZONE_ID, "Day", "21852"),
                  (reading_id, SCALE_ID, "Active", "zone-2", "Night", "8492")],
             )
+            conn.execute(
+                "INSERT INTO meter_readings(created_at,chat_id,ls,personal_account_id,"
+                "room_key_id,metering_point_id,meter_id,resource,meter_number) "
+                "VALUES ('2026-11-03 20:07:08',42,'100001',?,'room-1','point-2',"
+                "'meter-2','Water','M-2')", (ACCOUNT_ID,),
+            )
+            second_reading_id = conn.execute(
+                "SELECT id FROM meter_readings WHERE meter_id='meter-2'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO meter_reading_values(reading_id,scale_id,scale_name,zone_id,zone_name,value) "
+                "VALUES (?, 'scale-2','Cold','zone-3','Total','3.25')", (second_reading_id,),
+            )
             conn.commit()
         finally:
             conn.close()
 
         tasks = db.get_unsent_meter_reading_tasks(100)
-        self.assertEqual(tasks, [{
-            "TaskID": "task-1", "PersonalAccountID": ACCOUNT_ID,
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual({key: value for key, value in task.items() if key != "TaskID"}, {
+            "PersonalAccountID": ACCOUNT_ID,
             "RoomKeyID": "room-1", "Date": "03.11.2026 20:07:07",
-            "MeteringPoints": [{"MeteringPointID": "point-1", "Meters": [{
-                "MeteringDeviceID": "meter-1", "Scales": [{"ScaleID": SCALE_ID,
-                    "TariffZones": [{"TariffZoneID": ZONE_ID, "Value": 21852},
-                                    {"TariffZoneID": "zone-2", "Value": 8492}]}]
-            }]}],
-        }])
-        db.mark_meter_readings_pending(["task-1"])
-        self.assertEqual(db.get_pending_meter_reading_task_ids(100), ["task-1"])
+            "Data": [
+                {"MeteringPointID": "point-1", "MeteringDeviceID": "meter-1",
+                 "ScaleID": SCALE_ID, "TariffZoneID": ZONE_ID, "Value": 21852},
+                {"MeteringPointID": "point-1", "MeteringDeviceID": "meter-1",
+                 "ScaleID": SCALE_ID, "TariffZoneID": "zone-2", "Value": 8492},
+                {"MeteringPointID": "point-2", "MeteringDeviceID": "meter-2",
+                 "ScaleID": "scale-2", "TariffZoneID": "zone-3", "Value": 3.25},
+            ],
+        })
+        self.assertEqual(len(task["TaskID"]), 36)
+        self.assertEqual(db.get_unsent_meter_reading_tasks(100), tasks)
+        conn = db.get_conn()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(DISTINCT task_id) FROM meter_readings").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+        db.mark_meter_readings_pending([task["TaskID"]])
+        self.assertEqual(db.get_pending_meter_reading_task_ids(100), [task["TaskID"]])
 
         db.apply_meter_reading_task_statuses([{
-            "TaskID": "task-1", "Status": "ERROR", "message": "Rejected",
+            "TaskID": task["TaskID"], "Status": "ERROR", "message": "Rejected",
         }])
         row = db.list_meter_readings()[0]
         self.assertEqual((row["status"], row["message"]), ("ERROR", "Rejected"))
@@ -91,24 +190,70 @@ class Database1CTests(unittest.TestCase):
         try:
             for index in range(3):
                 conn.execute(
-                    "INSERT INTO meter_readings(task_id,created_at,ls,personal_account_id,"
+                    "INSERT INTO meter_readings(created_at,ls,personal_account_id,"
                     "room_key_id,metering_point_id,meter_id,meter_number) "
-                    "VALUES (?, '2026-11-03 20:07:07','100001',?,'room','point','meter',?)",
-                    (f"task-{index}", ACCOUNT_ID, f"M-{index}"),
-                )
-                reading_id = conn.execute(
-                    "SELECT id FROM meter_readings WHERE task_id=?", (f"task-{index}",)
-                ).fetchone()[0]
-                conn.execute(
-                    "INSERT INTO meter_reading_status(reading_id,status,updated_at) "
-                    "VALUES (?,'PENDING','now')", (reading_id,),
+                    "VALUES ('2026-11-03 20:07:07',?,?, 'room','point','meter',?)",
+                    (f"10000{index}", f"account-{index}", f"M-{index}"),
                 )
             conn.commit()
         finally:
             conn.close()
 
-        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ["task-0", "task-1"])
-        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ["task-2", "task-0"])
+        tasks = db.get_unsent_meter_reading_tasks(100)
+        ids = [task["TaskID"] for task in tasks]
+        db.mark_meter_readings_pending(ids)
+        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ids[:2])
+        self.assertEqual(db.get_pending_meter_reading_task_ids(2), ids[2:] + ids[:1])
+
+    def test_retry_reuses_saved_payload_after_source_rows_change(self) -> None:
+        conn = db.get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO meter_readings(created_at,ls,personal_account_id,room_key_id,"
+                "metering_point_id,meter_id,meter_number) "
+                "VALUES ('2026-11-03 20:07:07','100001',?,'room','point','meter-1','M-1')",
+                (ACCOUNT_ID,),
+            )
+            reading_id = conn.execute(
+                "SELECT id FROM meter_readings WHERE meter_id='meter-1'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO meter_reading_values(reading_id,scale_id,zone_id,value) "
+                "VALUES (?, 'scale','zone','10')", (reading_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        original_task = db.get_unsent_meter_reading_tasks(100)[0]
+        conn = db.get_conn()
+        try:
+            conn.execute(
+                "UPDATE meter_reading_values SET value='99' WHERE reading_id=?", (reading_id,)
+            )
+            conn.execute(
+                "INSERT INTO meter_readings(created_at,ls,personal_account_id,room_key_id,"
+                "metering_point_id,meter_id,meter_number) "
+                "VALUES ('2026-11-03 20:08:07','100001',?,'room','point','meter-2','M-2')",
+                (ACCOUNT_ID,),
+            )
+            new_reading_id = conn.execute(
+                "SELECT id FROM meter_readings WHERE meter_id='meter-2'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO meter_reading_values(reading_id,scale_id,zone_id,value) "
+                "VALUES (?, 'scale','zone','20')", (new_reading_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        retry_tasks = db.get_unsent_meter_reading_tasks(100)
+        retry = next(task for task in retry_tasks if task["TaskID"] == original_task["TaskID"])
+        added_task = next(task for task in retry_tasks if task["TaskID"] != original_task["TaskID"])
+        self.assertEqual(retry, original_task)
+        self.assertEqual(retry["Data"][0]["Value"], 10)
+        self.assertEqual(added_task["Data"][0]["Value"], 20)
 
     def test_1c_authorization_flag_is_persisted(self) -> None:
         db.upsert_bot_user(42, "100001", "", authorized_1c=True)
@@ -434,24 +579,21 @@ class Database1CTests(unittest.TestCase):
     def test_status_table_rejects_unknown_status_and_cascades_on_delete(self) -> None:
         self.import_meter()
         reading_id = self.save("6")["reading_id"]
+        task = db.get_unsent_meter_reading_tasks(100)[0]
         conn = db.get_conn()
         try:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
-                    "VALUES (?, 'DONE', 'now')", (reading_id,),
+                    "UPDATE meter_reading_status SET status='DONE' WHERE task_id=?",
+                    (task["TaskID"],),
                 )
-            conn.execute(
-                "INSERT INTO meter_reading_status(reading_id, status, updated_at) "
-                "VALUES (?, 'PENDING', 'now')", (reading_id,),
-            )
             conn.execute("DELETE FROM meter_readings WHERE id=?", (reading_id,))
             conn.commit()
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM meter_reading_values").fetchone()[0], 0
             )
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM meter_reading_status").fetchone()[0], 0
+                conn.execute("SELECT COUNT(*) FROM meter_reading_status").fetchone()[0], 1
             )
         finally:
             conn.close()

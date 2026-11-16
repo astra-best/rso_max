@@ -1,394 +1,131 @@
-# API интеграции с 1С
+# Интеграция с 1С
 
-Документ описывает текущий контракт обмена между MAX-ботом, внутренним FastAPI и опубликованным HTTP-сервисом 1С.
+Документ описывает текущий контракт MAX-бота, внутреннего FastAPI и HTTP-сервиса 1С. Вызовы 1С выполняет только FastAPI.
 
-## 1. Общая схема
+## Общие настройки и транспорт
 
-```text
-MAX-бот -> внутренний FastAPI -> HTTPS-сервис 1С
-```
+- Запросы и ответы: JSON в UTF-8.
+- Внешние запросы: HTTPS, `Content-Type: application/json`.
+- Авторизация FastAPI → 1С: `Authorization: Bearer <INTEGRATION_1C_AUTH_TOKEN>`.
+- Базовый адрес задаётся `INTEGRATION_1C_BASE_URL`. К нему добавляются пути методов из этого документа.
+- Таймаут обмена показаниями: `INTEGRATION_1C_SYNC_TIMEOUT_SECONDS` (по умолчанию 60 секунд).
+- Ошибки транспорта и некорректный ответ не меняют локальный статус задачи. Повторная отправка использует исходный `TaskID`.
 
-Бот не обращается к 1С напрямую:
+Токены нельзя записывать в документацию, журналы или коммитить.
 
-1. Бот вызывает внутренние методы FastAPI для авторизации пользователя.
-2. FastAPI вызывает опубликованные методы 1С.
-3. Фоновая задача FastAPI передаёт в 1С накопленные показания.
-4. FastAPI persists task statuses in SQLite; the portal displays the current processing status.
+## Внешние методы 1С
 
-Внутреннее и внешнее API используют разные Bearer-токены:
-
-- `INTERNAL_API_TOKEN` защищает соединение MAX-бота с FastAPI;
-- `INTEGRATION_1C_AUTH_TOKEN` защищает соединение FastAPI с 1С.
-
-Реальные токены нельзя записывать в документацию, журналы и `.env.example`.
-
-## 2. Общие требования к HTTP-сервису 1С
-
-- Протокол: HTTPS.
-- Формат запросов и ответов: JSON в UTF-8.
-- Заголовок запроса: `Content-Type: application/json`.
-- Авторизация: `Authorization: Bearer <INTEGRATION_1C_AUTH_TOKEN>`.
-- Бизнес-результат возвращается с HTTP `200` и полем `status` в JSON.
-- При неверном Bearer-токене 1С должна вернуть HTTP `401` или `403`.
-- Ответ авторизационных методов должен быть получен не позднее чем через 5 секунд.
-- Допустимое время синхронизации показаний на стороне Python: 60 секунд.
-
-Базовый адрес сервиса хранится в `INTEGRATION_1C_BASE_URL`. Python добавляет к нему один из путей:
-
-```text
-/auth/request-code
-/auth/verify-code
-/sent
-/sync
-```
-
-Например, если базовый адрес заканчивается на `/hs/integration`, итоговый адрес первого метода будет заканчиваться на `/hs/integration/auth/request-code`.
-
-## 3. Внешнее API: FastAPI вызывает 1С
-
-Эти три метода должны быть реализованы в опубликованном HTTP-сервисе 1С.
-
-### 3.1 Запрос кода авторизации
+### Запрос кода авторизации
 
 ```text
 POST /auth/request-code
 ```
 
-Назначение: проверить ЛС, сгенерировать одноразовый код и отправить его на электронную почту клиента.
-
 Запрос:
 
 ```json
-{
-  "ls": "100001",
-  "chat_id": 123456789
-}
+{"ls":"100001","chat_id":123456789}
 ```
 
-Поля:
+Успех возвращает `status: "ok"` и непустое пояснение в `message`. Другие допустимые статусы: `ls_not_found`, `no_contact`. Ответ не должен раскрывать email клиента или код.
 
-- `ls` — номер лицевого счёта, строка длиной от 1 до 64 символов;
-- `chat_id` — идентификатор пользователя MAX (`MaxUserID`), целое число.
-
-Успешный ответ:
-
-```json
-{
-  "status": "sent",
-  "message": "Код отправлен на электронную почту"
-}
-```
-
-ЛС не найден:
-
-```json
-{
-  "status": "ls_not_found",
-  "message": "Лицевой счёт не найден"
-}
-```
-
-У ЛС нет электронного адреса:
-
-```json
-{
-  "status": "no_contact",
-  "message": "Для лицевого счёта не указан e-mail"
-}
-```
-
-Допустимые значения `status`:
-
-- `sent`;
-- `ls_not_found`;
-- `no_contact`.
-
-1С не должна возвращать электронный адрес клиента или сам код.
-
-### 3.2 Проверка кода авторизации
+### Проверка кода авторизации
 
 ```text
 POST /auth/verify-code
 ```
 
-Назначение: проверить одноразовый код, сохранить привязку пользователя MAX к ЛС и вернуть активные счётчики.
-
 Запрос:
 
 ```json
-{
-  "ls": "100001",
-  "chat_id": 123456789,
-  "code": "482910"
-}
+{"ls":"100001","chat_id":123456789,"code":"482910"}
 ```
 
-Поля:
+При успехе возвращаются `status: "ok"`, непустое `message` и список приборов `meters` с полями `meter_number`, `resource_type`, `meter_type`. Допустимые ошибки: `wrong_code`, `expired_code`, `attempts_exceeded`. Код действует 10 минут, допускается не более 5 неверных попыток. Секреты нельзя включать в ответы и логи.
 
-- `ls` — тот же ЛС, для которого был запрошен код;
-- `chat_id` — тот же идентификатор пользователя MAX;
-- `code` — введённый пользователем код, строка длиной от 1 до 32 символов.
-
-Правила кода на стороне 1С:
-
-- срок действия — 10 минут;
-- максимум 5 неверных попыток;
-- код нельзя возвращать в ответе или писать в журнал;
-- при успешной проверке 1С сохраняет связку `chat_id` и `ls`.
-
-Успешный ответ:
-
-```json
-{
-  "status": "ok",
-  "message": "Авторизация выполнена",
-  "meters": [
-    {
-      "meter_number": "METER-001",
-      "resource_type": "Электроэнергия",
-      "meter_type": "Однотарифный"
-    },
-    {
-      "meter_number": "METER-002",
-      "resource_type": "Электроэнергия",
-      "meter_type": "Двухтарифный"
-    }
-  ]
-}
-```
-
-Ошибочные бизнес-результаты:
-
-```json
-{
-  "status": "wrong_code",
-  "message": "Код неверный"
-}
-```
-
-```json
-{
-  "status": "expired_code",
-  "message": "Срок действия кода истёк"
-}
-```
-
-```json
-{
-  "status": "attempts_exceeded",
-  "message": "Число попыток исчерпано"
-}
-```
-
-Допустимые значения `status`:
-
-- `ok`;
-- `wrong_code`;
-- `expired_code`;
-- `attempts_exceeded`.
-
-Каждый объект `meters` содержит:
-
-- `meter_number` — непустой уникальный номер счётчика в пределах ЛС;
-- `resource_type` — вид ресурса;
-- `meter_type` — строго `Однотарифный` или `Двухтарифный`.
-
-Начальные показания в этом ответе не передаются. Python создаёт новые счётчики с техническими значениями `initial1=0` и `initial2=0`; при включённой интеграции они не используются для локальной проверки показаний.
-
-### 3.3 Sending readings
+### Отправка пакетных показаний
 
 ```text
-POST /sent
+POST /RegistrationMetersValue
 ```
 
-Request contains up to 100 tasks in `Tasks`. One task is one meter reading for one personal account. Bot creates `TaskID` when saving the reading and reuses it on network retry. Nesting: `MeteringPoints` -> `Meters` -> `Scales` -> `TariffZones`. `Value` is a JSON number with up to 15 integer digits and 6 fractional digits. `Date` format is `DD.MM.YYYY HH:MM:SS`, without timezone.
+Тело запроса — корневой массив задач. Одна задача соответствует одному лицевому счёту и может содержать показания нескольких приборов. Пачка содержит не более 100 задач. Лимит задаётся `INTEGRATION_1C_BATCH_SIZE` (значение по умолчанию 100).
 
 ```json
-{
-  "Tasks": [{
+[
+  {
     "TaskID": "e8bb6d5e-2022-45e3-ae57-055dc46df68b",
     "PersonalAccountID": "20c484a6-6045-11ec-83a6-d41b81e4026e",
     "RoomKeyID": "00000000-0000-0000-0000-000000000000",
     "Date": "30.10.2026 20:07:07",
-    "MeteringPoints": [{
-      "MeteringPointID": "20c484a7-6045-11ec-83a6-d41b81e4026e",
-      "Meters": [{
-        "MeteringDeviceID": "20c484a8-6045-11ec-83a6-d41b81e4026e",
-        "Scales": [{
-          "ScaleID": "ff0a78b9-9ae3-11ea-9612-00155d016301",
-          "TariffZones": [
-            {"TariffZoneID": "ab89b37f-94e4-11ea-960f-00155d016301", "Value": 21852},
-            {"TariffZoneID": "ab89b380-94e4-11ea-960f-00155d016301", "Value": 8492}
-          ]
-        }]
-      }]
-    }]
-  }]
-}
+    "Data": [
+      {"MeteringPointID":"20c484a7-6045-11ec-83a6-d41b81e4026e","MeteringDeviceID":"20c484a8-6045-11ec-83a6-d41b81e4026e","ScaleID":"ff0a78b9-9ae3-11ea-9612-00155d016301","TariffZoneID":"ab89b37f-94e4-11ea-960f-00155d016301","Value":21852},
+      {"MeteringPointID":"20c484a7-6045-11ec-83a6-d41b81e4026e","MeteringDeviceID":"20c484a8-6045-11ec-83a6-d41b81e4026e","ScaleID":"ff0a78b9-9ae3-11ea-9612-00155d016301","TariffZoneID":"ab89b380-94e4-11ea-960f-00155d016301","Value":8492}
+    ]
+  }
+]
 ```
 
-Whole-batch acceptance: `{"status":"ok","message":""}`. Whole-batch rejection: `{"status":"error","message":"error text"}`. On `ok`, each task is recorded as `PENDING`. Resending the same `TaskID` must be idempotent so a retry after timeout cannot create a duplicate.
+`TaskID` создаётся при подготовке задачи к отправке. Исходный JSON сохраняется в базе до HTTP-запроса; повтор после транспортной ошибки использует тот же ID и тело. `Date` имеет формат `ДД.ММ.ГГГГ ЧЧ:ММ:СС`, как в примере. `Value` — JSON-число: до 15 цифр до десятичного разделителя и до 6 после. Значение передаётся без округления.
 
-### 3.4 Polling task statuses
-
-```text
-POST /sync
-```
-
-Request contains only IDs of locally `PENDING` tasks:
+Ответ относится ко всей пачке:
 
 ```json
-{"Tasks":[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b"}]}
+{"status":"ok","message":""}
 ```
 
-1C returns a status for every requested task. An unknown `TaskID` is returned as `ERROR`. Allowed statuses: `PENDING`, `SUCCESS`, `ERROR`; `message` contains error details for `ERROR` and is empty otherwise. Polling interval defaults to one hour and is configurable through `INTEGRATION_1C_SYNC_INTERVAL_MINUTES`. `SUCCESS` and `ERROR` are terminal.
+При `ok` приложение записывает каждую отправленную задачу со статусом `PENDING`. При отказе всей пачки:
 
 ```json
-{"Tasks":[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b","Status":"PENDING","message":""}]}
+{"status":"error","message":"Описание ошибки"}
 ```
 
-Both sending and polling are limited by `INTEGRATION_1C_BATCH_SIZE` (default 100 tasks).
+При `error` задачи остаются неотправленными и повторяются с сохранёнными `TaskID` и JSON.
 
-### 3.5 Предыдущие показания в выгрузке лицевых счетов
+### Запрос статусов задач
 
-В JSON-выгрузке лицевых счетов каждая тарифная зона может содержать поле `Reading` — последнее показание по зоне, известное 1С:
+```text
+POST /MetersValueStatus
+```
+
+Запрос содержит только ID локально ожидающих задач, не более `INTEGRATION_1C_BATCH_SIZE`:
 
 ```json
-{
-  "TariffZoneID": "fb6e02a6-4442-11eb-86b5-7c2a31835b20",
-  "TariffZone": "День",
-  "Reading": 50
-}
+[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b"}]
 ```
 
-- `Reading` — JSON-число (не строка и не `true`/`false`), неотрицательное, не более 15 цифр до запятой и 6 после. Число сохраняется точно, без округления через число с плавающей точкой.
-- Отсутствующее поле или `null` означает, что показания нет.
-- Некорректное значение не записывается; зона, прибор и лицевой счёт при этом импортируются, в журнал пишется предупреждение без самого значения.
-- При повторной выгрузке значение обновляется.
-- GUID в выгрузке сохраняются в нижнем регистре: один GUID в разном регистре считается одним объектом.
+1С возвращает один статус для каждого запрошенного `TaskID`. Неизвестный 1С ID должен вернуться со статусом `ERROR`.
 
-Бот показывает пользователю предыдущее показание и не принимает значение меньше него. Предыдущим считается наибольшее из двух значений: `Reading` из выгрузки и последнее показание, введённое через бот (кроме отклонённых 1С).
-
-## 4. Внутреннее API: MAX-бот вызывает FastAPI
-
-Базовый адрес по умолчанию:
-
-```text
-http://127.0.0.1:8000
+```json
+[{"TaskID":"e8bb6d5e-2022-45e3-ae57-055dc46df68b","Status":"PENDING","message":""}]
 ```
 
-Оба метода защищены заголовком:
+Допустимые статусы: `PENDING`, `SUCCESS`, `ERROR`. Для `ERROR` поле `message` содержит описание; для остальных статусов оно пустое. `SUCCESS` и `ERROR` конечные, повторно они не опрашиваются.
 
-```text
-Authorization: Bearer <INTERNAL_API_TOKEN>
-```
+Планировщик запускает синхронизацию раз в час. Интервал можно изменить через `INTEGRATION_1C_SYNC_INTERVAL_MINUTES` (например, временно поставить `1` для теста). За один запуск отправляется одна пачка неотправленных задач и опрашивается одна пачка ожидающих статусов.
 
-### 4.1 Запрос кода
+## Внутренний API FastAPI
+
+MAX-бот вызывает внутренние методы FastAPI с токеном `INTERNAL_API_TOKEN`; они не являются методами внешнего HTTP-сервиса 1С.
 
 ```text
 POST /api/v1/integrations/1c/auth/request-code
-```
-
-Тело и бизнес-ответы совпадают с внешним методом `/auth/request-code`.
-
-Пример PowerShell с шаблонным токеном:
-
-```powershell
-$headers = @{ Authorization = "Bearer <INTERNAL_API_TOKEN>" }
-$body = @{
-    ls = "100001"
-    chat_id = 123456789
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-    -Method Post `
-    -Uri "http://127.0.0.1:8000/api/v1/integrations/1c/auth/request-code" `
-    -Headers $headers `
-    -ContentType "application/json" `
-    -Body $body
-```
-
-### 4.2 Проверка кода
-
-```text
 POST /api/v1/integrations/1c/auth/verify-code
 ```
 
-Тело и бизнес-ответы совпадают с внешним методом `/auth/verify-code`.
+API документация доступна по адресу `http://127.0.0.1:8000/api/docs` при запущенном FastAPI.
 
-При `status=ok` FastAPI:
+## Mock-режим
 
-1. Сохраняет привязку `chat_id` к `ls`.
-2. Устанавливает `authorized_1c=1`.
-3. Добавляет или обновляет счётчики по паре `ls` и `meter_number`.
-4. Возвращает ответ боту.
+При `INTEGRATION_1C_MOCK=true` внешние HTTP-вызовы не выполняются. Mock принимает отправленные задачи, возвращает для них `PENDING`, а неизвестные ID — `ERROR`. Память mock очищается при перезапуске процесса.
 
-### 4.3 HTTP-ошибки внутреннего API
+## Проверка интеграции
 
-| HTTP | Значение |
-|---:|---|
-| `200` | Запрос обработан; бизнес-результат находится в поле `status` |
-| `401` | Неверный или отсутствующий `INTERNAL_API_TOKEN` |
-| `422` | Некорректное тело запроса |
-| `502` | Ошибка соединения, неверный HTTP-ответ, неизвестный статус или невалидный JSON от 1С |
-| `503` | Не заданы обязательные настройки реального подключения к 1С |
-| `504` | Тайм-аут запроса к 1С |
+1. Задать `INTEGRATION_1C_BASE_URL` и `INTEGRATION_1C_AUTH_TOKEN` в окружении сервиса.
+2. Установить `INTEGRATION_1C_MOCK=false` и включить интеграцию.
+3. Проверить авторизацию, затем отправку небольшой пачки через `/RegistrationMetersValue`.
+4. Убедиться, что принятые задачи появились в локальной БД со статусом `PENDING`.
+5. Проверить ответ `/MetersValueStatus` и переход в `PENDING`, `SUCCESS` или `ERROR`.
+6. Проверить повторную отправку с тем же `TaskID` после имитации таймаута.
 
-There is no internal HTTP route for 1C exchange. The FastAPI background job calls `client_1c.send_tasks()` and `client_1c.sync_task_statuses()` directly.
-
-Интерактивная документация внутреннего API доступна после запуска FastAPI:
-
-```text
-http://127.0.0.1:8000/api/docs
-```
-
-## 5. Mock-режим
-
-Mock включается настройками:
-
-```env
-ENABLE_1C_INTEGRATION=true
-INTEGRATION_1C_MOCK=true
-INTEGRATION_1C_MOCK_CODE=000000
-```
-
-Поведение mock:
-
-- принимает любой непустой ЛС;
-- не отправляет реальное письмо;
-- использует код `000000`, если значение не переопределено;
-- код действует 10 минут;
-- после 5 неверных попыток возвращает `attempts_exceeded`;
-- возвращает счётчики `MOCK-001` и `MOCK-002`;
-- принимает все показания;
-- хранит коды и результаты пакетов в памяти FastAPI;
-- после перезапуска FastAPI временное состояние mock теряется.
-
-## 6. Переход на реальную 1С
-
-После реализации трёх методов в 1С:
-
-1. Записать базовый HTTPS-адрес публикации в `INTEGRATION_1C_BASE_URL`.
-2. Записать один и тот же случайный секрет в константу 1С и `INTEGRATION_1C_AUTH_TOKEN`.
-3. Установить `INTEGRATION_1C_MOCK=false`.
-4. Перезапустить FastAPI и MAX-бот.
-5. Проверить запрос кода, проверку кода и получение счётчиков.
-/sync`.
-7. Убедиться, что коды, токены, e-mail и полные тела запросов не попадают в журналы.
-
-Если локальные запросы бота к FastAPI перехватывает VPN или системный прокси, добавить в `.env`:
-
-```env
-NO_PROXY=127.0.0.1,localhost
-```
-
-## 7. Связанные файлы
-
-- `client_1c.py` — клиент внешнего API 1С и mock-реализация;
-- `api/routers/integration_1c.py` — внутреннее API авторизации;
-- `api/schemas.py` — проверка входных данных;
-- `client_api.py` — вызовы FastAPI из MAX-бота;
-- `sync_1c.py` — пакетная синхронизация;
-- `database.py` — хранение привязок, очереди, статусов и счётчиков;
-- `TOR_1C_INTEGRATION_PART1_AUTH (2).md` — требования к авторизации;
-- `TOR_1C_INTEGRATION_PART2_READINGS.md` — требования к показаниям.
+Реальный URL и токен задаются отдельно от документации; токен остаётся секретом.
