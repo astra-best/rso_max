@@ -89,4 +89,4 @@ class SessionManager:
         with self._lock:
             for key in METER_INPUT_KEYS:
                 state.pop(key, None)
-            state["state"] = S.WAITING_VALUE1
+            state["state"] = S.WAITING_VALUE

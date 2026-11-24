@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import patch
 
 
@@ -44,7 +46,7 @@ class Client1CTests(unittest.TestCase):
             "https://host/base/auth/request-code",
         )
 
-    def test_live_request_adds_bearer_header_and_auth_timeout(self) -> None:
+    def test_live_request_omits_auth_header_and_uses_auth_timeout(self) -> None:
         client = self._module()
         response = unittest.mock.Mock(status_code=200)
         response.json.return_value = {"status": "ok"}
@@ -57,9 +59,44 @@ class Client1CTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(data, {"status": "ok"})
         _, kwargs = post.call_args
-        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-secret-token")
+        self.assertNotIn("Authorization", kwargs["headers"])
         self.assertEqual(kwargs["timeout"], 5)
         self.assertEqual(kwargs["json"], {"ls": "100001", "chat_id": 42})
+
+    def test_send_tasks_posts_root_array_to_registration_method(self) -> None:
+        client = self._module()
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = {"status": "ok", "message": ""}
+        tasks = [{"TaskID": "task-1", "Value": Decimal("999999999999999.123456")}]
+
+        with patch.object(client, "INTEGRATION_1C_MOCK", False), patch.object(
+            client.httpx, "post", return_value=response
+        ) as post:
+            data, error = client.send_tasks(tasks)
+
+        self.assertEqual((data, error), ({"status": "ok", "message": ""}, None))
+        self.assertTrue(post.call_args.args[0].endswith("/RegistrationMetersValue"))
+        self.assertEqual(
+            json.loads(post.call_args.kwargs["content"]),
+            [{"TaskID": "task-1", "Value": 999999999999999.123456}],
+        )
+        self.assertIn(b"999999999999999.123456", post.call_args.kwargs["content"])
+
+    def test_sync_task_statuses_posts_only_task_ids_to_sync(self) -> None:
+        client = self._module()
+        response = unittest.mock.Mock(status_code=200)
+        response.json.return_value = [{"TaskID": "task-1", "Status": "PENDING", "Message": ""}]
+        task_ids = ["task-1"]
+
+        with patch.object(client, "INTEGRATION_1C_MOCK", False), patch.object(
+            client.httpx, "post", return_value=response
+        ) as post:
+            data, error = client.sync_task_statuses(task_ids)
+
+        self.assertEqual(error, None)
+        self.assertEqual(data, response.json.return_value)
+        self.assertTrue(post.call_args.args[0].endswith("/MetersValueStatus"))
+        self.assertEqual(post.call_args.kwargs["json"], [{"TaskID": "task-1"}])
 
     def test_transport_error_does_not_return_or_log_token(self) -> None:
         client = self._module()

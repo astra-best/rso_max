@@ -20,8 +20,7 @@ STATE_VALUES = {
     "SCRIPT_LIST": "script_list",
     "SCRIPT_NODE": "script_node",
     "METER_SELECT": "meter_select",
-    "WAITING_VALUE1": "waiting_value1",
-    "WAITING_VALUE2": "waiting_value2",
+    "WAITING_VALUE": "waiting_value",
     "CONFIRM_POKAZANIYA": "confirm_pokazaniya",
     "APPOINTMENT_BRANCH": "appointment_branch",
     "APPOINTMENT_DATE": "appointment_date",
@@ -101,13 +100,12 @@ def test_wrappers_follow_user_states_rebinding_without_mutating_old_mapping(
     assert flow_state == {"state": S.MENU}
 
     meter_state = {
-        "state": S.WAITING_VALUE2,
-        "new_value1": 1,
-        "new_value2": 2,
+        "state": S.CONFIRM_POKAZANIYA,
+        "meter_values": ["1", "2"],
     }
     rebound_states[5] = meter_state
     bot._reset_meter_input(meter_state)
-    assert meter_state == {"state": S.WAITING_VALUE1}
+    assert meter_state == {"state": S.WAITING_VALUE}
 
     assert bot.cleanup_user_states(None, 30) == 1
     assert set(rebound_states) == {3, 4, 5}
@@ -178,19 +176,19 @@ def test_clear_flow_removes_exact_flow_keys_and_preserves_session_data():
     assert bot._FLOW_KEYS is FLOW_KEYS
 
 
-def test_reset_meter_input_removes_only_values_and_waits_for_first_tariff():
+def test_reset_meter_input_removes_only_values_and_waits_for_first_pair():
     state = {
-        "state": S.WAITING_VALUE2,
-        "new_value1": 123.4,
-        "new_value2": 234.5,
+        "state": S.CONFIRM_POKAZANIYA,
+        "meter_values": ["123.4", "234.5"],
         "meter_idx": 1,
         "meters": ["meter"],
     }
 
     bot._reset_meter_input(state)
 
+    assert METER_INPUT_KEYS == ("meter_values",)
     assert state == {
-        "state": S.WAITING_VALUE1,
+        "state": S.WAITING_VALUE,
         "meter_idx": 1,
         "meters": ["meter"],
     }
