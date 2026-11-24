@@ -136,14 +136,10 @@ def _validate() -> None:
                 raise RuntimeError("INTEGRATION_1C_MOCK запрещён в production")
             if not INTEGRATION_1C_BASE_URL:
                 raise RuntimeError("INTEGRATION_1C_BASE_URL обязателен в production")
-            if not INTEGRATION_1C_AUTH_TOKEN:
-                raise RuntimeError("INTEGRATION_1C_AUTH_TOKEN обязателен в production")
         elif not INTEGRATION_1C_MOCK:
             if not INTEGRATION_1C_BASE_URL:
                 logger.warning(
                     "INTEGRATION_1C_BASE_URL не задан — реальная интеграция с 1С не запустится"
                 )
-            if not INTEGRATION_1C_AUTH_TOKEN:
-                logger.warning("INTEGRATION_1C_AUTH_TOKEN не задан — 1С отклонит запросы")
 
 _validate()

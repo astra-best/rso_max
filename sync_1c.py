@@ -29,7 +29,7 @@ def _valid_status_response(result: list | None, task_ids: list[str]) -> list[dic
     for item in statuses:
         if not isinstance(item, dict):
             return None
-        task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("message")
+        task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("Message")
         if (
             not isinstance(task_id, str) or task_id not in task_ids or task_id in seen
             or not isinstance(status, str)

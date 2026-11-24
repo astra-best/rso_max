@@ -93,7 +93,7 @@ class Mock1CBackend:
         with self._lock:
             for task in tasks:
                 self._task_statuses.setdefault(
-                    task["TaskID"], {"TaskID": task["TaskID"], "Status": "PENDING", "message": ""}
+                    task["TaskID"], {"TaskID": task["TaskID"], "Status": "PENDING", "Message": ""}
                 )
         return {"status": "ok", "message": ""}
 
@@ -101,7 +101,7 @@ class Mock1CBackend:
         with self._lock:
             return [
                 self._task_statuses.get(
-                    task_id, {"TaskID": task_id, "Status": "ERROR", "message": "Task not found"}
+                    task_id, {"TaskID": task_id, "Status": "ERROR", "Message": "Task not found"}
                 )
                 for task_id in task_ids
             ]
@@ -137,12 +137,14 @@ def _encode_json(body) -> bytes:
 
 
 def _post_json(path: str, body, timeout: int) -> tuple[dict | list | None, str | None]:
-    if not INTEGRATION_1C_BASE_URL or not INTEGRATION_1C_AUTH_TOKEN:
+    if not INTEGRATION_1C_BASE_URL:
         log.error("1С-запрос %s не выполнен: отсутствует обязательная конфигурация", path)
         return None, "configuration_error"
 
     try:
-        headers = {"Authorization": f"Bearer {INTEGRATION_1C_AUTH_TOKEN}"}
+        headers = {}
+        # Временно без авторизации на стороне HTTP-сервиса 1С.
+        # Для возврата Bearer: headers["Authorization"] = f"Bearer {INTEGRATION_1C_AUTH_TOKEN}"
         if _contains_decimal(body):
             headers["Content-Type"] = "application/json"
             response = httpx.post(

@@ -41,7 +41,7 @@ class Sync1CTests(unittest.TestCase):
         with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
              patch.object(self.sync.client_1c, "send_tasks", return_value=({"status": "ok", "message": ""}, None)) as send, \
              patch.object(self.sync.client_1c, "sync_task_statuses", return_value=([
-                 {"TaskID": self.task_id, "Status": "PENDING", "message": ""},
+                 {"TaskID": self.task_id, "Status": "PENDING", "Message": ""},
              ], None)) as poll:
             result = self.sync.sync_1c_job()
 
@@ -58,7 +58,7 @@ class Sync1CTests(unittest.TestCase):
         with patch.object(self.sync, "ENABLE_1C_INTEGRATION", True), \
              patch.object(self.sync.client_1c, "send_tasks") as send, \
              patch.object(self.sync.client_1c, "sync_task_statuses", return_value=([
-                 {"TaskID": self.task_id, "Status": "ERROR", "message": "invalid value"},
+                 {"TaskID": self.task_id, "Status": "ERROR", "Message": "invalid value"},
              ], None)):
             self.assertEqual(self.sync.sync_1c_job(), "success")
         send.assert_not_called()
@@ -78,7 +78,7 @@ class Sync1CTests(unittest.TestCase):
              patch.object(self.sync, "INTEGRATION_1C_BATCH_SIZE", 1), \
              patch.object(self.sync.client_1c, "send_tasks", return_value=({"status": "ok", "message": ""}, None)) as send, \
              patch.object(self.sync.client_1c, "sync_task_statuses", return_value=([
-                 {"TaskID": self.task_id, "Status": "SUCCESS", "message": ""},
+                 {"TaskID": self.task_id, "Status": "SUCCESS", "Message": ""},
              ], None)) as poll:
             self.assertEqual(self.sync.sync_1c_job(), "success")
         self.assertEqual(len(send.call_args.args[0]), 1)
