@@ -142,7 +142,6 @@ def test_production_enabled_1c_rejects_mock_mode():
     ("missing_name", "overrides"),
     [
         ("INTEGRATION_1C_BASE_URL", {"INTEGRATION_1C_BASE_URL": ""}),
-        ("INTEGRATION_1C_AUTH_TOKEN", {"INTEGRATION_1C_AUTH_TOKEN": ""}),
     ],
 )
 def test_production_real_1c_requires_connection_settings(missing_name, overrides):
@@ -153,6 +152,11 @@ def test_production_real_1c_requires_connection_settings(missing_name, overrides
 
 def test_production_real_1c_accepts_complete_configuration():
     result = _import_config(_production_1c_env())
+    assert result.returncode == 0, result.stderr
+
+
+def test_production_real_1c_does_not_require_auth_token():
+    result = _import_config(_production_1c_env(INTEGRATION_1C_AUTH_TOKEN=""))
     assert result.returncode == 0, result.stderr
 
 

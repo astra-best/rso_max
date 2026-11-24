@@ -46,7 +46,7 @@ class Client1CTests(unittest.TestCase):
             "https://host/base/auth/request-code",
         )
 
-    def test_live_request_adds_bearer_header_and_auth_timeout(self) -> None:
+    def test_live_request_omits_auth_header_and_uses_auth_timeout(self) -> None:
         client = self._module()
         response = unittest.mock.Mock(status_code=200)
         response.json.return_value = {"status": "ok"}
@@ -59,7 +59,7 @@ class Client1CTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(data, {"status": "ok"})
         _, kwargs = post.call_args
-        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-secret-token")
+        self.assertNotIn("Authorization", kwargs["headers"])
         self.assertEqual(kwargs["timeout"], 5)
         self.assertEqual(kwargs["json"], {"ls": "100001", "chat_id": 42})
 
@@ -85,7 +85,7 @@ class Client1CTests(unittest.TestCase):
     def test_sync_task_statuses_posts_only_task_ids_to_sync(self) -> None:
         client = self._module()
         response = unittest.mock.Mock(status_code=200)
-        response.json.return_value = [{"TaskID": "task-1", "Status": "PENDING", "message": ""}]
+        response.json.return_value = [{"TaskID": "task-1", "Status": "PENDING", "Message": ""}]
         task_ids = ["task-1"]
 
         with patch.object(client, "INTEGRATION_1C_MOCK", False), patch.object(

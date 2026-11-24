@@ -100,7 +100,7 @@ class Portal1CTests(unittest.TestCase):
             task = db.get_unsent_meter_reading_tasks(100)[0]
             db.mark_meter_readings_pending([task["TaskID"]])
             db.apply_meter_reading_task_statuses([{
-                "TaskID": task["TaskID"], "Status": "ERROR", "message": "Неверное показание",
+                "TaskID": task["TaskID"], "Status": "ERROR", "Message": "Неверное показание",
             }])
             rows = db.list_meter_readings()
             self.assertEqual(db.get_counts()["pokazaniya"], 3)

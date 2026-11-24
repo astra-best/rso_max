@@ -179,7 +179,7 @@ class Database1CTests(unittest.TestCase):
         self.assertEqual(db.get_pending_meter_reading_task_ids(100), [task["TaskID"]])
 
         db.apply_meter_reading_task_statuses([{
-            "TaskID": task["TaskID"], "Status": "ERROR", "message": "Rejected",
+            "TaskID": task["TaskID"], "Status": "ERROR", "Message": "Rejected",
         }])
         row = db.list_meter_readings()[0]
         self.assertEqual((row["status"], row["message"]), ("ERROR", "Rejected"))

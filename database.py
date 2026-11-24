@@ -2053,7 +2053,7 @@ def apply_meter_reading_task_statuses(statuses: list[dict]) -> None:
     try:
         conn.execute("BEGIN IMMEDIATE")
         for item in statuses:
-            task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("message", "")
+            task_id, status, message = item.get("TaskID"), item.get("Status"), item.get("Message", "")
             if not isinstance(task_id, str) or not task_id or status not in {"PENDING", "SUCCESS", "ERROR"}:
                 raise ValueError("Invalid 1C task status")
             if not isinstance(message, str) or (status != "ERROR" and message):

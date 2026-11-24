@@ -49,7 +49,7 @@ class LocalIntegrationE2ETests(unittest.TestCase):
             if request.url.path.endswith("/RegistrationMetersValue"):
                 return httpx.Response(200, json={"status": "ok", "message": ""}, request=request)
             return httpx.Response(200, json=[
-                {"TaskID": task["TaskID"], "Status": "ERROR", "message": "Rejected"}
+                {"TaskID": task["TaskID"], "Status": "ERROR", "Message": "Rejected"}
                 for task in body
             ], request=request)
 
